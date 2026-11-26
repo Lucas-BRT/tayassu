@@ -3,6 +3,7 @@
 pub mod adapter;
 pub mod error;
 pub mod isolation;
+pub mod migration;
 
 pub use adapter::{
     AGY_PROBE_TIMEOUT_SECS, AdapterRegistry, AgyAdapter, CLAUDE_CONFIG_DIR_ENV, CODEX_HOME_ENV,
@@ -13,6 +14,9 @@ pub use error::ProviderError;
 pub use isolation::{
     DEFAULT_SHARED_HOME_LINKS, ENV_HOME, ENV_XDG_CACHE_HOME, ENV_XDG_CONFIG_HOME,
     ENV_XDG_DATA_HOME, ENV_XDG_STATE_HOME, FAKE_HOME_SUBDIR, IsolationStrategy, ProfileEnvironment,
+};
+pub use migration::{
+    DiscoveredAgent, HostDiscovery, MigrationFile, MigrationMode, MigrationSummary,
 };
 
 #[cfg(test)]
@@ -355,5 +359,52 @@ OpenRouter      OpenRouter                  stored
             .expect("local probe should be supported")
             .expect("config.json should authenticate profile");
         assert_eq!(parsed.windows.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn host_discovery_and_move_auth_preserves_binaries_and_settings() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let real_home = TempDir::new().expect("real home");
+        let profiles_root = TempDir::new().expect("profiles root");
+
+        let bin_dir = real_home.path().join(".local/bin");
+        fs::create_dir_all(&bin_dir).expect("mkdir bin");
+        let codex_bin = bin_dir.join("codex");
+        fs::write(&codex_bin, "#!/bin/sh\n").expect("write codex bin");
+        fs::set_permissions(&codex_bin, fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        let codex_dir = real_home.path().join(".codex");
+        let packages_dir = codex_dir.join("packages/standalone");
+        fs::create_dir_all(&packages_dir).expect("mkdir packages");
+        fs::write(codex_dir.join("auth.json"), "{\"token\":\"ok\"}").expect("write auth");
+        fs::write(codex_dir.join("config.toml"), "model = \"o3\"\n").expect("write cfg");
+        fs::write(packages_dir.join("marker"), "keep").expect("write marker");
+
+        let discovered = HostDiscovery.discover_all(real_home.path(), None);
+        assert_eq!(discovered.len(), 1);
+        let agent = &discovered[0];
+        assert_eq!(agent.provider, ProviderKind::Codex);
+        assert!(!agent.requires_relogin);
+
+        let account = AccountConfig::new(
+            agent.default_account_id.clone(),
+            agent.provider,
+            "Codex Imported",
+        );
+        let env = CodexAdapter.build_environment(&account, profiles_root.path());
+        let summary = agent
+            .apply(&env, real_home.path(), MigrationMode::MoveAuth)
+            .expect("apply migration");
+
+        assert_eq!(summary.copied_files, 2);
+        assert_eq!(summary.removed_source_files, 1);
+        // Auth moved into profile, but config.toml and updater packages dir remain intact on host!
+        assert!(env.profile_dir.join("auth.json").is_file());
+        assert!(env.profile_dir.join("config.toml").is_file());
+        assert!(!codex_dir.join("auth.json").exists());
+        assert!(codex_dir.join("config.toml").is_file());
+        assert!(packages_dir.join("marker").is_file());
     }
 }

@@ -62,6 +62,12 @@ const COPILOT_TOKEN_ENV_VARS: &[&str] = &["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "G
 /// Credential/config filenames written under `COPILOT_HOME` after `copilot login`.
 const COPILOT_CREDENTIAL_FILES: &[&str] = &["config.json", "hosts.json"];
 
+/// Shared links added for `agy` fake `HOME` so `agy update` still targets `~/.local/bin`.
+const AGY_EXTRA_SHARED_LINKS: &[&str] = &[".local/bin"];
+
+/// Shared links added for `opencode` fake `HOME` so `opencode upgrade` targets `~/.opencode/bin`.
+const OPENCODE_EXTRA_SHARED_LINKS: &[&str] = &[".opencode/bin"];
+
 /// Command arguments used to probe usage or auth status non-interactively for a provider.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProbeCommand {
@@ -219,7 +225,7 @@ impl ProviderAdapter for AgyAdapter {
 
     fn isolation(&self, account: &AccountConfig) -> IsolationStrategy {
         IsolationStrategy::FakeHome {
-            shared_links: resolved_shared_links(account),
+            shared_links: resolved_shared_links(account, AGY_EXTRA_SHARED_LINKS),
         }
     }
 
@@ -520,7 +526,7 @@ impl ProviderAdapter for OpencodeAdapter {
 
     fn isolation(&self, account: &AccountConfig) -> IsolationStrategy {
         IsolationStrategy::FakeHome {
-            shared_links: resolved_shared_links(account),
+            shared_links: resolved_shared_links(account, OPENCODE_EXTRA_SHARED_LINKS),
         }
     }
 
@@ -594,7 +600,7 @@ impl ProviderAdapter for CustomAdapter {
 
     fn isolation(&self, account: &AccountConfig) -> IsolationStrategy {
         IsolationStrategy::FakeHome {
-            shared_links: resolved_shared_links(account),
+            shared_links: resolved_shared_links(account, &[]),
         }
     }
 }
@@ -618,10 +624,11 @@ impl AdapterRegistry {
     }
 }
 
-fn resolved_shared_links(account: &AccountConfig) -> Vec<String> {
+fn resolved_shared_links(account: &AccountConfig, extra_defaults: &[&str]) -> Vec<String> {
     if account.shared_home_links.is_empty() {
         DEFAULT_SHARED_HOME_LINKS
             .iter()
+            .chain(extra_defaults.iter())
             .map(|entry| (*entry).to_owned())
             .collect()
     } else {
