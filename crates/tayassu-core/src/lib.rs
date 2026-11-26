@@ -14,7 +14,7 @@ pub use quota::{
     AccountStatus, CooldownEntry, DEFAULT_FALLBACK_COOLDOWN_SECS, MAX_REMAINING_PERCENT,
     MIN_REMAINING_PERCENT, QuotaWindow, RemainingPercent,
 };
-pub use router::{AccountRouter, SelectionPolicy};
+pub use router::{AccountRouter, FallbackTarget, SelectionPolicy};
 
 #[cfg(test)]
 mod tests {
@@ -204,5 +204,47 @@ mod tests {
         let id: AccountId = "agy-pro".parse().expect("id");
         assert_eq!(format!("{id:<12}"), "agy-pro     ");
         assert_eq!(format!("{:<10}", ProviderKind::Agy), "agy       ");
+    }
+
+    #[test]
+    fn router_selects_idle_account_on_priority_tie_and_supports_fallback_chain() {
+        let now = Utc::now();
+        let mut agy = AccountConfig::new("agy-a".parse().expect("id"), ProviderKind::Agy, "Agy");
+        agy.priority = STUDENT_PRIORITY;
+        let mut claude_busy = AccountConfig::new(
+            "claude-a".parse().expect("id"),
+            ProviderKind::Claude,
+            "Claude A",
+        );
+        claude_busy.priority = STUDENT_PRIORITY;
+        let mut claude_idle = AccountConfig::new(
+            "claude-b".parse().expect("id"),
+            ProviderKind::Claude,
+            "Claude B",
+        );
+        claude_idle.priority = STUDENT_PRIORITY;
+
+        let mut agy_st = AccountStatus::empty(agy.id.clone());
+        agy_st.set_cooldown(CooldownEntry {
+            bucket: "claude".parse().expect("bucket"),
+            resets_at: now + TimeDelta::hours(TEST_COOLDOWN_HOURS),
+            reason: "probe".to_owned(),
+        });
+        let mut busy_st = AccountStatus::empty(claude_busy.id.clone());
+        busy_st.active_sessions = 1;
+
+        let accounts = [agy, claude_busy, claude_idle.clone()];
+        let statuses = [agy_st, busy_st];
+        let chain: Vec<FallbackTarget> = vec![
+            "agy:claude".parse().expect("target"),
+            "claude".parse().expect("target"),
+        ];
+
+        let router = AccountRouter::new(SelectionPolicy::Priority);
+        let (picked, bucket) = router
+            .select_from_chain(&accounts, &statuses, &chain, now)
+            .expect("chain should fall back to idle claude-b");
+        assert_eq!(picked.id, claude_idle.id);
+        assert_eq!(bucket.as_str(), "default");
     }
 }
