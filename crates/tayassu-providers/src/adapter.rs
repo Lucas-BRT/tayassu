@@ -62,11 +62,21 @@ const COPILOT_TOKEN_ENV_VARS: &[&str] = &["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "G
 /// Credential/config filenames written under `COPILOT_HOME` after `copilot login`.
 const COPILOT_CREDENTIAL_FILES: &[&str] = &["config.json", "hosts.json"];
 
-/// Shared links added for `agy` fake `HOME` so `agy update` still targets `~/.local/bin`.
-const AGY_EXTRA_SHARED_LINKS: &[&str] = &[".local/bin"];
+/// Shared links added for `agy` fake `HOME` so `agy update`, skills, and MCP configs stay unified.
+const AGY_EXTRA_SHARED_LINKS: &[&str] = &[
+    ".local/bin",
+    ".gemini/antigravity-cli/skills",
+    ".gemini/antigravity-cli/mcp",
+    ".gemini/GEMINI.md",
+];
 
-/// Shared links added for `opencode` fake `HOME` so `opencode upgrade` targets `~/.opencode/bin`.
-const OPENCODE_EXTRA_SHARED_LINKS: &[&str] = &[".opencode/bin"];
+/// Shared links added for `opencode` fake `HOME` so `opencode upgrade`, skills, and plugins stay unified.
+const OPENCODE_EXTRA_SHARED_LINKS: &[&str] = &[
+    ".opencode/bin",
+    ".config/opencode/skills",
+    ".config/opencode/plugins",
+    ".config/opencode/AGENTS.md",
+];
 
 /// Command arguments used to probe usage or auth status non-interactively for a provider.
 #[derive(Debug, Clone, PartialEq, Eq)]

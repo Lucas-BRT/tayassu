@@ -74,6 +74,9 @@ Claude and GPT models  Five Hour Limit Remaining  0%   2026-11-26 21:38 -03
         let profiles_root = TempDir::new().expect("profiles root");
         fs::write(real_home.path().join(".gitconfig"), "[user]\nname = test\n")
             .expect("write gitconfig");
+        fs::create_dir_all(real_home.path().join(".local/bin")).expect("mkdir .local/bin");
+        fs::create_dir_all(real_home.path().join(".gemini/antigravity-cli/skills"))
+            .expect("mkdir skills");
 
         let account = AccountConfig::new(
             "agy-student".parse().expect("id"),
@@ -86,8 +89,15 @@ Claude and GPT models  Five Hour Limit Remaining  0%   2026-11-26 21:38 -03
 
         env.prepare(real_home.path()).expect("prepare profile");
 
-        let fake_gitconfig = env.profile_dir.join(FAKE_HOME_SUBDIR).join(".gitconfig");
-        assert!(fake_gitconfig.symlink_metadata().is_ok());
+        let fake_home = env.profile_dir.join(FAKE_HOME_SUBDIR);
+        assert!(fake_home.join(".gitconfig").symlink_metadata().is_ok());
+        assert!(fake_home.join(".local/bin").symlink_metadata().is_ok());
+        assert!(
+            fake_home
+                .join(".gemini/antigravity-cli/skills")
+                .symlink_metadata()
+                .is_ok()
+        );
         assert_eq!(env.env_vars[0].0, ENV_HOME);
     }
 
