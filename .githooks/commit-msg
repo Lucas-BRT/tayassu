@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+commit_msg_file="$1"
+first_line="$(head -n 1 "$commit_msg_file")"
+
+pattern='^(feat|fix|chore|docs|refactor|test|ci|build|perf|style|revert)(\([a-z0-9._/-]+\))?!?: .+'
+
+if [[ "$first_line" =~ ^Merge\  ]] || [[ "$first_line" =~ ^Revert\ \" ]]; then
+    exit 0
+fi
+
+if [[ ! "$first_line" =~ $pattern ]]; then
+    echo "error: commit message must follow Conventional Commits." >&2
+    echo "  got:      $first_line" >&2
+    echo "  expected: <type>(<scope>): <subject>" >&2
+    echo "  types:    feat|fix|chore|docs|refactor|test|ci|build|perf|style|revert" >&2
+    exit 1
+fi
