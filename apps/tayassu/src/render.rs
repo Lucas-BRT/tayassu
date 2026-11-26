@@ -1,4 +1,5 @@
 use chrono::{DateTime, TimeDelta, Utc};
+use std::collections::BTreeSet;
 use std::io::{self, Write};
 use tayassu_core::{AccountConfig, AccountStatus, ModelBucket, ProviderKind};
 
@@ -13,7 +14,7 @@ pub struct StatusTable<'a> {
     accounts: &'a [AccountConfig],
     statuses: &'a [AccountStatus],
     provider_filter: Option<ProviderKind>,
-    bucket: &'a ModelBucket,
+    bucket_filter: Option<&'a ModelBucket>,
 }
 
 impl<'a> StatusTable<'a> {
@@ -23,13 +24,13 @@ impl<'a> StatusTable<'a> {
         accounts: &'a [AccountConfig],
         statuses: &'a [AccountStatus],
         provider_filter: Option<ProviderKind>,
-        bucket: &'a ModelBucket,
+        bucket_filter: Option<&'a ModelBucket>,
     ) -> Self {
         Self {
             accounts,
             statuses,
             provider_filter,
-            bucket,
+            bucket_filter,
         }
     }
 
@@ -57,9 +58,11 @@ impl<'a> StatusTable<'a> {
 
         writeln!(
             writer,
-            "{:<18} {:<10} {:<4} {:<18} {:<8} LABEL",
+            "{:<18} {:<10} {:<4} {:<18} {:<28} LABEL",
             "ACCOUNT", "PROVIDER", "PRI", "STATE", "QUOTA"
         )?;
+
+        let default_bucket = ModelBucket::default_bucket();
 
         for account in filtered {
             let status = self
@@ -67,28 +70,13 @@ impl<'a> StatusTable<'a> {
                 .iter()
                 .find(|entry| entry.account_id == account.id);
 
-            let state_text = if !account.enabled {
-                "DISABLED".to_owned()
-            } else if let Some(cooldown) =
-                status.and_then(|st| st.active_cooldown(self.bucket, now))
-            {
-                let rem = cooldown
-                    .remaining(now)
-                    .map_or_else(|| "0m".to_owned(), format_countdown);
-                format!("COOLDOWN ({rem})")
-            } else if status.is_some_and(|st| !st.is_available(self.bucket, now)) {
-                "EXHAUSTED".to_owned()
-            } else {
-                "READY".to_owned()
-            };
-
-            let quota_text = status
-                .and_then(|st| st.lowest_remaining_percent(self.bucket))
-                .map_or_else(|| "-".to_owned(), |pct| pct.to_string());
+            let eval_bucket = self.bucket_filter.unwrap_or(&default_bucket);
+            let state_text = render_state(account, status, eval_bucket, now);
+            let quota_text = render_quota(status, self.bucket_filter, now);
 
             writeln!(
                 writer,
-                "{:<18} {:<10} {:<4} {:<18} {:<8} {}",
+                "{:<18} {:<10} {:<4} {:<18} {:<28} {}",
                 account.id,
                 account.provider,
                 account.priority,
@@ -102,7 +90,79 @@ impl<'a> StatusTable<'a> {
     }
 }
 
-fn format_countdown(delta: TimeDelta) -> String {
+fn render_state(
+    account: &AccountConfig,
+    status: Option<&AccountStatus>,
+    bucket: &ModelBucket,
+    now: DateTime<Utc>,
+) -> String {
+    if !account.enabled {
+        return "DISABLED".to_owned();
+    }
+    if let Some(cooldown) = status.and_then(|st| st.active_cooldown(bucket, now)) {
+        let rem = cooldown
+            .remaining(now)
+            .map_or_else(|| "0m".to_owned(), format_countdown);
+        return format!("COOLDOWN ({rem})");
+    }
+    if status.is_some_and(|st| !st.is_available(bucket, now)) {
+        return "EXHAUSTED".to_owned();
+    }
+    "READY".to_owned()
+}
+
+fn render_quota(
+    status: Option<&AccountStatus>,
+    bucket_filter: Option<&ModelBucket>,
+    now: DateTime<Utc>,
+) -> String {
+    let Some(st) = status else {
+        return "-".to_owned();
+    };
+
+    if let Some(bucket) = bucket_filter {
+        return st
+            .lowest_remaining_percent(bucket)
+            .map_or_else(|| "-".to_owned(), |pct| pct.to_string());
+    }
+
+    let mut buckets = BTreeSet::new();
+    for window in &st.windows {
+        buckets.insert(window.bucket.clone());
+    }
+    for cooldown in &st.cooldowns {
+        if cooldown.is_active(now) {
+            buckets.insert(cooldown.bucket.clone());
+        }
+    }
+
+    if buckets.is_empty() {
+        return "-".to_owned();
+    }
+
+    let parts: Vec<String> = buckets
+        .iter()
+        .map(|bucket| {
+            let pct = st
+                .lowest_remaining_percent(bucket)
+                .map_or_else(|| "?".to_owned(), |val| val.to_string());
+            if let Some(cd) = st.active_cooldown(bucket, now) {
+                let rem = cd
+                    .remaining(now)
+                    .map_or_else(|| "0m".to_owned(), format_countdown);
+                format!("{bucket}:{pct}({rem})")
+            } else {
+                format!("{bucket}:{pct}")
+            }
+        })
+        .collect();
+
+    parts.join(" ")
+}
+
+/// Formats a positive duration into a compact `XhYYm` or `Ym` countdown.
+#[must_use]
+pub fn format_countdown(delta: TimeDelta) -> String {
     let total_minutes = (delta.num_seconds() + SECS_PER_MINUTE - 1) / SECS_PER_MINUTE;
     let hours = total_minutes / MINUTES_PER_HOUR;
     let minutes = total_minutes % MINUTES_PER_HOUR;
@@ -116,10 +176,13 @@ fn format_countdown(delta: TimeDelta) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tayassu_core::CooldownEntry;
+    use tayassu_core::{CooldownEntry, QuotaWindow, RemainingPercent};
 
     /// Cooldown duration in minutes used to verify countdown formatting.
     const TEST_COOLDOWN_MINUTES: i64 = 125;
+
+    /// Gemini remaining quota percentage fixture.
+    const GEMINI_PCT: u8 = 43;
 
     #[test]
     fn renders_ready_and_cooldown_rows() {
@@ -136,6 +199,12 @@ mod tests {
         );
 
         let mut cooling_status = AccountStatus::empty(cooling.id.clone());
+        cooling_status.windows.push(QuotaWindow {
+            window_name: "weekly".to_owned(),
+            bucket: "gemini".parse().expect("bucket"),
+            remaining: Some(RemainingPercent::try_from(GEMINI_PCT).expect("pct")),
+            resets_at: None,
+        });
         cooling_status.set_cooldown(CooldownEntry {
             bucket: ModelBucket::default_bucket(),
             resets_at: now + TimeDelta::minutes(TEST_COOLDOWN_MINUTES),
@@ -144,8 +213,7 @@ mod tests {
 
         let accounts = [ready, cooling];
         let statuses = [cooling_status];
-        let bucket = ModelBucket::default_bucket();
-        let table = StatusTable::new(&accounts, &statuses, None, &bucket);
+        let table = StatusTable::new(&accounts, &statuses, None, None);
 
         let mut buf = Vec::new();
         table.write_to(&mut buf, now).expect("render table");
@@ -155,5 +223,6 @@ mod tests {
         assert!(output.contains("READY"));
         assert!(output.contains("agy-student"));
         assert!(output.contains("COOLDOWN (2h05m)"));
+        assert!(output.contains("gemini:43%"));
     }
 }

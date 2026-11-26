@@ -99,6 +99,12 @@ pub enum AccountAction {
         /// Account identifier to inspect.
         id: AccountId,
     },
+
+    /// Launch the provider CLI interactively inside the account's isolated profile to log in.
+    Login {
+        /// Account identifier to authenticate.
+        id: AccountId,
+    },
 }
 
 /// Manual cooldown management subcommands.
