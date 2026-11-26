@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use tayassu_core::ProviderKind;
+use tayassu_core::{AccountId, ProviderKind};
 use thiserror::Error;
 
 /// Errors returned by provider isolation and probing adapters.
@@ -20,6 +20,17 @@ pub enum ProviderError {
     ProbeNotImplemented {
         /// Provider lacking probe support.
         provider: ProviderKind,
+    },
+
+    /// Isolated profile has not been authenticated yet.
+    #[error(
+        "account '{account_id}' ({provider}) is not logged in; run `tayassu account login {account_id}`"
+    )]
+    AuthenticationRequired {
+        /// Provider requiring authentication.
+        provider: ProviderKind,
+        /// Unauthenticated account identifier.
+        account_id: AccountId,
     },
 
     /// Provider usage output could not be parsed.
