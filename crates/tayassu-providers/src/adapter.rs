@@ -1,6 +1,8 @@
 use crate::error::ProviderError;
 use crate::isolation::{DEFAULT_SHARED_HOME_LINKS, IsolationStrategy, ProfileEnvironment};
 use chrono::{DateTime, NaiveDateTime, TimeDelta, Utc};
+use serde::Deserialize;
+use std::env;
 use std::path::Path;
 use tayassu_core::{
     AccountConfig, CooldownEntry, DEFAULT_FALLBACK_COOLDOWN_SECS, ModelBucket, ProviderKind,
@@ -37,17 +39,23 @@ const COLON_TZ_OFFSET_LEN: usize = 6;
 /// Expected length of a compact timezone offset like `-0300`.
 const COMPACT_TZ_OFFSET_LEN: usize = 5;
 
-/// Command arguments used to probe usage non-interactively for a provider.
+/// Environment variables checked by GitHub Copilot CLI for token authentication.
+const COPILOT_TOKEN_ENV_VARS: &[&str] = &["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"];
+
+/// Credential/config filenames written under `COPILOT_HOME` after `copilot login`.
+const COPILOT_CREDENTIAL_FILES: &[&str] = &["config.json", "hosts.json"];
+
+/// Command arguments used to probe usage or auth status non-interactively for a provider.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProbeCommand {
     /// Arguments passed to the account executable.
     pub args: Vec<String>,
 }
 
-/// Structured result produced by probing a provider's usage state.
+/// Structured result produced by probing a provider's usage or auth state.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProbeOutput {
-    /// Quota windows reported by the provider.
+    /// Quota or auth windows reported by the provider.
     pub windows: Vec<QuotaWindow>,
     /// Cooldown entries derived from the probe output.
     pub cooldowns: Vec<CooldownEntry>,
@@ -71,6 +79,16 @@ pub trait ProviderAdapter: Send + Sync {
         None
     }
 
+    /// Optional local profile probe for providers without a non-interactive status subcommand.
+    fn probe_local(
+        &self,
+        _account: &AccountConfig,
+        _env: &ProfileEnvironment,
+        _now: DateTime<Utc>,
+    ) -> Option<Result<ProbeOutput, ProviderError>> {
+        None
+    }
+
     /// Builds the concrete [`ProfileEnvironment`] for `account` under `profiles_root`.
     fn build_environment(
         &self,
@@ -83,7 +101,7 @@ pub trait ProviderAdapter: Send + Sync {
         ProfileEnvironment::new(profile_dir, self.isolation(account))
     }
 
-    /// Parses raw usage output (e.g. from `/usage`) into quota windows and cooldowns.
+    /// Parses raw usage or auth status output into quota windows and cooldowns.
     ///
     /// # Errors
     ///
@@ -134,12 +152,7 @@ impl AgyAdapter {
         } else if lowered.contains("claude") {
             "claude".to_owned()
         } else {
-            lowered
-                .chars()
-                .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
-                .collect::<String>()
-                .trim_matches('-')
-                .to_owned()
+            slugify(group)
         };
 
         slug.parse().map_err(|err| ProviderError::ParseUsage {
@@ -286,6 +299,17 @@ impl ProviderAdapter for AgyAdapter {
     }
 }
 
+/// Subset of JSON fields returned by `claude auth status`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ClaudeAuthStatus {
+    logged_in: bool,
+    #[serde(default)]
+    login_expires_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    plan_tier: Option<String>,
+}
+
 /// Adapter for Claude Code CLI (`claude`).
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ClaudeAdapter;
@@ -303,6 +327,57 @@ impl ProviderAdapter for ClaudeAdapter {
 
     fn login_args(&self) -> Vec<String> {
         vec!["auth".to_owned(), "login".to_owned()]
+    }
+
+    fn probe_command(&self) -> Option<ProbeCommand> {
+        Some(ProbeCommand {
+            args: vec!["auth".to_owned(), "status".to_owned()],
+        })
+    }
+
+    fn parse_usage_output(
+        &self,
+        account: &AccountConfig,
+        raw_output: &str,
+        now: DateTime<Utc>,
+    ) -> Result<ProbeOutput, ProviderError> {
+        let json_slice =
+            extract_json_object(raw_output).ok_or_else(|| ProviderError::ParseUsage {
+                provider: ProviderKind::Claude,
+                reason: "no JSON object found in `claude auth status` output".to_owned(),
+            })?;
+
+        let status: ClaudeAuthStatus =
+            serde_json::from_str(json_slice).map_err(|err| ProviderError::ParseUsage {
+                provider: ProviderKind::Claude,
+                reason: format!("invalid `claude auth status` JSON: {err}"),
+            })?;
+
+        if !status.logged_in || status.login_expires_at.is_some_and(|exp| exp <= now) {
+            return Err(ProviderError::AuthenticationRequired {
+                provider: ProviderKind::Claude,
+                account_id: account.id.clone(),
+            });
+        }
+
+        let window_name = status
+            .plan_tier
+            .as_deref()
+            .filter(|tier| !tier.trim().is_empty())
+            .map_or_else(
+                || "auth".to_owned(),
+                |tier| format!("auth:{}", tier.trim().to_ascii_lowercase()),
+            );
+
+        Ok(ProbeOutput {
+            windows: vec![QuotaWindow {
+                window_name,
+                bucket: ModelBucket::default_bucket(),
+                remaining: None,
+                resets_at: status.login_expires_at,
+            }],
+            cooldowns: Vec::new(),
+        })
     }
 }
 
@@ -324,6 +399,44 @@ impl ProviderAdapter for CodexAdapter {
     fn login_args(&self) -> Vec<String> {
         vec!["login".to_owned()]
     }
+
+    fn probe_command(&self) -> Option<ProbeCommand> {
+        Some(ProbeCommand {
+            args: vec!["login".to_owned(), "status".to_owned()],
+        })
+    }
+
+    fn parse_usage_output(
+        &self,
+        account: &AccountConfig,
+        raw_output: &str,
+        _now: DateTime<Utc>,
+    ) -> Result<ProbeOutput, ProviderError> {
+        let lowered = raw_output.to_ascii_lowercase();
+        if lowered.contains("not logged in") || lowered.contains(AGY_AUTH_REQUIRED_MARKER) {
+            return Err(ProviderError::AuthenticationRequired {
+                provider: ProviderKind::Codex,
+                account_id: account.id.clone(),
+            });
+        }
+
+        if lowered.contains("logged in") {
+            return Ok(ProbeOutput {
+                windows: vec![QuotaWindow {
+                    window_name: "auth".to_owned(),
+                    bucket: ModelBucket::default_bucket(),
+                    remaining: None,
+                    resets_at: None,
+                }],
+                cooldowns: Vec::new(),
+            });
+        }
+
+        Err(ProviderError::ParseUsage {
+            provider: ProviderKind::Codex,
+            reason: "unrecognized `codex login status` output".to_owned(),
+        })
+    }
 }
 
 /// Adapter for GitHub Copilot CLI (`copilot`).
@@ -344,6 +457,37 @@ impl ProviderAdapter for CopilotAdapter {
     fn login_args(&self) -> Vec<String> {
         vec!["login".to_owned()]
     }
+
+    fn probe_local(
+        &self,
+        account: &AccountConfig,
+        env_profile: &ProfileEnvironment,
+        _now: DateTime<Utc>,
+    ) -> Option<Result<ProbeOutput, ProviderError>> {
+        let has_profile_cred = COPILOT_CREDENTIAL_FILES
+            .iter()
+            .any(|name| env_profile.profile_dir.join(name).is_file());
+        let has_env_token = COPILOT_TOKEN_ENV_VARS
+            .iter()
+            .any(|var| env::var_os(var).is_some_and(|val| !val.is_empty()));
+
+        if has_profile_cred || has_env_token {
+            Some(Ok(ProbeOutput {
+                windows: vec![QuotaWindow {
+                    window_name: "auth".to_owned(),
+                    bucket: ModelBucket::default_bucket(),
+                    remaining: None,
+                    resets_at: None,
+                }],
+                cooldowns: Vec::new(),
+            }))
+        } else {
+            Some(Err(ProviderError::AuthenticationRequired {
+                provider: ProviderKind::Copilot,
+                account_id: account.id.clone(),
+            }))
+        }
+    }
 }
 
 /// Adapter for `OpenCode` CLI (`opencode`).
@@ -363,6 +507,60 @@ impl ProviderAdapter for OpencodeAdapter {
 
     fn login_args(&self) -> Vec<String> {
         vec!["auth".to_owned(), "login".to_owned()]
+    }
+
+    fn probe_command(&self) -> Option<ProbeCommand> {
+        Some(ProbeCommand {
+            args: vec!["auth".to_owned(), "list".to_owned()],
+        })
+    }
+
+    fn parse_usage_output(
+        &self,
+        account: &AccountConfig,
+        raw_output: &str,
+        _now: DateTime<Utc>,
+    ) -> Result<ProbeOutput, ProviderError> {
+        let mut windows = Vec::new();
+        let mut seen_buckets = std::collections::BTreeSet::new();
+
+        for line in raw_output.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let columns = split_table_columns(trimmed);
+            let is_stored = columns
+                .last()
+                .is_some_and(|col| col.eq_ignore_ascii_case("stored"));
+            if !is_stored {
+                continue;
+            }
+            let raw_provider = columns[0];
+            let slug = slugify(raw_provider);
+            if let Ok(bucket) = slug.parse::<ModelBucket>()
+                && seen_buckets.insert(bucket.clone())
+            {
+                windows.push(QuotaWindow {
+                    window_name: "auth".to_owned(),
+                    bucket,
+                    remaining: None,
+                    resets_at: None,
+                });
+            }
+        }
+
+        if windows.is_empty() {
+            return Err(ProviderError::AuthenticationRequired {
+                provider: ProviderKind::Opencode,
+                account_id: account.id.clone(),
+            });
+        }
+
+        Ok(ProbeOutput {
+            windows,
+            cooldowns: Vec::new(),
+        })
     }
 }
 
@@ -409,6 +607,31 @@ fn resolved_shared_links(account: &AccountConfig) -> Vec<String> {
             .collect()
     } else {
         account.shared_home_links.clone()
+    }
+}
+
+fn slugify(raw: &str) -> String {
+    let mut result = String::with_capacity(raw.len());
+    let mut prev_dash = false;
+    for ch in raw.trim().to_ascii_lowercase().chars() {
+        if ch.is_ascii_alphanumeric() {
+            result.push(ch);
+            prev_dash = false;
+        } else if !prev_dash && !result.is_empty() {
+            result.push('-');
+            prev_dash = true;
+        }
+    }
+    result.trim_end_matches('-').to_owned()
+}
+
+fn extract_json_object(raw: &str) -> Option<&str> {
+    let start = raw.find('{')?;
+    let end = raw.rfind('}')?;
+    if end >= start {
+        Some(&raw[start..=end])
+    } else {
+        None
     }
 }
 

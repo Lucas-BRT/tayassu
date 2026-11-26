@@ -215,4 +215,125 @@ Claude and GPT models  Five Hour Limit Remaining  0%   2026-11-26 21:38 -03
             .expect_err("percentage > 100 must fail");
         assert!(matches!(bad_pct, ProviderError::ParseUsage { .. }));
     }
+
+    #[test]
+    fn claude_parses_auth_status_json_and_detects_logged_out() {
+        let account = AccountConfig::new(
+            "claude-pro".parse().expect("id"),
+            ProviderKind::Claude,
+            "Claude Pro",
+        );
+        let now = Utc
+            .with_ymd_and_hms(2026, 11, 26, 22, 0, 0)
+            .single()
+            .expect("valid utc");
+
+        let fixture = r#"
+{
+  "loggedIn": true,
+  "authMethod": "claude.ai",
+  "loginExpiresAt": "2026-12-06T03:29:58.541Z",
+  "planTier": "pro"
+}
+"#;
+        let parsed = ClaudeAdapter
+            .parse_usage_output(&account, fixture, now)
+            .expect("claude json should parse");
+        assert_eq!(parsed.windows.len(), 1);
+        assert_eq!(parsed.windows[0].window_name, "auth:pro");
+        assert!(parsed.windows[0].resets_at.is_some());
+
+        let logged_out = ClaudeAdapter
+            .parse_usage_output(&account, r#"{"loggedIn": false}"#, now)
+            .expect_err("logged out must fail");
+        assert!(matches!(
+            logged_out,
+            ProviderError::AuthenticationRequired {
+                provider: ProviderKind::Claude,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn codex_parses_login_status_logged_in_and_out() {
+        let account = AccountConfig::new(
+            "codex-main".parse().expect("id"),
+            ProviderKind::Codex,
+            "Codex",
+        );
+        let now = Utc::now();
+
+        let parsed = CodexAdapter
+            .parse_usage_output(&account, "Logged in using ChatGPT\n", now)
+            .expect("codex logged in should parse");
+        assert_eq!(parsed.windows.len(), 1);
+        assert_eq!(parsed.windows[0].window_name, "auth");
+
+        let logged_out = CodexAdapter
+            .parse_usage_output(&account, "Not logged in\n", now)
+            .expect_err("not logged in must fail");
+        assert!(matches!(
+            logged_out,
+            ProviderError::AuthenticationRequired {
+                provider: ProviderKind::Codex,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn opencode_parses_stored_providers_and_rejects_empty() {
+        let account = AccountConfig::new(
+            "opencode-main".parse().expect("id"),
+            ProviderKind::Opencode,
+            "OpenCode",
+        );
+        let fixture = "\
+GitHub Copilot  GitHub Copilot              stored
+Google          Google                      stored
+OpenRouter      OpenRouter 2                stored
+OpenRouter      OpenRouter                  stored
+";
+        let parsed = OpencodeAdapter
+            .parse_usage_output(&account, fixture, Utc::now())
+            .expect("opencode auth list should parse");
+        let buckets: Vec<&str> = parsed
+            .windows
+            .iter()
+            .map(|win| win.bucket.as_str())
+            .collect();
+        assert_eq!(buckets, vec!["github-copilot", "google", "openrouter"]);
+
+        let empty_err = OpencodeAdapter
+            .parse_usage_output(&account, "", Utc::now())
+            .expect_err("empty auth list must require auth");
+        assert!(matches!(
+            empty_err,
+            ProviderError::AuthenticationRequired {
+                provider: ProviderKind::Opencode,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn copilot_local_probe_checks_profile_credentials() {
+        let profiles_root = TempDir::new().expect("temp dir");
+        let real_home = TempDir::new().expect("real home");
+        let account = AccountConfig::new(
+            "copilot-work".parse().expect("id"),
+            ProviderKind::Copilot,
+            "Copilot",
+        );
+        let env = CopilotAdapter.build_environment(&account, profiles_root.path());
+        env.prepare(real_home.path()).expect("prepare");
+
+        fs::write(env.profile_dir.join("config.json"), "{}").expect("write config");
+        let parsed = CopilotAdapter
+            .probe_local(&account, &env, Utc::now())
+            .expect("local probe should be supported")
+            .expect("config.json should authenticate profile");
+        assert_eq!(parsed.windows.len(), 1);
+    }
 }
