@@ -34,6 +34,19 @@ impl TestEnv {
             .expect("spawn tayassu")
     }
 
+    fn run_cli_in(&self, cwd: &Path, args: &[&str]) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_tayassu"))
+            .current_dir(cwd)
+            .args(args)
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", self.dir.path().join("home"))
+            .env("XDG_CONFIG_HOME", self.dir.path().join("config"))
+            .env("XDG_STATE_HOME", self.dir.path().join("state"))
+            .env("XDG_DATA_HOME", self.dir.path().join("data"))
+            .output()
+            .expect("spawn tayassu")
+    }
+
     fn run_ok(&self, args: &[&str]) -> String {
         let output = self.run_cli(args);
         assert!(
@@ -393,4 +406,106 @@ fn shell_init_emits_valid_wrappers_for_bash_and_fish() {
     let fish_out = env.run_ok(&["shell-init", "fish", "--provider", "copilot"]);
     assert!(fish_out.contains("function copilot --wraps copilot"));
     assert!(!fish_out.contains("function agy"));
+}
+
+#[cfg(unix)]
+#[test]
+fn project_policy_resume_memory_and_fallback_chain() {
+    let env = TestEnv::new();
+    let repo_dir = env.dir.path().join("my-work-repo");
+    fs::create_dir_all(&repo_dir).expect("mkdir repo");
+    let mock_ok = env.write_mock_script("mock-ok.sh", "#!/usr/bin/env bash\necho ok\n");
+
+    for (id, provider, pri) in [
+        ("agy-student", "agy", "10"),
+        ("claude-work", "claude", "20"),
+        ("claude-personal", "claude", "10"),
+    ] {
+        env.run_ok(&[
+            "account",
+            "add",
+            id,
+            provider,
+            "--priority",
+            pri,
+            "--binary",
+            &mock_ok,
+        ]);
+    }
+
+    fs::write(
+        repo_dir.join(".tayassu.toml"),
+        "[preferred_accounts]\nclaude = \"claude-work\"\n",
+    )
+    .expect("write .tayassu.toml");
+
+    let project_run = env.run_cli_in(&repo_dir, &["run", "claude", "--dry-run"]);
+    assert!(project_run.status.success());
+    assert!(String::from_utf8_lossy(&project_run.stdout).contains("account: claude-work"));
+
+    let forced_run = env.run_cli_in(
+        &repo_dir,
+        &["run", "claude", "--account", "claude-personal"],
+    );
+    assert!(forced_run.status.success());
+
+    let resume_dry = env.run_cli_in(
+        &repo_dir,
+        &["run", "claude", "--dry-run", "--", "--continue"],
+    );
+    assert!(String::from_utf8_lossy(&resume_dry.stdout).contains("account: claude-personal"));
+
+    let cfg_path = env.dir.path().join("config/tayassu/config.toml");
+    let cfg_text = fs::read_to_string(&cfg_path).expect("read config");
+    let updated_cfg = cfg_text.replace(
+        "[fallback_chains]",
+        "[fallback_chains]\nclaude-any = [\"agy:claude\", \"claude:default\"]",
+    );
+    fs::write(&cfg_path, updated_cfg).expect("write config with chain");
+
+    env.run_ok(&[
+        "cooldown",
+        "set",
+        "agy-student",
+        "--model",
+        "claude",
+        "--minutes",
+        "60",
+    ]);
+    let chain_dry = env.run_ok(&["run", "--chain", "claude-any", "--dry-run"]);
+    assert!(chain_dry.contains("account: claude-personal"));
+}
+
+#[cfg(unix)]
+#[test]
+fn systemd_unit_install_and_doctor_diagnostics() {
+    let env = TestEnv::new();
+    let mock_ok = env.write_mock_script("mock-ok.sh", "#!/usr/bin/env bash\necho ok\n");
+    env.run_ok(&[
+        "account",
+        "add",
+        "claude-work",
+        "claude",
+        "--binary",
+        &mock_ok,
+    ]);
+
+    let unit_out = env.run_ok(&["systemd-unit", "--interval-minutes", "10", "--install"]);
+    assert!(unit_out.contains("tayassu-probe.timer"));
+    assert!(
+        env.dir
+            .path()
+            .join("config/systemd/user/tayassu-probe.service")
+            .is_file()
+    );
+
+    let cred_file = env
+        .dir
+        .path()
+        .join("data/tayassu/profiles/claude/claude-work/.credentials.json");
+    fs::write(&cred_file, "{}").expect("write cred");
+    fs::set_permissions(&cred_file, fs::Permissions::from_mode(0o644)).expect("chmod 644");
+    let doctor_out = env.run_ok(&["doctor"]);
+    assert!(doctor_out.contains("[OK  ]"));
+    assert!(doctor_out.contains("chmod 600"));
 }
