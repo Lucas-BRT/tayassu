@@ -282,3 +282,57 @@ fn probe_supports_claude_codex_copilot_and_opencode_in_parallel() {
     assert!(status_out.contains("default:ok"));
     assert!(status_out.contains("github-copilot:ok google:ok"));
 }
+
+#[cfg(unix)]
+#[test]
+fn run_captures_stderr_rate_limit_and_failover_switches_account() {
+    let env = TestEnv::new();
+
+    let rate_limited_script = env.write_mock_script(
+        "mock-rate-limited.sh",
+        "#!/usr/bin/env bash\necho 'Error 429: usage limit reached, try again in 45 minutes' >&2\nexit 1\n",
+    );
+    let healthy_script = env.write_mock_script(
+        "mock-healthy.sh",
+        "#!/usr/bin/env bash\necho 'served-by-fallback'\n",
+    );
+
+    env.run_ok(&[
+        "account",
+        "add",
+        "claude-primary",
+        "claude",
+        "--priority",
+        "10",
+        "--binary",
+        &rate_limited_script,
+    ]);
+    env.run_ok(&[
+        "account",
+        "add",
+        "claude-backup",
+        "claude",
+        "--priority",
+        "20",
+        "--binary",
+        &healthy_script,
+    ]);
+
+    // Without --failover: command exits non-zero, but cooldown is recorded automatically.
+    let first_run = env.run_cli(&["run", "claude"]);
+    assert!(!first_run.status.success());
+    let first_stderr = String::from_utf8_lossy(&first_run.stderr);
+    assert!(first_stderr.contains("rate limit detected on 'claude-primary'"));
+
+    let status_after = env.run_ok(&["status"]);
+    assert!(status_after.contains("claude-primary"));
+    assert!(status_after.contains("COOLDOWN (45m)"));
+
+    // Clear cooldown and verify --failover automatically retries on claude-backup.
+    env.run_ok(&["cooldown", "clear", "claude-primary"]);
+    let failover_out = env.run_ok(&["run", "claude", "--failover"]);
+    assert!(failover_out.contains("served-by-fallback"));
+
+    let status_final = env.run_ok(&["status"]);
+    assert!(status_final.contains("COOLDOWN (45m)"));
+}

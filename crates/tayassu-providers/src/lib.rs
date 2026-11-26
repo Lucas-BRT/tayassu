@@ -155,6 +155,26 @@ Claude and GPT models  Five Hour Limit Remaining  0%   2026-11-26 21:38 -03
             .expect("rate limit should be detected");
 
         assert!(entry.is_active(now));
+        assert_eq!(
+            entry.resets_at.signed_duration_since(now).num_seconds(),
+            tayassu_core::DEFAULT_FALLBACK_COOLDOWN_SECS
+        );
+
+        let parsed_duration = ClaudeAdapter
+            .detect_rate_limit(
+                &account,
+                &ModelBucket::default_bucket(),
+                "Usage limit reached. Please try again in 2h 30m.",
+                now,
+            )
+            .expect("duration hint should be parsed");
+        assert_eq!(
+            parsed_duration
+                .resets_at
+                .signed_duration_since(now)
+                .num_minutes(),
+            150
+        );
     }
 
     #[test]

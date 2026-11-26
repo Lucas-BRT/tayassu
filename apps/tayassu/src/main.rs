@@ -1,14 +1,15 @@
 mod cli;
 mod render;
+mod tui;
 
 use anyhow::{Context, Result, bail};
 use chrono::{TimeDelta, Utc};
 use clap::Parser;
 use cli::{AccountAction, Cli, Command, CooldownAction};
 use render::StatusTable;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::Path;
-use std::process::{Command as ProcessCommand, Stdio};
+use std::process::{Command as ProcessCommand, ExitStatus, Stdio};
 use std::thread;
 use tayassu_core::{
     AccountConfig, AccountId, AccountRouter, CooldownEntry, ModelBucket, ProviderKind,
@@ -24,6 +25,29 @@ const DEFAULT_LOG_FILTER: &str = "warn";
 
 /// Fallback non-zero exit code when a child process is terminated by a signal.
 const SIGNAL_FALLBACK_EXIT_CODE: i32 = 1;
+
+/// Maximum stderr bytes buffered in memory during `tayassu run` for passive rate-limit detection.
+const MAX_CAPTURED_STDERR_BYTES: usize = 64 * 1024;
+
+/// Chunk size in bytes used when forwarding child stderr to the user's terminal.
+const STDERR_READ_CHUNK_BYTES: usize = 4096;
+
+/// Maximum attempts allowed when `--failover` is enabled (primary + 1 fallback account).
+const MAX_FAILOVER_ATTEMPTS: usize = 2;
+
+struct RunRequest {
+    provider: ProviderKind,
+    model: Option<ModelBucket>,
+    policy: Option<SelectionPolicy>,
+    dry_run: bool,
+    failover: bool,
+    args: Vec<String>,
+}
+
+struct RunOutcome {
+    status: ExitStatus,
+    captured_stderr: String,
+}
 
 struct App {
     paths: XdgPaths,
@@ -58,59 +82,140 @@ impl App {
                     .write_to(out, Utc::now())
                     .context("failed to write status table")
             }
+            Command::Dash => self.handle_dash(),
             Command::Run {
                 provider,
                 model,
                 policy,
                 dry_run,
+                failover,
                 args,
-            } => self.run_agent(provider, model, policy, dry_run, &args, out),
+            } => self.run_agent(
+                &RunRequest {
+                    provider,
+                    model,
+                    policy,
+                    dry_run,
+                    failover,
+                    args,
+                },
+                out,
+            ),
             Command::Account { action } => self.handle_account(action, out),
             Command::Cooldown { action } => self.handle_cooldown(action, out),
             Command::Probe { id } => self.handle_probe(id.as_ref(), out),
         }
     }
 
-    fn run_agent(
-        &self,
-        provider: ProviderKind,
-        model: Option<ModelBucket>,
-        policy: Option<SelectionPolicy>,
-        dry_run: bool,
-        args: &[String],
-        out: &mut impl Write,
-    ) -> Result<()> {
-        let bucket = model.unwrap_or_default();
-        let router = AccountRouter::new(policy.unwrap_or(self.config.default_policy));
-        let account = router
-            .select(
-                &self.config.accounts,
-                &self.state.statuses,
-                provider,
-                &bucket,
-                Utc::now(),
-            )
-            .context("cannot select an account for this run")?;
+    fn handle_dash(&mut self) -> Result<()> {
+        let paths = self.paths.clone();
+        let accounts = self.config.accounts.clone();
 
-        let adapter = AdapterRegistry.adapter_for(account.provider);
-        let env = adapter.build_environment(account, &self.paths.profiles_dir);
-        env.prepare(&self.paths.home_dir)
-            .with_context(|| format!("failed to prepare profile for {}", account.id))?;
+        tui::run_dashboard(
+            &accounts,
+            &mut self.state,
+            |state| {
+                let (ok_count, err_count) = probe_accounts(&accounts, &paths, state, None)?;
+                Ok(format!("Probe complete: {ok_count} ok, {err_count} failed"))
+            },
+            |state, account_id| {
+                let status = state.status_for_mut(account_id);
+                let cleared = status.cooldowns.len();
+                status.cooldowns.clear();
+                state
+                    .save_atomic(&paths.state_file)
+                    .with_context(|| format!("failed to save {}", paths.state_file.display()))?;
+                Ok(format!("Cleared {cleared} cooldown(s) for '{account_id}'"))
+            },
+        )
+    }
 
-        if dry_run {
-            writeln!(out, "account: {}", account.id)?;
-            writeln!(out, "executable: {}", account.executable())?;
-            for (key, value) in &env.env_vars {
-                writeln!(out, "env: {key}={value}")?;
+    fn run_agent(&mut self, req: &RunRequest, out: &mut impl Write) -> Result<()> {
+        let bucket = req.model.clone().unwrap_or_default();
+        let router = AccountRouter::new(req.policy.unwrap_or(self.config.default_policy));
+        let max_attempts = if req.failover {
+            MAX_FAILOVER_ATTEMPTS
+        } else {
+            1
+        };
+
+        for attempt in 1..=max_attempts {
+            let account = router
+                .select(
+                    &self.config.accounts,
+                    &self.state.statuses,
+                    req.provider,
+                    &bucket,
+                    Utc::now(),
+                )
+                .context("cannot select an account for this run")?
+                .clone();
+
+            let adapter = AdapterRegistry.adapter_for(account.provider);
+            let env = adapter.build_environment(&account, &self.paths.profiles_dir);
+            env.prepare(&self.paths.home_dir)
+                .with_context(|| format!("failed to prepare profile for {}", account.id))?;
+
+            if req.dry_run {
+                writeln!(out, "account: {}", account.id)?;
+                writeln!(out, "executable: {}", account.executable())?;
+                for (key, value) in &env.env_vars {
+                    writeln!(out, "env: {key}={value}")?;
+                }
+                if !req.args.is_empty() {
+                    writeln!(out, "args: {}", req.args.join(" "))?;
+                }
+                return Ok(());
             }
-            if !args.is_empty() {
-                writeln!(out, "args: {}", args.join(" "))?;
+
+            info!(account = %account.id, executable = account.executable(), "launching agent CLI");
+            let outcome = spawn_capturing_stderr(&account, &env.env_vars, &req.args)?;
+
+            let rate_limit_hit =
+                adapter.detect_rate_limit(&account, &bucket, &outcome.captured_stderr, Utc::now());
+
+            if let Some(cooldown) = rate_limit_hit {
+                let resets_at = cooldown.resets_at;
+                self.state
+                    .status_for_mut(&account.id)
+                    .set_cooldown(cooldown);
+                self.save_state()?;
+                warn!(
+                    account = %account.id,
+                    bucket = %bucket,
+                    resets_at = %resets_at.to_rfc3339(),
+                    "rate limit detected; cooldown recorded"
+                );
+                let _ = writeln!(
+                    io::stderr(),
+                    "tayassu: rate limit detected on '{}' (bucket '{}'); cooldown set until {}",
+                    account.id,
+                    bucket,
+                    resets_at.to_rfc3339()
+                );
+
+                if req.failover && attempt < max_attempts {
+                    let _ = writeln!(
+                        io::stderr(),
+                        "tayassu: failing over to next available {} account...",
+                        req.provider
+                    );
+                    continue;
+                }
+            }
+
+            if !outcome.status.success() {
+                let code = outcome.status.code().unwrap_or(SIGNAL_FALLBACK_EXIT_CODE);
+                bail!(
+                    "'{}' (account '{}') exited with status {code}",
+                    account.executable(),
+                    account.id
+                );
             }
             return Ok(());
         }
 
-        info!(account = %account.id, executable = account.executable(), "launching agent CLI");
-        spawn_interactive(account, &env.env_vars, args)
+        Ok(())
     }
 
     fn handle_account(&mut self, action: AccountAction, out: &mut impl Write) -> Result<()> {
@@ -244,57 +349,7 @@ impl App {
             return Ok(());
         }
 
-        let now = Utc::now();
-        let profiles_dir = &self.paths.profiles_dir;
-        let home_dir = &self.paths.home_dir;
-
-        let results: Vec<(AccountId, Result<ProbeOutput>)> = thread::scope(|scope| {
-            let handles: Vec<_> = targets
-                .iter()
-                .map(|account| {
-                    scope.spawn(move || {
-                        let res = run_single_probe(account, profiles_dir, home_dir, now);
-                        (account.id.clone(), res)
-                    })
-                })
-                .collect();
-
-            handles
-                .into_iter()
-                .map(|handle| handle.join().unwrap_or_else(|_| bail_unknown_probe_panic()))
-                .collect()
-        });
-
-        let mut updated_any = false;
-        for (account_id, outcome) in results {
-            match outcome {
-                Ok(parsed) => {
-                    let window_count = parsed.windows.len();
-                    let cooldown_count = parsed.cooldowns.len();
-                    let status = self.state.status_for_mut(&account_id);
-                    status.last_probed_at = Some(now);
-                    status.windows = parsed.windows;
-                    status.prune_expired(now);
-                    for cooldown in parsed.cooldowns {
-                        status.set_cooldown(cooldown);
-                    }
-                    updated_any = true;
-                    writeln!(
-                        out,
-                        "{account_id}: ok ({window_count} windows, {cooldown_count} active cooldowns)"
-                    )?;
-                }
-                Err(err) => {
-                    warn!(account = %account_id, error = %err, "probe failed");
-                    writeln!(out, "{account_id}: {err}")?;
-                }
-            }
-        }
-
-        if updated_any {
-            self.save_state()?;
-        }
-
+        probe_accounts(&targets, &self.paths, &mut self.state, Some(out))?;
         Ok(())
     }
 
@@ -309,6 +364,74 @@ impl App {
             .save_atomic(&self.paths.state_file)
             .with_context(|| format!("failed to save {}", self.paths.state_file.display()))
     }
+}
+
+fn probe_accounts(
+    targets: &[AccountConfig],
+    paths: &XdgPaths,
+    state: &mut RuntimeState,
+    mut out: Option<&mut dyn Write>,
+) -> Result<(usize, usize)> {
+    let now = Utc::now();
+    let profiles_dir = &paths.profiles_dir;
+    let home_dir = &paths.home_dir;
+
+    let results: Vec<(AccountId, Result<ProbeOutput>)> = thread::scope(|scope| {
+        let handles: Vec<_> = targets
+            .iter()
+            .map(|account| {
+                scope.spawn(move || {
+                    let res = run_single_probe(account, profiles_dir, home_dir, now);
+                    (account.id.clone(), res)
+                })
+            })
+            .collect();
+
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap_or_else(|_| bail_unknown_probe_panic()))
+            .collect()
+    });
+
+    let mut ok_count = 0usize;
+    let mut err_count = 0usize;
+    for (account_id, outcome) in results {
+        match outcome {
+            Ok(parsed) => {
+                let window_count = parsed.windows.len();
+                let cooldown_count = parsed.cooldowns.len();
+                let status = state.status_for_mut(&account_id);
+                status.last_probed_at = Some(now);
+                status.windows = parsed.windows;
+                status.prune_expired(now);
+                for cooldown in parsed.cooldowns {
+                    status.set_cooldown(cooldown);
+                }
+                ok_count += 1;
+                if let Some(writer) = out.as_deref_mut() {
+                    writeln!(
+                        writer,
+                        "{account_id}: ok ({window_count} windows, {cooldown_count} active cooldowns)"
+                    )?;
+                }
+            }
+            Err(err) => {
+                err_count += 1;
+                warn!(account = %account_id, error = %err, "probe failed");
+                if let Some(writer) = out.as_deref_mut() {
+                    writeln!(writer, "{account_id}: {err}")?;
+                }
+            }
+        }
+    }
+
+    if ok_count > 0 {
+        state
+            .save_atomic(&paths.state_file)
+            .with_context(|| format!("failed to save {}", paths.state_file.display()))?;
+    }
+
+    Ok((ok_count, err_count))
 }
 
 fn spawn_interactive(
@@ -339,6 +462,69 @@ fn spawn_interactive(
         );
     }
     Ok(())
+}
+
+/// Spawns the agent CLI with inherited stdin/stdout and teed stderr for rate-limit detection.
+fn spawn_capturing_stderr(
+    account: &AccountConfig,
+    env_vars: &[(String, String)],
+    args: &[String],
+) -> Result<RunOutcome> {
+    let mut cmd = ProcessCommand::new(account.executable());
+    cmd.args(args)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::piped());
+    for (key, value) in env_vars {
+        cmd.env(key, value);
+    }
+
+    let mut child = cmd.spawn().with_context(|| {
+        format!(
+            "failed to spawn '{}' for account '{}'",
+            account.executable(),
+            account.id
+        )
+    })?;
+
+    let stderr_handle = child.stderr.take().map(|mut child_stderr| {
+        thread::spawn(move || {
+            let mut captured = Vec::new();
+            let mut buf = [0u8; STDERR_READ_CHUNK_BYTES];
+            let mut host_stderr = io::stderr();
+            while let Ok(read_len) = child_stderr.read(&mut buf) {
+                if read_len == 0 {
+                    break;
+                }
+                let chunk = &buf[..read_len];
+                let _ = host_stderr.write_all(chunk);
+                let _ = host_stderr.flush();
+                if captured.len() < MAX_CAPTURED_STDERR_BYTES {
+                    let remaining = MAX_CAPTURED_STDERR_BYTES - captured.len();
+                    let take = read_len.min(remaining);
+                    captured.extend_from_slice(&chunk[..take]);
+                }
+            }
+            String::from_utf8_lossy(&captured).into_owned()
+        })
+    });
+
+    let status = child.wait().with_context(|| {
+        format!(
+            "failed waiting on '{}' for account '{}'",
+            account.executable(),
+            account.id
+        )
+    })?;
+
+    let captured_stderr = stderr_handle
+        .and_then(|handle| handle.join().ok())
+        .unwrap_or_default();
+
+    Ok(RunOutcome {
+        status,
+        captured_stderr,
+    })
 }
 
 fn run_single_probe(
