@@ -131,4 +131,78 @@ mod tests {
 
         assert_eq!(picked.id, second.id);
     }
+
+    #[test]
+    fn router_soonest_reset_and_expired_cooldown_handling() {
+        let now = Utc::now();
+        let mut soon = AccountConfig::new(
+            "copilot-a".parse().expect("id"),
+            ProviderKind::Copilot,
+            "Copilot A",
+        );
+        soon.priority = PRO_PRIORITY;
+
+        let mut later = AccountConfig::new(
+            "copilot-b".parse().expect("id"),
+            ProviderKind::Copilot,
+            "Copilot B",
+        );
+        later.priority = STUDENT_PRIORITY;
+
+        let mut soon_status = AccountStatus::empty(soon.id.clone());
+        soon_status.windows.push(QuotaWindow {
+            window_name: "5h".to_owned(),
+            bucket: ModelBucket::default_bucket(),
+            remaining: Some(RemainingPercent::try_from(LOW_QUOTA_PCT).expect("pct")),
+            resets_at: Some(now + TimeDelta::hours(1)),
+        });
+        // Expired cooldown must not block selection.
+        soon_status.set_cooldown(CooldownEntry {
+            bucket: ModelBucket::default_bucket(),
+            resets_at: now - TimeDelta::minutes(1),
+            reason: "expired".to_owned(),
+        });
+
+        let mut later_status = AccountStatus::empty(later.id.clone());
+        later_status.windows.push(QuotaWindow {
+            window_name: "5h".to_owned(),
+            bucket: ModelBucket::default_bucket(),
+            remaining: Some(RemainingPercent::try_from(HIGH_QUOTA_PCT).expect("pct")),
+            resets_at: Some(now + TimeDelta::hours(TEST_COOLDOWN_HOURS)),
+        });
+
+        let accounts = [soon.clone(), later];
+        let router = AccountRouter::new(SelectionPolicy::SoonestReset);
+        let picked = router
+            .select(
+                &accounts,
+                &[soon_status, later_status],
+                ProviderKind::Copilot,
+                &ModelBucket::default_bucket(),
+                now,
+            )
+            .expect("soonest resetting account should be selected");
+
+        assert_eq!(picked.id, soon.id);
+    }
+
+    #[test]
+    fn provider_kind_parses_all_supported_agents_and_display_pads() {
+        assert_eq!(
+            "copilot".parse::<ProviderKind>().expect("copilot"),
+            ProviderKind::Copilot
+        );
+        assert_eq!(
+            "github-copilot".parse::<ProviderKind>().expect("alias"),
+            ProviderKind::Copilot
+        );
+        assert_eq!(
+            "opencode".parse::<ProviderKind>().expect("opencode"),
+            ProviderKind::Opencode
+        );
+
+        let id: AccountId = "agy-pro".parse().expect("id");
+        assert_eq!(format!("{id:<12}"), "agy-pro     ");
+        assert_eq!(format!("{:<10}", ProviderKind::Agy), "agy       ");
+    }
 }

@@ -74,7 +74,7 @@ impl AsRef<str> for AccountId {
 
 impl fmt::Display for AccountId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        f.pad(&self.0)
     }
 }
 
@@ -88,6 +88,10 @@ pub enum ProviderKind {
     Claude,
     /// `OpenAI` Codex CLI (`codex`).
     Codex,
+    /// GitHub Copilot CLI (`copilot`).
+    Copilot,
+    /// `OpenCode` CLI (`opencode`).
+    Opencode,
     /// User-defined CLI binary with explicit configuration.
     Custom,
 }
@@ -100,6 +104,8 @@ impl ProviderKind {
             Self::Agy => "agy",
             Self::Claude => "claude",
             Self::Codex => "codex",
+            Self::Copilot => "copilot",
+            Self::Opencode => "opencode",
             Self::Custom => "custom-agent",
         }
     }
@@ -111,6 +117,8 @@ impl ProviderKind {
             Self::Agy => "agy",
             Self::Claude => "claude",
             Self::Codex => "codex",
+            Self::Copilot => "copilot",
+            Self::Opencode => "opencode",
             Self::Custom => "custom",
         }
     }
@@ -124,6 +132,8 @@ impl FromStr for ProviderKind {
             "agy" | "antigravity" => Ok(Self::Agy),
             "claude" | "claude-code" => Ok(Self::Claude),
             "codex" => Ok(Self::Codex),
+            "copilot" | "github-copilot" => Ok(Self::Copilot),
+            "opencode" => Ok(Self::Opencode),
             "custom" => Ok(Self::Custom),
             _ => Err(CoreError::UnknownProvider {
                 value: raw.to_owned(),
@@ -134,7 +144,7 @@ impl FromStr for ProviderKind {
 
 impl fmt::Display for ProviderKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
+        f.pad(self.as_str())
     }
 }
 
@@ -203,7 +213,7 @@ impl From<ModelBucket> for String {
 
 impl fmt::Display for ModelBucket {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        f.pad(&self.0)
     }
 }
 
