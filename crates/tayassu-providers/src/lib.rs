@@ -6,11 +6,13 @@ pub mod isolation;
 
 pub use adapter::{
     AGY_PROBE_TIMEOUT_SECS, AdapterRegistry, AgyAdapter, CLAUDE_CONFIG_DIR_ENV, CODEX_HOME_ENV,
-    ClaudeAdapter, CodexAdapter, CustomAdapter, ProbeCommand, ProbeOutput, ProviderAdapter,
+    COPILOT_HOME_ENV, ClaudeAdapter, CodexAdapter, CopilotAdapter, CustomAdapter, OpencodeAdapter,
+    ProbeCommand, ProbeOutput, ProviderAdapter,
 };
 pub use error::ProviderError;
 pub use isolation::{
-    DEFAULT_SHARED_HOME_LINKS, ENV_HOME, FAKE_HOME_SUBDIR, IsolationStrategy, ProfileEnvironment,
+    DEFAULT_SHARED_HOME_LINKS, ENV_HOME, ENV_XDG_CACHE_HOME, ENV_XDG_CONFIG_HOME,
+    ENV_XDG_DATA_HOME, ENV_XDG_STATE_HOME, FAKE_HOME_SUBDIR, IsolationStrategy, ProfileEnvironment,
 };
 
 #[cfg(test)]
@@ -153,5 +155,64 @@ Claude and GPT models  Five Hour Limit Remaining  0%   2026-11-26 21:38 -03
             .expect("rate limit should be detected");
 
         assert!(entry.is_active(now));
+    }
+
+    #[test]
+    fn copilot_uses_native_env_and_opencode_isolates_home_and_xdg() {
+        let profiles_root = TempDir::new().expect("temp dir");
+        let registry = AdapterRegistry;
+
+        let copilot = AccountConfig::new(
+            "copilot-work".parse().expect("id"),
+            ProviderKind::Copilot,
+            "Copilot Work",
+        );
+        let copilot_adapter = registry.adapter_for(ProviderKind::Copilot);
+        let copilot_env = copilot_adapter.build_environment(&copilot, profiles_root.path());
+        assert_eq!(copilot_env.env_vars.len(), 1);
+        assert_eq!(copilot_env.env_vars[0].0, COPILOT_HOME_ENV);
+        assert_eq!(copilot_adapter.login_args(), vec!["login"]);
+
+        let opencode = AccountConfig::new(
+            "opencode-main".parse().expect("id"),
+            ProviderKind::Opencode,
+            "OpenCode",
+        );
+        let opencode_adapter = registry.adapter_for(ProviderKind::Opencode);
+        let opencode_env = opencode_adapter.build_environment(&opencode, profiles_root.path());
+        let env_keys: Vec<&str> = opencode_env
+            .env_vars
+            .iter()
+            .map(|(key, _)| key.as_str())
+            .collect();
+        assert_eq!(
+            env_keys,
+            vec![
+                ENV_HOME,
+                ENV_XDG_CONFIG_HOME,
+                ENV_XDG_DATA_HOME,
+                ENV_XDG_STATE_HOME,
+                ENV_XDG_CACHE_HOME
+            ]
+        );
+        assert_eq!(opencode_adapter.login_args(), vec!["auth", "login"]);
+    }
+
+    #[test]
+    fn agy_parser_rejects_empty_or_malformed_usage_output() {
+        let account = AccountConfig::new("agy-bad".parse().expect("id"), ProviderKind::Agy, "Bad");
+        let empty_err = AgyAdapter
+            .parse_usage_output(&account, "Quota:\n", Utc::now())
+            .expect_err("empty table must fail");
+        assert!(matches!(empty_err, ProviderError::ParseUsage { .. }));
+
+        let bad_pct = AgyAdapter
+            .parse_usage_output(
+                &account,
+                "Gemini Models  Weekly Limit Remaining  150%  2026-12-03 06:02 -03\n",
+                Utc::now(),
+            )
+            .expect_err("percentage > 100 must fail");
+        assert!(matches!(bad_pct, ProviderError::ParseUsage { .. }));
     }
 }

@@ -13,6 +13,9 @@ pub const CLAUDE_CONFIG_DIR_ENV: &str = "CLAUDE_CONFIG_DIR";
 /// Native home directory env var supported by `OpenAI` Codex CLI.
 pub const CODEX_HOME_ENV: &str = "CODEX_HOME";
 
+/// Native home directory env var supported by GitHub Copilot CLI.
+pub const COPILOT_HOME_ENV: &str = "COPILOT_HOME";
+
 /// Timeout in seconds passed to `agy --print-timeout` during usage probes.
 pub const AGY_PROBE_TIMEOUT_SECS: u64 = 15;
 
@@ -297,6 +300,10 @@ impl ProviderAdapter for ClaudeAdapter {
             var_name: CLAUDE_CONFIG_DIR_ENV,
         }
     }
+
+    fn login_args(&self) -> Vec<String> {
+        vec!["auth".to_owned(), "login".to_owned()]
+    }
 }
 
 /// Adapter for `OpenAI` Codex CLI (`codex`).
@@ -312,6 +319,50 @@ impl ProviderAdapter for CodexAdapter {
         IsolationStrategy::NativeEnvVar {
             var_name: CODEX_HOME_ENV,
         }
+    }
+
+    fn login_args(&self) -> Vec<String> {
+        vec!["login".to_owned()]
+    }
+}
+
+/// Adapter for GitHub Copilot CLI (`copilot`).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct CopilotAdapter;
+
+impl ProviderAdapter for CopilotAdapter {
+    fn kind(&self) -> ProviderKind {
+        ProviderKind::Copilot
+    }
+
+    fn isolation(&self, _account: &AccountConfig) -> IsolationStrategy {
+        IsolationStrategy::NativeEnvVar {
+            var_name: COPILOT_HOME_ENV,
+        }
+    }
+
+    fn login_args(&self) -> Vec<String> {
+        vec!["login".to_owned()]
+    }
+}
+
+/// Adapter for `OpenCode` CLI (`opencode`).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct OpencodeAdapter;
+
+impl ProviderAdapter for OpencodeAdapter {
+    fn kind(&self) -> ProviderKind {
+        ProviderKind::Opencode
+    }
+
+    fn isolation(&self, account: &AccountConfig) -> IsolationStrategy {
+        IsolationStrategy::FakeHome {
+            shared_links: resolved_shared_links(account),
+        }
+    }
+
+    fn login_args(&self) -> Vec<String> {
+        vec!["auth".to_owned(), "login".to_owned()]
     }
 }
 
@@ -343,6 +394,8 @@ impl AdapterRegistry {
             ProviderKind::Agy => Box::new(AgyAdapter),
             ProviderKind::Claude => Box::new(ClaudeAdapter),
             ProviderKind::Codex => Box::new(CodexAdapter),
+            ProviderKind::Copilot => Box::new(CopilotAdapter),
+            ProviderKind::Opencode => Box::new(OpencodeAdapter),
             ProviderKind::Custom => Box::new(CustomAdapter),
         }
     }
