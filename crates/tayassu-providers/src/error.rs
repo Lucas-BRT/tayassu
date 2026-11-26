@@ -1,0 +1,33 @@
+use std::path::PathBuf;
+use tayassu_core::ProviderKind;
+use thiserror::Error;
+
+/// Errors returned by provider isolation and probing adapters.
+#[derive(Debug, Error)]
+pub enum ProviderError {
+    /// Filesystem operation failed while preparing an isolated profile.
+    #[error("profile filesystem error at {path}: {source}")]
+    Io {
+        /// Path involved in the failed operation.
+        path: PathBuf,
+        /// Underlying OS error.
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// Provider does not yet implement automatic usage probing.
+    #[error("automatic usage probe is not implemented yet for provider '{provider}'")]
+    ProbeNotImplemented {
+        /// Provider lacking probe support.
+        provider: ProviderKind,
+    },
+
+    /// Provider usage output could not be parsed.
+    #[error("failed to parse usage output for provider '{provider}': {reason}")]
+    ParseUsage {
+        /// Provider whose output failed parsing.
+        provider: ProviderKind,
+        /// Parsing failure detail.
+        reason: String,
+    },
+}
