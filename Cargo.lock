@@ -560,6 +560,7 @@ dependencies = [
  "tayassu-core",
  "tayassu-providers",
  "tayassu-store",
+ "tempfile",
  "tracing",
  "tracing-subscriber",
 ]
