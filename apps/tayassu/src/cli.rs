@@ -1,3 +1,4 @@
+use crate::shell::ShellKind;
 use clap::{Parser, Subcommand};
 use tayassu_core::{
     AccountId, DEFAULT_ACCOUNT_PRIORITY, ModelBucket, ProviderKind, SelectionPolicy,
@@ -91,6 +92,18 @@ pub enum Command {
         /// Selection priority assigned to imported accounts.
         #[arg(long, default_value_t = DEFAULT_ACCOUNT_PRIORITY)]
         priority: u8,
+    },
+
+    /// Print shell wrapper functions so `agy`, `claude`, `codex`, etc. route through `tayassu`.
+    ShellInit {
+        /// Target shell (`bash`, `zsh`, `fish`).
+        shell: ShellKind,
+        /// Restrict wrappers to specific provider(s) (repeatable). Defaults to all built-in agents.
+        #[arg(long = "provider")]
+        providers: Vec<ProviderKind>,
+        /// Include `--failover` in generated wrapper functions.
+        #[arg(long)]
+        failover: bool,
     },
 }
 

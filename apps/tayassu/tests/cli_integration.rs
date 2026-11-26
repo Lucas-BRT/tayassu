@@ -380,3 +380,17 @@ fn import_discovers_filters_and_migrates_update_safely() {
     assert!(local_bin.join("claude").is_file());
     assert!(home.join(".codex/auth.json").is_file());
 }
+
+#[test]
+fn shell_init_emits_valid_wrappers_for_bash_and_fish() {
+    let env = TestEnv::new();
+
+    let bash_out = env.run_ok(&["shell-init", "bash", "--failover"]);
+    assert!(bash_out.contains("agy() { tayassu run agy --failover -- \"$@\"; }"));
+    assert!(bash_out.contains("claude() { tayassu run claude --failover -- \"$@\"; }"));
+    assert!(bash_out.contains("codex() { tayassu run codex --failover -- \"$@\"; }"));
+
+    let fish_out = env.run_ok(&["shell-init", "fish", "--provider", "copilot"]);
+    assert!(fish_out.contains("function copilot --wraps copilot"));
+    assert!(!fish_out.contains("function agy"));
+}

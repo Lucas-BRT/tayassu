@@ -1,5 +1,6 @@
 mod cli;
 mod render;
+mod shell;
 mod tui;
 
 use anyhow::{Context, Result, bail};
@@ -7,6 +8,7 @@ use chrono::{TimeDelta, Utc};
 use clap::Parser;
 use cli::{AccountAction, Cli, Command, CooldownAction};
 use render::StatusTable;
+use shell::ShellInit;
 use std::env;
 use std::io::{self, Read, Write};
 use std::path::Path;
@@ -112,6 +114,14 @@ impl App {
                 move_auth,
                 priority,
             } => self.handle_import(&include, &exclude, dry_run, move_auth, priority, out),
+            Command::ShellInit {
+                shell,
+                providers,
+                failover,
+            } => {
+                let snippet = ShellInit::new(shell, providers, failover).render();
+                write!(out, "{snippet}").context("failed to write shell-init snippet")
+            }
         }
     }
 
