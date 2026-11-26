@@ -107,6 +107,11 @@ pub trait ProviderAdapter: Send + Sync {
         Vec::new()
     }
 
+    /// Arguments passed to the CLI executable to self-update in the real host `$HOME`.
+    fn update_args(&self) -> Option<Vec<String>> {
+        None
+    }
+
     /// Non-interactive probe command specification, if supported by this provider.
     fn probe_command(&self) -> Option<ProbeCommand> {
         None
@@ -243,6 +248,10 @@ impl ProviderAdapter for AgyAdapter {
         vec!["--print=/usage".to_owned()]
     }
 
+    fn update_args(&self) -> Option<Vec<String>> {
+        Some(vec!["update".to_owned()])
+    }
+
     fn probe_command(&self) -> Option<ProbeCommand> {
         Some(ProbeCommand {
             args: vec![
@@ -362,6 +371,10 @@ impl ProviderAdapter for ClaudeAdapter {
 
     fn login_args(&self) -> Vec<String> {
         vec!["auth".to_owned(), "login".to_owned()]
+    }
+
+    fn update_args(&self) -> Option<Vec<String>> {
+        Some(vec!["update".to_owned()])
     }
 
     fn probe_command(&self) -> Option<ProbeCommand> {
@@ -493,6 +506,10 @@ impl ProviderAdapter for CopilotAdapter {
         vec!["login".to_owned()]
     }
 
+    fn update_args(&self) -> Option<Vec<String>> {
+        Some(vec!["update".to_owned()])
+    }
+
     fn probe_local(
         &self,
         account: &AccountConfig,
@@ -542,6 +559,10 @@ impl ProviderAdapter for OpencodeAdapter {
 
     fn login_args(&self) -> Vec<String> {
         vec!["auth".to_owned(), "login".to_owned()]
+    }
+
+    fn update_args(&self) -> Option<Vec<String>> {
+        Some(vec!["upgrade".to_owned()])
     }
 
     fn probe_command(&self) -> Option<ProbeCommand> {
