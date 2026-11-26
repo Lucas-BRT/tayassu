@@ -62,6 +62,22 @@ const COPILOT_TOKEN_ENV_VARS: &[&str] = &["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "G
 /// Credential/config filenames written under `COPILOT_HOME` after `copilot login`.
 const COPILOT_CREDENTIAL_FILES: &[&str] = &["config.json", "hosts.json"];
 
+/// Shared links added for `agy` fake `HOME` so `agy update`, skills, and MCP configs stay unified.
+const AGY_EXTRA_SHARED_LINKS: &[&str] = &[
+    ".local/bin",
+    ".gemini/antigravity-cli/skills",
+    ".gemini/antigravity-cli/mcp",
+    ".gemini/GEMINI.md",
+];
+
+/// Shared links added for `opencode` fake `HOME` so `opencode upgrade`, skills, and plugins stay unified.
+const OPENCODE_EXTRA_SHARED_LINKS: &[&str] = &[
+    ".opencode/bin",
+    ".config/opencode/skills",
+    ".config/opencode/plugins",
+    ".config/opencode/AGENTS.md",
+];
+
 /// Command arguments used to probe usage or auth status non-interactively for a provider.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProbeCommand {
@@ -89,6 +105,11 @@ pub trait ProviderAdapter: Send + Sync {
     /// Arguments passed to the CLI executable for interactive account login.
     fn login_args(&self) -> Vec<String> {
         Vec::new()
+    }
+
+    /// Arguments passed to the CLI executable to self-update in the real host `$HOME`.
+    fn update_args(&self) -> Option<Vec<String>> {
+        None
     }
 
     /// Non-interactive probe command specification, if supported by this provider.
@@ -219,12 +240,16 @@ impl ProviderAdapter for AgyAdapter {
 
     fn isolation(&self, account: &AccountConfig) -> IsolationStrategy {
         IsolationStrategy::FakeHome {
-            shared_links: resolved_shared_links(account),
+            shared_links: resolved_shared_links(account, AGY_EXTRA_SHARED_LINKS),
         }
     }
 
     fn login_args(&self) -> Vec<String> {
         vec!["--print=/usage".to_owned()]
+    }
+
+    fn update_args(&self) -> Option<Vec<String>> {
+        Some(vec!["update".to_owned()])
     }
 
     fn probe_command(&self) -> Option<ProbeCommand> {
@@ -346,6 +371,10 @@ impl ProviderAdapter for ClaudeAdapter {
 
     fn login_args(&self) -> Vec<String> {
         vec!["auth".to_owned(), "login".to_owned()]
+    }
+
+    fn update_args(&self) -> Option<Vec<String>> {
+        Some(vec!["update".to_owned()])
     }
 
     fn probe_command(&self) -> Option<ProbeCommand> {
@@ -477,6 +506,10 @@ impl ProviderAdapter for CopilotAdapter {
         vec!["login".to_owned()]
     }
 
+    fn update_args(&self) -> Option<Vec<String>> {
+        Some(vec!["update".to_owned()])
+    }
+
     fn probe_local(
         &self,
         account: &AccountConfig,
@@ -520,12 +553,16 @@ impl ProviderAdapter for OpencodeAdapter {
 
     fn isolation(&self, account: &AccountConfig) -> IsolationStrategy {
         IsolationStrategy::FakeHome {
-            shared_links: resolved_shared_links(account),
+            shared_links: resolved_shared_links(account, OPENCODE_EXTRA_SHARED_LINKS),
         }
     }
 
     fn login_args(&self) -> Vec<String> {
         vec!["auth".to_owned(), "login".to_owned()]
+    }
+
+    fn update_args(&self) -> Option<Vec<String>> {
+        Some(vec!["upgrade".to_owned()])
     }
 
     fn probe_command(&self) -> Option<ProbeCommand> {
@@ -594,7 +631,7 @@ impl ProviderAdapter for CustomAdapter {
 
     fn isolation(&self, account: &AccountConfig) -> IsolationStrategy {
         IsolationStrategy::FakeHome {
-            shared_links: resolved_shared_links(account),
+            shared_links: resolved_shared_links(account, &[]),
         }
     }
 }
@@ -618,10 +655,11 @@ impl AdapterRegistry {
     }
 }
 
-fn resolved_shared_links(account: &AccountConfig) -> Vec<String> {
+fn resolved_shared_links(account: &AccountConfig, extra_defaults: &[&str]) -> Vec<String> {
     if account.shared_home_links.is_empty() {
         DEFAULT_SHARED_HOME_LINKS
             .iter()
+            .chain(extra_defaults.iter())
             .map(|entry| (*entry).to_owned())
             .collect()
     } else {

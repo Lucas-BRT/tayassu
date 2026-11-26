@@ -1,9 +1,10 @@
 use crate::atomic::write_atomic;
 use crate::error::StoreError;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
-use tayassu_core::{AccountConfig, AccountId, SelectionPolicy};
+use tayassu_core::{AccountConfig, AccountId, FallbackTarget, SelectionPolicy};
 
 /// Top-level user configuration persisted in `config.toml`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -11,6 +12,9 @@ pub struct AppConfig {
     /// Default routing policy when `--policy` is not passed on the CLI.
     #[serde(default)]
     pub default_policy: SelectionPolicy,
+    /// Named cross-provider fallback chains (e.g. `claude = ["agy:claude", "claude:default"]`).
+    #[serde(default)]
+    pub fallback_chains: BTreeMap<String, Vec<FallbackTarget>>,
     /// Configured subscription accounts.
     #[serde(default)]
     pub accounts: Vec<AccountConfig>,

@@ -66,4 +66,17 @@ pub enum CoreError {
         /// Missing account identifier.
         id: AccountId,
     },
+
+    /// Fallback target string failed parsing (`<provider>` or `<provider>:<bucket>`).
+    #[error("invalid fallback target '{value}': {reason}")]
+    InvalidFallbackTarget {
+        /// Raw rejected input.
+        value: String,
+        /// Validation reason.
+        reason: String,
+    },
+
+    /// No account in any target of a fallback chain is available.
+    #[error("no available account across fallback chain")]
+    NoAvailableAccountInChain,
 }
