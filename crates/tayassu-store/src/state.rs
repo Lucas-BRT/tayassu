@@ -1,22 +1,29 @@
 use crate::atomic::write_atomic;
 use crate::error::StoreError;
 use serde::{Deserialize, Serialize};
-use std::fs;
-use std::path::Path;
-use tayassu_core::{AccountId, AccountStatus};
+use std::collections::BTreeMap;
+use std::fs::{self, File, OpenOptions};
+use std::path::{Path, PathBuf};
+use tayassu_core::{AccountId, AccountStatus, ProviderKind};
 
 /// Current schema version written to `state.json`.
 pub const STATE_SCHEMA_VERSION: u32 = 1;
 
-/// Persisted quota and cooldown runtime state (`state.json`).
+/// Lock filename sibling to `state.json` guarding concurrent read-modify-write updates.
+const STATE_LOCK_FILE_NAME: &str = "state.lock";
+
+/// Persisted quota, cooldown, and per-directory session state (`state.json`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeState {
     /// Forward-compatibility schema version.
     #[serde(default = "default_schema_version")]
     pub schema_version: u32,
-    /// Per-account quota snapshots and active cooldowns.
+    /// Per-account quota snapshots, active cooldowns, and active session counts.
     #[serde(default)]
     pub statuses: Vec<AccountStatus>,
+    /// Last account used per `<cwd>::<provider>` key to support `--continue`/`--resume`.
+    #[serde(default)]
+    pub last_account_by_cwd: BTreeMap<String, AccountId>,
 }
 
 const fn default_schema_version() -> u32 {
@@ -28,6 +35,7 @@ impl Default for RuntimeState {
         Self {
             schema_version: STATE_SCHEMA_VERSION,
             statuses: Vec::new(),
+            last_account_by_cwd: BTreeMap::new(),
         }
     }
 }
@@ -62,6 +70,23 @@ impl RuntimeState {
         write_atomic(path, &serialized)
     }
 
+    /// Acquires an exclusive OS file lock on `state.lock`, reloads `state.json`, applies `mutate`,
+    /// and atomically writes the updated state back to disk.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] if locking, loading, or saving fails.
+    pub fn update_locked<T, F>(path: &Path, mutate: F) -> Result<(Self, T), StoreError>
+    where
+        F: FnOnce(&mut Self) -> T,
+    {
+        let _lock = StateLock::acquire(path)?;
+        let mut state = Self::load(path)?;
+        let result = mutate(&mut state);
+        state.save_atomic(path)?;
+        Ok((state, result))
+    }
+
     /// Looks up the runtime status for `account_id`.
     #[must_use]
     pub fn status_for(&self, account_id: &AccountId) -> Option<&AccountStatus> {
@@ -83,4 +108,62 @@ impl RuntimeState {
         let last = self.statuses.len() - 1;
         &mut self.statuses[last]
     }
+
+    /// Records the last account used in `cwd` for `provider`.
+    pub fn record_cwd_account(
+        &mut self,
+        cwd: &Path,
+        provider: ProviderKind,
+        account_id: AccountId,
+    ) {
+        let key = cwd_provider_key(cwd, provider);
+        self.last_account_by_cwd.insert(key, account_id);
+    }
+
+    /// Looks up the last account used in `cwd` for `provider`.
+    #[must_use]
+    pub fn last_cwd_account(&self, cwd: &Path, provider: ProviderKind) -> Option<&AccountId> {
+        let key = cwd_provider_key(cwd, provider);
+        self.last_account_by_cwd.get(&key)
+    }
+}
+
+/// Exclusive advisory file lock guarding concurrent `state.json` mutations.
+struct StateLock {
+    _file: File,
+}
+
+impl StateLock {
+    fn acquire(state_path: &Path) -> Result<Self, StoreError> {
+        let lock_path = state_lock_path(state_path);
+        if let Some(parent) = lock_path.parent() {
+            fs::create_dir_all(parent).map_err(|source| StoreError::Io {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(|source| StoreError::Io {
+                path: lock_path.clone(),
+                source,
+            })?;
+        file.lock().map_err(|source| StoreError::Io {
+            path: lock_path,
+            source,
+        })?;
+        Ok(Self { _file: file })
+    }
+}
+
+fn state_lock_path(state_path: &Path) -> PathBuf {
+    state_path.with_file_name(STATE_LOCK_FILE_NAME)
+}
+
+fn cwd_provider_key(cwd: &Path, provider: ProviderKind) -> String {
+    format!("{}::{}", cwd.display(), provider)
 }
