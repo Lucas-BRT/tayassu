@@ -72,6 +72,26 @@ pub enum Command {
         #[arg(long)]
         id: Option<AccountId>,
     },
+
+    /// Auto-discover installed AI CLIs and safely import their host credentials into isolated profiles.
+    #[command(alias = "discover")]
+    Import {
+        /// Include only specific provider(s) (repeatable). Defaults to all discovered providers.
+        #[arg(long = "provider")]
+        include: Vec<ProviderKind>,
+        /// Exclude specific provider(s) from discovery/import (repeatable).
+        #[arg(long = "exclude")]
+        exclude: Vec<ProviderKind>,
+        /// Preview discovered agents, files, and update-safety notes without modifying disk.
+        #[arg(long)]
+        dry_run: bool,
+        /// Remove original host auth files after verified copy (never removes binaries or updater dirs).
+        #[arg(long)]
+        move_auth: bool,
+        /// Selection priority assigned to imported accounts.
+        #[arg(long, default_value_t = DEFAULT_ACCOUNT_PRIORITY)]
+        priority: u8,
+    },
 }
 
 /// Account management subcommands.

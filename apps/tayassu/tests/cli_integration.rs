@@ -25,6 +25,7 @@ impl TestEnv {
     fn run_cli(&self, args: &[&str]) -> Output {
         Command::new(env!("CARGO_BIN_EXE_tayassu"))
             .args(args)
+            .env("PATH", "/usr/bin:/bin")
             .env("HOME", self.dir.path().join("home"))
             .env("XDG_CONFIG_HOME", self.dir.path().join("config"))
             .env("XDG_STATE_HOME", self.dir.path().join("state"))
@@ -335,4 +336,47 @@ fn run_captures_stderr_rate_limit_and_failover_switches_account() {
 
     let status_final = env.run_ok(&["status"]);
     assert!(status_final.contains("COOLDOWN (45m)"));
+}
+
+#[cfg(unix)]
+#[test]
+fn import_discovers_filters_and_migrates_update_safely() {
+    let env = TestEnv::new();
+    let home = env.dir.path().join("home");
+    let local_bin = home.join(".local/bin");
+    fs::create_dir_all(&local_bin).expect("mkdir local bin");
+
+    for bin_name in ["claude", "codex", "agy"] {
+        let bin_path = local_bin.join(bin_name);
+        fs::write(&bin_path, "#!/usr/bin/env bash\n").expect("write stub bin");
+        let mut perms = fs::metadata(&bin_path).expect("meta").permissions();
+        perms.set_mode(SCRIPT_EXECUTABLE_MODE);
+        fs::set_permissions(&bin_path, perms).expect("chmod");
+    }
+
+    fs::create_dir_all(home.join(".claude")).expect("mkdir .claude");
+    fs::write(home.join(".claude/.credentials.json"), "{}").expect("write claude cred");
+    fs::create_dir_all(home.join(".codex")).expect("mkdir .codex");
+    fs::write(home.join(".codex/auth.json"), "{}").expect("write codex auth");
+
+    // Dry-run excluding agy must list claude and codex without modifying config.toml.
+    let dry = env.run_ok(&["import", "--dry-run", "--exclude", "agy"]);
+    assert!(dry.contains("[dry-run] claude -> account 'claude-host'"));
+    assert!(dry.contains("[dry-run] codex -> account 'codex-host'"));
+    assert!(!dry.contains("agy-host"));
+    assert!(!env.dir.path().join("config/tayassu/config.toml").exists());
+
+    // Real import with --provider claude --move-auth moves only .credentials.json.
+    let imported = env.run_ok(&["import", "--provider", "claude", "--move-auth"]);
+    assert!(imported.contains("Imported 'claude-host' (claude)"));
+    assert!(!home.join(".claude/.credentials.json").exists());
+    assert!(
+        env.dir
+            .path()
+            .join("data/tayassu/profiles/claude/claude-host/.credentials.json")
+            .is_file()
+    );
+    // Host binary and codex auth (excluded) remain untouched.
+    assert!(local_bin.join("claude").is_file());
+    assert!(home.join(".codex/auth.json").is_file());
 }

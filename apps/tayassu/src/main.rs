@@ -7,6 +7,7 @@ use chrono::{TimeDelta, Utc};
 use clap::Parser;
 use cli::{AccountAction, Cli, Command, CooldownAction};
 use render::StatusTable;
+use std::env;
 use std::io::{self, Read, Write};
 use std::path::Path;
 use std::process::{Command as ProcessCommand, ExitStatus, Stdio};
@@ -15,7 +16,7 @@ use tayassu_core::{
     AccountConfig, AccountId, AccountRouter, CooldownEntry, ModelBucket, ProviderKind,
     SelectionPolicy,
 };
-use tayassu_providers::{AdapterRegistry, ProbeOutput};
+use tayassu_providers::{AdapterRegistry, HostDiscovery, MigrationMode, ProbeOutput};
 use tayassu_store::{AppConfig, RuntimeState, XdgPaths};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
@@ -104,6 +105,13 @@ impl App {
             Command::Account { action } => self.handle_account(action, out),
             Command::Cooldown { action } => self.handle_cooldown(action, out),
             Command::Probe { id } => self.handle_probe(id.as_ref(), out),
+            Command::Import {
+                include,
+                exclude,
+                dry_run,
+                move_auth,
+                priority,
+            } => self.handle_import(&include, &exclude, dry_run, move_auth, priority, out),
         }
     }
 
@@ -350,6 +358,98 @@ impl App {
         }
 
         probe_accounts(&targets, &self.paths, &mut self.state, Some(out))?;
+        Ok(())
+    }
+
+    fn handle_import(
+        &mut self,
+        include: &[ProviderKind],
+        exclude: &[ProviderKind],
+        dry_run: bool,
+        move_auth: bool,
+        priority: u8,
+        out: &mut impl Write,
+    ) -> Result<()> {
+        let discovered: Vec<_> = HostDiscovery
+            .discover_all(&self.paths.home_dir, env::var_os("PATH").as_deref())
+            .into_iter()
+            .filter(|agent| include.is_empty() || include.contains(&agent.provider))
+            .filter(|agent| !exclude.contains(&agent.provider))
+            .collect();
+
+        if discovered.is_empty() {
+            writeln!(out, "No matching installed AI CLI agents found.")?;
+            return Ok(());
+        }
+
+        let mode = if move_auth {
+            MigrationMode::MoveAuth
+        } else {
+            MigrationMode::Copy
+        };
+
+        let mut imported_any = false;
+        for agent in &discovered {
+            let mut account = AccountConfig::new(
+                agent.default_account_id.clone(),
+                agent.provider,
+                format!("{} (imported)", agent.provider),
+            );
+            account.priority = priority;
+
+            let adapter = AdapterRegistry.adapter_for(agent.provider);
+            let profile_env = adapter.build_environment(&account, &self.paths.profiles_dir);
+
+            if dry_run {
+                writeln!(
+                    out,
+                    "[dry-run] {} -> account '{}' (binary: {}, {} credential/config file(s) found)",
+                    agent.provider,
+                    agent.default_account_id,
+                    agent.binary_path.display(),
+                    agent.existing_file_count()
+                )?;
+                writeln!(out, "  update-safety: {}", agent.update_safety_note)?;
+                if agent.requires_relogin {
+                    writeln!(
+                        out,
+                        "  note: run `tayassu account login {}` after import",
+                        agent.default_account_id
+                    )?;
+                }
+                continue;
+            }
+
+            let summary = agent
+                .apply(&profile_env, &self.paths.home_dir, mode)
+                .with_context(|| format!("failed to import {}", agent.provider))?;
+
+            self.config.upsert_account(account);
+            imported_any = true;
+
+            writeln!(
+                out,
+                "Imported '{}' ({}) -> {} ({} file(s) copied, {} host auth file(s) moved)",
+                agent.default_account_id,
+                agent.provider,
+                profile_env.profile_dir.display(),
+                summary.copied_files,
+                summary.removed_source_files
+            )?;
+            writeln!(out, "  update-safety: {}", agent.update_safety_note)?;
+            if summary.requires_relogin {
+                writeln!(
+                    out,
+                    "  next: run `tayassu account login {}`",
+                    agent.default_account_id
+                )?;
+            }
+        }
+
+        if imported_any {
+            self.save_config()?;
+        }
+
         Ok(())
     }
 
