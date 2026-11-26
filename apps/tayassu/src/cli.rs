@@ -28,6 +28,9 @@ pub enum Command {
         model: Option<ModelBucket>,
     },
 
+    /// Open an interactive live terminal dashboard for accounts, quotas, and cooldowns.
+    Dash,
+
     /// Select an available account for a provider and invoke its CLI in an isolated profile.
     Run {
         /// Provider to invoke (`agy`, `claude`, `codex`, `copilot`, `opencode`, `custom`).
@@ -41,6 +44,9 @@ pub enum Command {
         /// Print the chosen account and isolated environment without spawning the CLI.
         #[arg(long)]
         dry_run: bool,
+        /// Retry once on the next available account if the first run hits a rate limit.
+        #[arg(long)]
+        failover: bool,
         /// Extra arguments passed verbatim to the underlying agent CLI.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
