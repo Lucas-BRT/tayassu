@@ -14,7 +14,9 @@ pub enum CoreError {
     },
 
     /// Provider name is not recognized.
-    #[error("unknown provider '{value}'; expected one of: agy, claude, codex, custom")]
+    #[error(
+        "unknown provider '{value}'; expected one of: agy, claude, codex, copilot, opencode, custom"
+    )]
     UnknownProvider {
         /// Raw rejected input.
         value: String,

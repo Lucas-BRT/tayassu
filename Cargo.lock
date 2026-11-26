@@ -560,6 +560,7 @@ dependencies = [
  "tayassu-core",
  "tayassu-providers",
  "tayassu-store",
+ "tempfile",
  "tracing",
  "tracing-subscriber",
 ]
@@ -578,6 +579,8 @@ name = "tayassu-providers"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "serde",
+ "serde_json",
  "tayassu-core",
  "tempfile",
  "thiserror",

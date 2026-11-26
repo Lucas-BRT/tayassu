@@ -7,6 +7,8 @@ license.workspace = true
 
 [dependencies]
 chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 tayassu-core.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

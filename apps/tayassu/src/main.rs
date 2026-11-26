@@ -7,12 +7,14 @@ use clap::Parser;
 use cli::{AccountAction, Cli, Command, CooldownAction};
 use render::StatusTable;
 use std::io::{self, Write};
-use std::process::Command as ProcessCommand;
+use std::path::Path;
+use std::process::{Command as ProcessCommand, Stdio};
+use std::thread;
 use tayassu_core::{
     AccountConfig, AccountId, AccountRouter, CooldownEntry, ModelBucket, ProviderKind,
     SelectionPolicy,
 };
-use tayassu_providers::AdapterRegistry;
+use tayassu_providers::{AdapterRegistry, ProbeOutput};
 use tayassu_store::{AppConfig, RuntimeState, XdgPaths};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
@@ -46,12 +48,11 @@ impl App {
     fn execute(&mut self, command: Command, out: &mut impl Write) -> Result<()> {
         match command {
             Command::Status { provider, model } => {
-                let bucket = model.unwrap_or_default();
                 let table = StatusTable::new(
                     &self.config.accounts,
                     &self.state.statuses,
                     provider,
-                    &bucket,
+                    model.as_ref(),
                 );
                 table
                     .write_to(out, Utc::now())
@@ -109,29 +110,7 @@ impl App {
         }
 
         info!(account = %account.id, executable = account.executable(), "launching agent CLI");
-        let mut cmd = ProcessCommand::new(account.executable());
-        cmd.args(args);
-        for (key, value) in &env.env_vars {
-            cmd.env(key, value);
-        }
-
-        let exit_status = cmd.status().with_context(|| {
-            format!(
-                "failed to spawn '{}' for account '{}'",
-                account.executable(),
-                account.id
-            )
-        })?;
-
-        if !exit_status.success() {
-            let code = exit_status.code().unwrap_or(SIGNAL_FALLBACK_EXIT_CODE);
-            bail!(
-                "'{}' (account '{}') exited with status {code}",
-                account.executable(),
-                account.id
-            );
-        }
-        Ok(())
+        spawn_interactive(account, &env.env_vars, args)
     }
 
     fn handle_account(&mut self, action: AccountAction, out: &mut impl Write) -> Result<()> {
@@ -184,6 +163,27 @@ impl App {
                     writeln!(out, "export {key}={value}")?;
                 }
             }
+            AccountAction::Login { id } => {
+                let account = self
+                    .config
+                    .find_account(&id)
+                    .with_context(|| format!("account '{id}' not found"))?
+                    .clone();
+                let adapter = AdapterRegistry.adapter_for(account.provider);
+                let env = adapter.build_environment(&account, &self.paths.profiles_dir);
+                env.prepare(&self.paths.home_dir)
+                    .with_context(|| format!("failed to prepare profile for {id}"))?;
+
+                writeln!(
+                    out,
+                    "Logging in '{id}' ({}) using isolated profile {}",
+                    account.provider,
+                    env.profile_dir.display()
+                )?;
+                out.flush()?;
+                let login_args = adapter.login_args();
+                spawn_interactive(&account, &env.env_vars, &login_args)?;
+            }
         }
         Ok(())
     }
@@ -228,29 +228,73 @@ impl App {
         Ok(())
     }
 
-    fn handle_probe(&self, id: Option<&AccountId>, out: &mut impl Write) -> Result<()> {
-        let targets: Vec<&AccountConfig> = match id {
+    fn handle_probe(&mut self, id: Option<&AccountId>, out: &mut impl Write) -> Result<()> {
+        let targets: Vec<AccountConfig> = match id {
             Some(target_id) => vec![
                 self.config
                     .find_account(target_id)
-                    .with_context(|| format!("account '{target_id}' not found"))?,
+                    .with_context(|| format!("account '{target_id}' not found"))?
+                    .clone(),
             ],
-            None => self.config.accounts.iter().collect(),
+            None => self.config.accounts.clone(),
         };
+
         if targets.is_empty() {
             writeln!(out, "No accounts configured to probe.")?;
             return Ok(());
         }
-        for account in targets {
-            let adapter = AdapterRegistry.adapter_for(account.provider);
-            match adapter.parse_usage_output(account, "", Utc::now()) {
-                Ok(_) => writeln!(out, "{}: ok", account.id)?,
+
+        let now = Utc::now();
+        let profiles_dir = &self.paths.profiles_dir;
+        let home_dir = &self.paths.home_dir;
+
+        let results: Vec<(AccountId, Result<ProbeOutput>)> = thread::scope(|scope| {
+            let handles: Vec<_> = targets
+                .iter()
+                .map(|account| {
+                    scope.spawn(move || {
+                        let res = run_single_probe(account, profiles_dir, home_dir, now);
+                        (account.id.clone(), res)
+                    })
+                })
+                .collect();
+
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap_or_else(|_| bail_unknown_probe_panic()))
+                .collect()
+        });
+
+        let mut updated_any = false;
+        for (account_id, outcome) in results {
+            match outcome {
+                Ok(parsed) => {
+                    let window_count = parsed.windows.len();
+                    let cooldown_count = parsed.cooldowns.len();
+                    let status = self.state.status_for_mut(&account_id);
+                    status.last_probed_at = Some(now);
+                    status.windows = parsed.windows;
+                    status.prune_expired(now);
+                    for cooldown in parsed.cooldowns {
+                        status.set_cooldown(cooldown);
+                    }
+                    updated_any = true;
+                    writeln!(
+                        out,
+                        "{account_id}: ok ({window_count} windows, {cooldown_count} active cooldowns)"
+                    )?;
+                }
                 Err(err) => {
-                    warn!(account = %account.id, error = %err, "probe skipped");
-                    writeln!(out, "{}: {err}", account.id)?;
+                    warn!(account = %account_id, error = %err, "probe failed");
+                    writeln!(out, "{account_id}: {err}")?;
                 }
             }
         }
+
+        if updated_any {
+            self.save_state()?;
+        }
+
         Ok(())
     }
 
@@ -265,6 +309,90 @@ impl App {
             .save_atomic(&self.paths.state_file)
             .with_context(|| format!("failed to save {}", self.paths.state_file.display()))
     }
+}
+
+fn spawn_interactive(
+    account: &AccountConfig,
+    env_vars: &[(String, String)],
+    args: &[String],
+) -> Result<()> {
+    let mut cmd = ProcessCommand::new(account.executable());
+    cmd.args(args);
+    for (key, value) in env_vars {
+        cmd.env(key, value);
+    }
+
+    let exit_status = cmd.status().with_context(|| {
+        format!(
+            "failed to spawn '{}' for account '{}'",
+            account.executable(),
+            account.id
+        )
+    })?;
+
+    if !exit_status.success() {
+        let code = exit_status.code().unwrap_or(SIGNAL_FALLBACK_EXIT_CODE);
+        bail!(
+            "'{}' (account '{}') exited with status {code}",
+            account.executable(),
+            account.id
+        );
+    }
+    Ok(())
+}
+
+fn run_single_probe(
+    account: &AccountConfig,
+    profiles_dir: &Path,
+    real_home: &Path,
+    now: chrono::DateTime<Utc>,
+) -> Result<ProbeOutput> {
+    let adapter = AdapterRegistry.adapter_for(account.provider);
+    let env = adapter.build_environment(account, profiles_dir);
+    env.prepare(real_home)
+        .with_context(|| format!("failed to prepare profile for {}", account.id))?;
+
+    if let Some(local_result) = adapter.probe_local(account, &env, now) {
+        return local_result.map_err(Into::into);
+    }
+
+    let Some(spec) = adapter.probe_command() else {
+        return adapter
+            .parse_usage_output(account, "", now)
+            .map_err(Into::into);
+    };
+
+    let mut cmd = ProcessCommand::new(account.executable());
+    cmd.args(&spec.args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (key, value) in &env.env_vars {
+        cmd.env(key, value);
+    }
+
+    let output = cmd.output().with_context(|| {
+        format!(
+            "failed to run probe '{}' for account '{}'",
+            account.executable(),
+            account.id
+        )
+    })?;
+
+    let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
+    if !output.stderr.is_empty() {
+        combined.push('\n');
+        combined.push_str(&String::from_utf8_lossy(&output.stderr));
+    }
+
+    adapter
+        .parse_usage_output(account, &combined, now)
+        .map_err(Into::into)
+}
+
+fn bail_unknown_probe_panic() -> (AccountId, Result<ProbeOutput>) {
+    let fallback_id: AccountId = "unknown".parse().unwrap_or_else(|_| unreachable!());
+    (fallback_id, Err(anyhow::anyhow!("probe worker panicked")))
 }
 
 fn main() -> Result<()> {

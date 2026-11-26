@@ -30,7 +30,7 @@ pub enum Command {
 
     /// Select an available account for a provider and invoke its CLI in an isolated profile.
     Run {
-        /// Provider to invoke (`agy`, `claude`, `codex`, `custom`).
+        /// Provider to invoke (`agy`, `claude`, `codex`, `copilot`, `opencode`, `custom`).
         provider: ProviderKind,
         /// Model bucket to check cooldowns against (defaults to `default`).
         #[arg(long)]
@@ -75,7 +75,7 @@ pub enum AccountAction {
     Add {
         /// Unique account slug (e.g. `agy-student`, `agy-pro`).
         id: AccountId,
-        /// Provider kind (`agy`, `claude`, `codex`, `custom`).
+        /// Provider kind (`agy`, `claude`, `codex`, `copilot`, `opencode`, `custom`).
         provider: ProviderKind,
         /// Human-readable label shown in status output.
         #[arg(long, default_value = "")]
@@ -97,6 +97,12 @@ pub enum AccountAction {
     /// Print the isolated profile directory and environment overrides for an account.
     Env {
         /// Account identifier to inspect.
+        id: AccountId,
+    },
+
+    /// Launch the provider CLI interactively inside the account's isolated profile to log in.
+    Login {
+        /// Account identifier to authenticate.
         id: AccountId,
     },
 }
