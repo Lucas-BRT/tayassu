@@ -22,7 +22,24 @@ pub const COPILOT_HOME_ENV: &str = "COPILOT_HOME";
 pub const AGY_PROBE_TIMEOUT_SECS: u64 = 15;
 
 /// Substring markers indicating a CLI hit a rate or usage limit.
-const RATE_LIMIT_MARKERS: &[&str] = &["rate limit", "usage limit", "quota exceeded", "429"];
+const RATE_LIMIT_MARKERS: &[&str] = &[
+    "rate limit",
+    "usage limit",
+    "quota exceeded",
+    "too many requests",
+    "resource_exhausted",
+    "limit reached",
+    "429",
+];
+
+/// Seconds per minute used when parsing textual retry-after durations.
+const SECS_PER_MINUTE: i64 = 60;
+
+/// Seconds per hour used when parsing textual retry-after durations.
+const SECS_PER_HOUR: i64 = 3600;
+
+/// Maximum retry-after duration (7 days in seconds) accepted from unstructured CLI stderr.
+const MAX_PARSED_COOLDOWN_SECS: i64 = 7 * 24 * SECS_PER_HOUR;
 
 /// Substring marker emitted by `agy` when a profile has no stored OAuth credentials.
 const AGY_AUTH_REQUIRED_MARKER: &str = "authentication required";
@@ -117,7 +134,7 @@ pub trait ProviderAdapter: Send + Sync {
         })
     }
 
-    /// Passively inspects CLI output for rate-limit signals and builds a fallback cooldown.
+    /// Passively inspects CLI output for rate-limit signals and builds a cooldown entry.
     fn detect_rate_limit(
         &self,
         _account: &AccountConfig,
@@ -132,9 +149,11 @@ pub trait ProviderAdapter: Send + Sync {
         if !matched {
             return None;
         }
+        let duration_secs =
+            parse_retry_after_secs(&lowered).unwrap_or(DEFAULT_FALLBACK_COOLDOWN_SECS);
         Some(CooldownEntry {
             bucket: bucket.clone(),
-            resets_at: now + TimeDelta::seconds(DEFAULT_FALLBACK_COOLDOWN_SECS),
+            resets_at: now + TimeDelta::seconds(duration_secs),
             reason: format!("detected-rate-limit:{}", self.kind()),
         })
     }
@@ -687,4 +706,67 @@ fn normalize_offset_suffix(raw: &str) -> String {
         }
     }
     raw.to_owned()
+}
+
+/// Extracts an approximate cooldown duration in seconds from rate-limit stderr messages
+/// such as `"try again in 45 minutes"`, `"resets in 2h 30m"`, or `"retry-after: 120s"`.
+fn parse_retry_after_secs(lowered: &str) -> Option<i64> {
+    let tokens: Vec<&str> = lowered
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|tok| !tok.is_empty())
+        .collect();
+
+    let mut total_secs: i64 = 0;
+    let mut idx = 0;
+
+    while idx < tokens.len() {
+        let token = tokens[idx];
+        if let Some(secs) = parse_compact_duration_token(token) {
+            total_secs = total_secs.saturating_add(secs);
+            idx += 1;
+            continue;
+        }
+        if let Ok(value) = token.parse::<i64>()
+            && value > 0
+            && let Some(unit) = tokens.get(idx + 1).copied()
+            && let Some(multiplier) = unit_multiplier_secs(unit)
+        {
+            total_secs = total_secs.saturating_add(value.saturating_mul(multiplier));
+            idx += 2;
+            continue;
+        }
+        idx += 1;
+    }
+
+    if total_secs > 0 && total_secs <= MAX_PARSED_COOLDOWN_SECS {
+        Some(total_secs)
+    } else {
+        None
+    }
+}
+
+fn parse_compact_duration_token(token: &str) -> Option<i64> {
+    if token.len() < 2 {
+        return None;
+    }
+    let (digits, suffix) = token.split_at(token.len() - 1);
+    let value: i64 = digits.parse().ok()?;
+    if value <= 0 {
+        return None;
+    }
+    match suffix {
+        "h" => Some(value.saturating_mul(SECS_PER_HOUR)),
+        "m" => Some(value.saturating_mul(SECS_PER_MINUTE)),
+        "s" => Some(value),
+        _ => None,
+    }
+}
+
+fn unit_multiplier_secs(unit: &str) -> Option<i64> {
+    match unit {
+        "h" | "hr" | "hrs" | "hour" | "hours" => Some(SECS_PER_HOUR),
+        "m" | "min" | "mins" | "minute" | "minutes" => Some(SECS_PER_MINUTE),
+        "s" | "sec" | "secs" | "second" | "seconds" => Some(1),
+        _ => None,
+    }
 }
