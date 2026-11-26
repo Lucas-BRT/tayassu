@@ -215,3 +215,70 @@ fn run_injects_isolated_env_into_spawned_copilot_and_codex() {
     let expected_codex = Path::new("profiles").join("codex").join("oai-main");
     assert!(codex_out.contains(&expected_codex.display().to_string()));
 }
+
+#[cfg(unix)]
+#[test]
+fn probe_supports_claude_codex_copilot_and_opencode_in_parallel() {
+    let env = TestEnv::new();
+
+    let mock_claude = env.write_mock_script(
+        "mock-claude.sh",
+        "#!/usr/bin/env bash\necho '{\"loggedIn\":true,\"planTier\":\"pro\",\"loginExpiresAt\":\"2099-12-06T03:29:58.541Z\"}'\n",
+    );
+    let mock_codex = env.write_mock_script(
+        "mock-codex.sh",
+        "#!/usr/bin/env bash\necho 'Logged in using ChatGPT'\n",
+    );
+    let mock_opencode = env.write_mock_script(
+        "mock-opencode.sh",
+        "#!/usr/bin/env bash\ncat <<'EOF'\nGitHub Copilot  GitHub Copilot              stored\nGoogle          Google                      stored\nEOF\n",
+    );
+
+    env.run_ok(&[
+        "account",
+        "add",
+        "claude-main",
+        "claude",
+        "--binary",
+        &mock_claude,
+    ]);
+    env.run_ok(&[
+        "account",
+        "add",
+        "codex-main",
+        "codex",
+        "--binary",
+        &mock_codex,
+    ]);
+    env.run_ok(&[
+        "account",
+        "add",
+        "opencode-main",
+        "opencode",
+        "--binary",
+        &mock_opencode,
+    ]);
+    env.run_ok(&["account", "add", "copilot-main", "copilot"]);
+
+    let copilot_cfg = env
+        .dir
+        .path()
+        .join("data")
+        .join("tayassu")
+        .join("profiles")
+        .join("copilot")
+        .join("copilot-main")
+        .join("config.json");
+    fs::write(copilot_cfg, "{}").expect("seed copilot config");
+
+    let probe_out = env.run_ok(&["probe"]);
+    assert!(probe_out.contains("claude-main: ok (1 windows, 0 active cooldowns)"));
+    assert!(probe_out.contains("codex-main: ok (1 windows, 0 active cooldowns)"));
+    assert!(probe_out.contains("opencode-main: ok (2 windows, 0 active cooldowns)"));
+    assert!(probe_out.contains("copilot-main: ok (1 windows, 0 active cooldowns)"));
+
+    let status_out = env.run_ok(&["status"]);
+    assert!(status_out.contains("claude-main"));
+    assert!(status_out.contains("default:ok"));
+    assert!(status_out.contains("github-copilot:ok google:ok"));
+}

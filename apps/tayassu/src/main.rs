@@ -348,15 +348,19 @@ fn run_single_probe(
     now: chrono::DateTime<Utc>,
 ) -> Result<ProbeOutput> {
     let adapter = AdapterRegistry.adapter_for(account.provider);
+    let env = adapter.build_environment(account, profiles_dir);
+    env.prepare(real_home)
+        .with_context(|| format!("failed to prepare profile for {}", account.id))?;
+
+    if let Some(local_result) = adapter.probe_local(account, &env, now) {
+        return local_result.map_err(Into::into);
+    }
+
     let Some(spec) = adapter.probe_command() else {
         return adapter
             .parse_usage_output(account, "", now)
             .map_err(Into::into);
     };
-
-    let env = adapter.build_environment(account, profiles_dir);
-    env.prepare(real_home)
-        .with_context(|| format!("failed to prepare profile for {}", account.id))?;
 
     let mut cmd = ProcessCommand::new(account.executable());
     cmd.args(&spec.args)

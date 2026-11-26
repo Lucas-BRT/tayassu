@@ -145,7 +145,7 @@ fn render_quota(
         .map(|bucket| {
             let pct = st
                 .lowest_remaining_percent(bucket)
-                .map_or_else(|| "?".to_owned(), |val| val.to_string());
+                .map_or_else(|| "ok".to_owned(), |val| val.to_string());
             if let Some(cd) = st.active_cooldown(bucket, now) {
                 let rem = cd
                     .remaining(now)
