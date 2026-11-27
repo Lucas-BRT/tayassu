@@ -9,10 +9,11 @@ use crossterm::terminal::{
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Wrap};
 use ratatui::{Frame, Terminal};
 use std::collections::BTreeSet;
+use std::fmt::Write as _;
 use std::io::{self, Stdout};
 use std::time::Duration;
 use tayassu_core::{AccountConfig, AccountId, AccountStatus, ModelBucket};
@@ -35,7 +36,33 @@ const COL_ACCOUNT_WIDTH: u16 = 18;
 const COL_PROVIDER_WIDTH: u16 = 10;
 const COL_PRIORITY_WIDTH: u16 = 5;
 const COL_STATE_WIDTH: u16 = 18;
-const COL_QUOTA_WIDTH: u16 = 30;
+/// Minimum quota column width, used on narrow terminals.
+const COL_QUOTA_MIN_WIDTH: u16 = 12;
+/// Minimum label column width; zero lets it collapse before the quota column clips.
+const COL_LABEL_MIN_WIDTH: u16 = 0;
+/// Horizontal padding added to the widest quota cell.
+const COL_CELL_PADDING: u16 = 2;
+/// Space ratatui inserts between table columns.
+const COLUMN_SPACING: u16 = 1;
+/// Table borders (2) plus the selection symbol (2).
+const TABLE_CHROME_WIDTH: u16 = 4;
+/// Header text for the quota column.
+const COL_QUOTA_HEADER: &str = "QUOTA";
+
+/// Visual state of an account row in the dashboard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AccountState {
+    /// Account is disabled in `config.toml`.
+    Disabled,
+    /// Account has an active cooldown on the evaluated bucket.
+    Cooling(Option<chrono::TimeDelta>),
+    /// Account has no remaining quota on the evaluated bucket.
+    Exhausted,
+    /// Account is available on the default bucket but has a sub-bucket cooldown.
+    Partial,
+    /// Account is fully available.
+    Ready,
+}
 
 /// Actions returned by keyboard input handling in [`DashboardState`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,8 +88,7 @@ impl Default for DashboardState {
     fn default() -> Self {
         Self {
             selected: 0,
-            status_message: "Press 'r' to probe accounts, 'c' to clear cooldowns, 'q' to quit"
-                .to_owned(),
+            status_message: "Ready".to_owned(),
         }
     }
 }
@@ -179,26 +205,32 @@ impl DashboardState {
                 let status = statuses.iter().find(|entry| entry.account_id == account.id);
                 let (state_text, state_color) =
                     account_state_cell(account, status, &default_bucket, now);
-                let quota_text = summarize_buckets(status, now);
+                let quota_lines = summarize_buckets(status, now);
+                let quota_height = u16::try_from(quota_lines.len()).unwrap_or(u16::MAX);
+                let quota_cell = Cell::from(Text::from(
+                    quota_lines.into_iter().map(Line::from).collect::<Vec<_>>(),
+                ));
 
                 Row::new([
                     Cell::from(account.id.as_str().to_owned()),
                     Cell::from(account.provider.as_str().to_owned()),
                     Cell::from(account.priority.to_string()),
                     Cell::from(state_text).style(Style::default().fg(state_color)),
-                    Cell::from(quota_text),
+                    quota_cell,
                     Cell::from(account.label.clone()),
                 ])
+                .height(quota_height)
             })
             .collect();
 
+        let quota_width = quota_column_width(accounts, statuses, now, area.width);
         let widths = [
             Constraint::Length(COL_ACCOUNT_WIDTH),
             Constraint::Length(COL_PROVIDER_WIDTH),
             Constraint::Length(COL_PRIORITY_WIDTH),
             Constraint::Length(COL_STATE_WIDTH),
-            Constraint::Length(COL_QUOTA_WIDTH),
-            Constraint::Min(10),
+            Constraint::Length(quota_width),
+            Constraint::Min(COL_LABEL_MIN_WIDTH),
         ];
 
         let table = Table::new(rows, widths)
@@ -244,7 +276,7 @@ impl DashboardState {
     fn render_footer(&self, frame: &mut Frame<'_>, area: ratatui::layout::Rect) {
         let footer = Paragraph::new(Line::from(vec![
             Span::styled(
-                " j/k: move | r: probe | c: clear cooldown | q: quit ",
+                " j/k: move | r: probe | c: clear cooldowns | q: quit ",
                 Style::default()
                     .fg(Color::Black)
                     .bg(Color::Cyan)
@@ -352,17 +384,28 @@ fn render_header(
 ) {
     let default_bucket = ModelBucket::default_bucket();
     let total = accounts.len();
-    let ready_count = accounts
-        .iter()
-        .filter(|account| {
-            account.enabled
-                && statuses
-                    .iter()
-                    .find(|st| st.account_id == account.id)
-                    .is_none_or(|st| st.is_available(&default_bucket, now))
-        })
-        .count();
-    let cooling_count = total.saturating_sub(ready_count);
+    let mut ready = 0u16;
+    let mut partial = 0u16;
+    let mut unavailable = 0u16;
+    let mut disabled = 0u16;
+
+    for account in accounts {
+        let status = statuses.iter().find(|st| st.account_id == account.id);
+        match account_state(account, status, &default_bucket, now) {
+            AccountState::Ready => ready += 1,
+            AccountState::Partial => partial += 1,
+            AccountState::Cooling(_) | AccountState::Exhausted => unavailable += 1,
+            AccountState::Disabled => disabled += 1,
+        }
+    }
+
+    let mut summary = format!(
+        "| {total} accounts  •  {ready} ready  •  {partial} partial  •  {unavailable} unavailable"
+    );
+    if disabled > 0 {
+        let _ = write!(summary, "  •  {disabled} disabled");
+    }
+    let _ = write!(summary, "  •  {}", now.format("%H:%M:%S UTC"));
 
     let line = Line::from(vec![
         Span::styled(
@@ -371,10 +414,7 @@ fn render_header(
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::raw(format!(
-            "| {total} accounts  •  {ready_count} ready  •  {cooling_count} unavailable  •  {}",
-            now.format("%H:%M:%S UTC")
-        )),
+        Span::raw(summary),
     ]);
 
     let header = Paragraph::new(line).block(
@@ -385,34 +425,85 @@ fn render_header(
     frame.render_widget(header, area);
 }
 
+fn account_state(
+    account: &AccountConfig,
+    status: Option<&AccountStatus>,
+    bucket: &ModelBucket,
+    now: DateTime<Utc>,
+) -> AccountState {
+    if !account.enabled {
+        return AccountState::Disabled;
+    }
+    if let Some(cd) = status.and_then(|st| st.active_cooldown(bucket, now)) {
+        return AccountState::Cooling(cd.remaining(now));
+    }
+    if status.is_some_and(|st| !st.is_available(bucket, now)) {
+        return AccountState::Exhausted;
+    }
+    let has_sub_cooldown = status.is_some_and(|st| st.cooldowns.iter().any(|cd| cd.is_active(now)));
+    if has_sub_cooldown {
+        return AccountState::Partial;
+    }
+    AccountState::Ready
+}
+
 fn account_state_cell(
     account: &AccountConfig,
     status: Option<&AccountStatus>,
     bucket: &ModelBucket,
     now: DateTime<Utc>,
 ) -> (String, Color) {
-    if !account.enabled {
-        return ("DISABLED".to_owned(), Color::DarkGray);
+    match account_state(account, status, bucket, now) {
+        AccountState::Disabled => ("DISABLED".to_owned(), Color::DarkGray),
+        AccountState::Cooling(remaining) => (
+            format!(
+                "COOLDOWN ({})",
+                remaining.map_or_else(|| "0m".to_owned(), format_countdown)
+            ),
+            Color::Red,
+        ),
+        AccountState::Exhausted => ("EXHAUSTED".to_owned(), Color::Red),
+        AccountState::Partial => ("PARTIAL".to_owned(), Color::Yellow),
+        AccountState::Ready => ("READY".to_owned(), Color::Green),
     }
-    if let Some(cd) = status.and_then(|st| st.active_cooldown(bucket, now)) {
-        let rem = cd
-            .remaining(now)
-            .map_or_else(|| "0m".to_owned(), format_countdown);
-        return (format!("COOLDOWN ({rem})"), Color::Red);
-    }
-    if status.is_some_and(|st| !st.is_available(bucket, now)) {
-        return ("EXHAUSTED".to_owned(), Color::Red);
-    }
-    let has_sub_cooldown = status.is_some_and(|st| st.cooldowns.iter().any(|cd| cd.is_active(now)));
-    if has_sub_cooldown {
-        return ("PARTIAL".to_owned(), Color::Yellow);
-    }
-    ("READY".to_owned(), Color::Green)
 }
 
-fn summarize_buckets(status: Option<&AccountStatus>, now: DateTime<Utc>) -> String {
+fn quota_column_width(
+    accounts: &[AccountConfig],
+    statuses: &[AccountStatus],
+    now: DateTime<Utc>,
+    table_width: u16,
+) -> u16 {
+    let content_width = accounts
+        .iter()
+        .map(|account| {
+            let status = statuses.iter().find(|st| st.account_id == account.id);
+            summarize_buckets(status, now)
+                .iter()
+                .map(|line| line.chars().count())
+                .max()
+                .unwrap_or(0)
+        })
+        .max()
+        .unwrap_or(0);
+    let desired = u16::try_from(content_width)
+        .unwrap_or(u16::MAX)
+        .max(u16::try_from(COL_QUOTA_HEADER.len()).unwrap_or(0))
+        + COL_CELL_PADDING;
+    let fixed = COL_ACCOUNT_WIDTH
+        + COL_PROVIDER_WIDTH
+        + COL_PRIORITY_WIDTH
+        + COL_STATE_WIDTH
+        + COL_LABEL_MIN_WIDTH
+        + COLUMN_SPACING * 5
+        + TABLE_CHROME_WIDTH;
+    let available = table_width.saturating_sub(fixed);
+    desired.min(available.max(COL_QUOTA_MIN_WIDTH))
+}
+
+fn summarize_buckets(status: Option<&AccountStatus>, now: DateTime<Utc>) -> Vec<String> {
     let Some(st) = status else {
-        return "-".to_owned();
+        return vec!["-".to_owned()];
     };
     let mut buckets = BTreeSet::new();
     for win in &st.windows {
@@ -424,7 +515,7 @@ fn summarize_buckets(status: Option<&AccountStatus>, now: DateTime<Utc>) -> Stri
         }
     }
     if buckets.is_empty() {
-        return "-".to_owned();
+        return vec!["-".to_owned()];
     }
     buckets
         .iter()
@@ -441,8 +532,7 @@ fn summarize_buckets(status: Option<&AccountStatus>, now: DateTime<Utc>) -> Stri
                 format!("{bucket}:{pct}")
             }
         })
-        .collect::<Vec<String>>()
-        .join(" ")
+        .collect()
 }
 
 fn build_detail_lines<'a>(
@@ -517,6 +607,18 @@ mod tests {
     /// Virtual terminal height for `TestBackend` rendering checks.
     const TEST_TERM_HEIGHT: u16 = 20;
 
+    /// Wider terminal used to verify quota cells are not clipped.
+    const WIDE_TEST_TERM_WIDTH: u16 = 120;
+
+    /// Narrow terminal used to verify quota cells survive reduced layouts.
+    const NARROW_TEST_TERM_WIDTH: u16 = 80;
+
+    /// Gemini remaining quota fixture percentage.
+    const TEST_GEMINI_PCT: u8 = 31;
+
+    /// Claude remaining quota fixture percentage.
+    const TEST_CLAUDE_PCT: u8 = 50;
+
     /// Cooldown duration in minutes used in TUI rendering tests.
     const TEST_COOLDOWN_MINUTES: i64 = 90;
 
@@ -566,6 +668,71 @@ mod tests {
         assert!(rendered.contains("PARTIAL"));
         assert!(rendered.contains("gemini:47%"));
         assert!(rendered.contains("claude:ok(1h30m)"));
+    }
+
+    #[test]
+    fn dashboard_keeps_full_quota_text_and_counts_partial_accounts() {
+        let now = Utc::now();
+        let account =
+            AccountConfig::new("agy-host".parse().expect("id"), ProviderKind::Agy, "Host");
+        let mut status = AccountStatus::empty(account.id.clone());
+
+        for (bucket, pct) in [("gemini", TEST_GEMINI_PCT), ("claude", TEST_CLAUDE_PCT)] {
+            let bucket: ModelBucket = bucket.parse().expect("bucket");
+            status.windows.push(QuotaWindow {
+                window_name: "weekly".to_owned(),
+                bucket: bucket.clone(),
+                remaining: Some(RemainingPercent::try_from(pct).expect("pct")),
+                resets_at: None,
+            });
+            status.set_cooldown(CooldownEntry {
+                bucket,
+                resets_at: now + TimeDelta::minutes(TEST_COOLDOWN_MINUTES),
+                reason: "agy-probe:5h".to_owned(),
+            });
+        }
+
+        let state = DashboardState::default();
+        let backend = TestBackend::new(WIDE_TEST_TERM_WIDTH, TEST_TERM_HEIGHT);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let accounts = [account];
+        let statuses = [status];
+
+        terminal
+            .draw(|frame| state.render(frame, &accounts, &statuses, now))
+            .expect("draw frame");
+
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+
+        assert!(rendered.contains("claude:50%(1h30m)"), "{rendered}");
+        assert!(rendered.contains("gemini:31%(1h30m)"), "{rendered}");
+        assert!(rendered.contains("0 ready"));
+        assert!(rendered.contains("1 partial"));
+        assert!(rendered.contains("0 unavailable"));
+        assert!(!rendered.contains("Press 'r' to probe accounts"));
+
+        let backend = TestBackend::new(NARROW_TEST_TERM_WIDTH, TEST_TERM_HEIGHT);
+        let mut terminal = Terminal::new(backend).expect("narrow test terminal");
+        terminal
+            .draw(|frame| state.render(frame, &accounts, &statuses, now))
+            .expect("draw narrow frame");
+
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+
+        assert!(rendered.contains("claude:50%(1h30m)"), "{rendered}");
+        assert!(rendered.contains("gemini:31%(1h30m)"), "{rendered}");
     }
 
     #[test]
