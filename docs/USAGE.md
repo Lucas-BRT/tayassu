@@ -177,6 +177,10 @@ to remove its previously loaded wrappers.
 `~/.config/fish/conf.d/tayassu.fish`. `setup` installs `tayassu-probe.service` and
 `tayassu-probe.timer` under `$XDG_CONFIG_HOME/systemd/user/` (enable with
 `systemctl --user enable --now tayassu-probe.timer`). It is idempotent.
+Installing these units does not enable the timer. Check its status with
+`systemctl --user status tayassu-probe.timer`; `--no-systemd` skips installation.
+Use `tayassu auto probe` to refresh quotas and enable the timer. If the systemd
+user manager is unavailable, use `tayassu probe` to refresh quotas manually.
 
 ### `tayassu update`, `tayassu uninstall`, and `tayassu providers update`
 

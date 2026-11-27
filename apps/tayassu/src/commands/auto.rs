@@ -93,12 +93,12 @@ impl Auto {
                 Some(&mut *out),
             )?;
         }
-        let active = ProcessCommand::new("systemctl")
+        let enabled = ProcessCommand::new("systemctl")
             .args(["--user", "is-enabled", "--quiet", SYSTEMD_TIMER_NAME])
             .status()
             .context("failed to check systemd user timer")?
             .success();
-        if active {
+        if enabled {
             anyhow::ensure!(
                 ProcessCommand::new("systemctl")
                     .args(["--user", "start", SYSTEMD_TIMER_NAME])
@@ -110,6 +110,7 @@ impl Auto {
             writeln!(out, "Background probe timer already enabled.")?;
         } else {
             Self::install_timer(app)?;
+            writeln!(out, "Background probe timer enabled and started.")?;
         }
         Ok(())
     }
@@ -137,12 +138,22 @@ impl Auto {
                 dir.display()
             );
         }
-        let _ = ProcessCommand::new("systemctl")
-            .args(["--user", "daemon-reload"])
-            .status();
-        let _ = ProcessCommand::new("systemctl")
-            .args(["--user", "enable", "--now", SYSTEMD_TIMER_NAME])
-            .status();
+        anyhow::ensure!(
+            ProcessCommand::new("systemctl")
+                .args(["--user", "daemon-reload"])
+                .status()
+                .context("failed to run systemctl daemon-reload")?
+                .success(),
+            "could not reload systemd user units; run `tayassu probe` for a manual refresh"
+        );
+        anyhow::ensure!(
+            ProcessCommand::new("systemctl")
+                .args(["--user", "enable", "--now", SYSTEMD_TIMER_NAME])
+                .status()
+                .context("failed to run systemctl enable --now")?
+                .success(),
+            "could not enable and start the background probe timer; check `systemctl --user status {SYSTEMD_TIMER_NAME}`"
+        );
         Ok(())
     }
 }

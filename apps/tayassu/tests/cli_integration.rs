@@ -1201,6 +1201,68 @@ printf 'Content-Length: %s\r\n\r\n%s' "${#response}" "$response"
 
 #[cfg(unix)]
 #[test]
+fn setup_reports_timer_status_and_skips_systemctl_when_requested() {
+    let env = TestEnv::new();
+    let systemctl = env.write_mock_script("systemctl", "#!/bin/sh\nexit 0\n");
+    let path = format!("{}:/usr/bin:/bin", env.dir.path().display());
+    let run = |args: &[&str]| {
+        env.command()
+            .env("PATH", &path)
+            .args(args)
+            .output()
+            .expect("run setup")
+    };
+    let active = run(&["setup"]);
+    assert!(active.status.success());
+    assert!(String::from_utf8_lossy(&active.stdout).contains("timer is active"));
+    fs::write(&systemctl, "#!/bin/sh\necho inactive\nexit 3\n").expect("mock inactive timer");
+    let inactive = run(&["setup"]);
+    assert!(inactive.status.success());
+    assert!(String::from_utf8_lossy(&inactive.stdout).contains("timer is inactive"));
+    fs::write(&systemctl, "#!/bin/sh\nexit 1\n").expect("change systemctl");
+    let unknown = run(&["setup"]);
+    assert!(unknown.status.success());
+    assert!(
+        String::from_utf8_lossy(&unknown.stdout).contains("timer status could not be confirmed")
+    );
+    fs::remove_file(systemctl).expect("remove mock systemctl");
+    let skipped = run(&["setup", "--no-systemd"]);
+    assert!(skipped.status.success());
+    assert!(!String::from_utf8_lossy(&skipped.stdout).contains("systemd:"));
+}
+
+#[cfg(unix)]
+#[test]
+fn auto_probe_reports_failed_timer_activation() {
+    for (failed_command, message) in [
+        ("daemon-reload", "could not reload systemd user units"),
+        (
+            "enable",
+            "could not enable and start the background probe timer",
+        ),
+    ] {
+        let env = TestEnv::new();
+        env.write_mock_script(
+            "systemctl",
+            &format!("#!/bin/sh\ncase \"$2\" in\n is-enabled|{failed_command}) exit 1 ;;\nesac\n"),
+        );
+        let output = env
+            .command()
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", env.dir.path().display()),
+            )
+            .args(["auto", "probe"])
+            .output()
+            .expect("run auto probe");
+        assert!(!output.status.success(), "{failed_command}");
+        assert!(String::from_utf8_lossy(&output.stderr).contains(message));
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("enabled and started"));
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn auto_probe_installs_and_enables_timer_without_overwriting_existing_units() {
     let env = TestEnv::new();
     env.write_mock_script(
