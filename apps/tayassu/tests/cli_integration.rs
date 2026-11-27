@@ -407,8 +407,14 @@ fn import_discovers_filters_and_migrates_update_safely() {
     let dry = env.run_ok(&["import", "--dry-run", "--exclude", "agy"]);
     assert!(dry.contains("[dry-run] claude -> account 'claude-host'"));
     assert!(dry.contains("[dry-run] codex -> account 'codex-host'"));
+    assert!(dry.contains(".claude/.credentials.json"));
+    assert!(dry.contains("profiles/claude/claude-host/.credentials.json"));
+    assert!(dry.contains("copy; keep source"));
     assert!(!dry.contains("agy-host"));
     assert!(!env.dir.path().join("config/tayassu/config.toml").exists());
+    let move_preview = env.run_ok(&["import", "--dry-run", "--provider", "claude", "--move-auth"]);
+    assert!(move_preview.contains("copy, then remove source"));
+    assert!(home.join(".claude/.credentials.json").is_file());
 
     // Real import with --provider claude --move-auth moves only .credentials.json.
     let imported = env.run_ok(&["import", "--provider", "claude", "--move-auth"]);

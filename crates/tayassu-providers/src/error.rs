@@ -5,6 +5,9 @@ use thiserror::Error;
 /// Errors returned by provider isolation and probing adapters.
 #[derive(Debug, Error)]
 pub enum ProviderError {
+    /// Copied credentials differ from their source.
+    #[error("copied file differs from source: {path}; source was preserved")]
+    CopyVerification { path: PathBuf },
     /// Filesystem operation failed while preparing an isolated profile.
     #[error("profile filesystem error at {path}: {source}")]
     Io {

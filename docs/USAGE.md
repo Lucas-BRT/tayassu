@@ -41,6 +41,14 @@ cargo install --locked --path apps/tayassu
 
 ## Quick start
 
+To inspect an import without changing files, run `tayassu import --dry-run`.
+The preview lists discovered files and their destinations. Run `tayassu import`
+to copy them, then follow any login instructions and check `tayassu ls`.
+
+To add a separate account instead, run `tayassu add <provider> [id]` and
+complete the provider's login flow. Use `tayassu where <provider>` to inspect
+the account selected before launching it.
+
 ```bash
 tayassu setup            # shell wrappers, tab completion and the background probe timer
 tayassu import           # discover installed CLIs and copy their credentials
@@ -50,8 +58,9 @@ tayassu run agy -- --help
 ```
 
 `tayassu import` never deletes binaries or updater directories. It copies host
-auth files by default; pass `--move-auth` only when you want the host files
-removed after a verified copy.
+auth files by default. With `--move-auth`, tayassu copies the files and compares
+each removable credential with its copy before deleting any originals for that
+provider. An error during removal can still leave some originals already moved.
 
 ## Command overview
 

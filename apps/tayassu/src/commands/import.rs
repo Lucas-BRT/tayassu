@@ -7,7 +7,10 @@ use clap_complete::ArgValueCandidates;
 use std::env;
 use std::io::Write;
 use tayassu_core::{AccountConfig, DEFAULT_ACCOUNT_PRIORITY, ProviderKind};
-use tayassu_providers::{AdapterRegistry, DiscoveredAgent, HostDiscovery, MigrationMode};
+use tayassu_providers::{
+    AdapterRegistry, DiscoveredAgent, FAKE_HOME_SUBDIR, HostDiscovery, IsolationStrategy,
+    MigrationMode, ProfileEnvironment,
+};
 use tracing::warn;
 
 /// Auto-discover installed AI CLIs and safely import their host credentials into isolated profiles.
@@ -26,7 +29,7 @@ pub struct Import {
     /// Refresh credentials in profiles that are already registered.
     #[arg(long)]
     refresh: bool,
-    /// Remove original host auth files after verified copy (never removes binaries or updater dirs).
+    /// Remove original host auth files after copying (never removes binaries or updater dirs).
     #[arg(long)]
     move_auth: bool,
     /// Selection priority assigned to imported accounts.
@@ -53,7 +56,10 @@ impl Import {
             .collect();
 
         if discovered.is_empty() {
-            writeln!(out, "No matching installed AI CLI agents found.")?;
+            writeln!(
+                out,
+                "No matching installed AI CLI agents found. Check PATH or add an account with `tayassu add <provider> [id]`."
+            )?;
             return Ok(());
         }
 
@@ -97,7 +103,7 @@ impl Import {
             let profile_env = adapter.build_environment(&account, &app.paths.profiles_dir);
 
             if self.dry_run {
-                write_preview(agent, out)?;
+                write_preview(agent, &profile_env, mode, out)?;
                 continue;
             }
 
@@ -143,7 +149,12 @@ impl Import {
     }
 }
 
-fn write_preview(agent: &DiscoveredAgent, out: &mut dyn Write) -> Result<()> {
+fn write_preview(
+    agent: &DiscoveredAgent,
+    profile: &ProfileEnvironment,
+    mode: MigrationMode,
+    out: &mut dyn Write,
+) -> Result<()> {
     writeln!(
         out,
         "[dry-run] {} -> account '{}' (binary: {}, {} credential/config file(s) found)",
@@ -152,6 +163,23 @@ fn write_preview(agent: &DiscoveredAgent, out: &mut dyn Write) -> Result<()> {
         agent.binary_path.display(),
         agent.existing_file_count()
     )?;
+    let root = match profile.strategy {
+        IsolationStrategy::NativeEnvVar { .. } => profile.profile_dir.clone(),
+        IsolationStrategy::FakeHome { .. } => profile.profile_dir.join(FAKE_HOME_SUBDIR),
+    };
+    for file in agent.files.iter().filter(|file| file.exists) {
+        let action = if mode == MigrationMode::MoveAuth && file.removable_on_move {
+            "copy, then remove source"
+        } else {
+            "copy; keep source"
+        };
+        writeln!(
+            out,
+            "  {} -> {} ({action})",
+            file.source_path.display(),
+            root.join(&file.dest_rel).display()
+        )?;
+    }
     writeln!(out, "  update-safety: {}", agent.update_safety_note)?;
     if agent.requires_relogin {
         writeln!(
