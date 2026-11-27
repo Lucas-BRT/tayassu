@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
-use tayassu_core::{AccountConfig, AccountId, FallbackTarget, SelectionPolicy};
+use tayassu_core::{AccountConfig, AccountId, FallbackTarget, ProviderKind, SelectionPolicy};
 
 /// Top-level user configuration persisted in `config.toml`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -48,6 +48,31 @@ impl AppConfig {
     pub fn save_atomic(&self, path: &Path) -> Result<(), StoreError> {
         let serialized = toml::to_string_pretty(self)?;
         write_atomic(path, serialized.as_bytes())
+    }
+
+    /// Returns the first unused account id for `provider` (`claude`, `claude-2`, `claude-3`, ...).
+    ///
+    /// # Panics
+    ///
+    /// Never in practice: the candidate sequence is unbounded and ids are short valid slugs.
+    #[must_use]
+    pub fn next_free_id(&self, provider: ProviderKind) -> AccountId {
+        let base = provider.as_str();
+        (1_u32..)
+            .map(|n| {
+                if n == 1 {
+                    base.to_owned()
+                } else {
+                    format!("{base}-{n}")
+                }
+            })
+            .find_map(|candidate| {
+                candidate
+                    .parse::<AccountId>()
+                    .ok()
+                    .filter(|id| self.find_account(id).is_none())
+            })
+            .expect("unbounded candidate sequence yields a free id")
     }
 
     /// Looks up a configured account by `id`.
