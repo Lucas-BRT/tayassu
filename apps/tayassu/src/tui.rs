@@ -718,9 +718,7 @@ fn summarize_buckets(status: Option<&AccountStatus>, now: DateTime<Utc>) -> Vec<
     buckets
         .iter()
         .map(|bucket| {
-            let pct = st
-                .lowest_remaining_percent(bucket)
-                .map_or_else(|| "ok".to_owned(), |val| val.to_string());
+            let pct = st.quota_label(bucket, now);
             if let Some(cd) = st.active_cooldown(bucket, now) {
                 let rem = cd
                     .remaining(now)
@@ -844,6 +842,7 @@ mod tests {
             "Student Plan",
         );
         let mut status = AccountStatus::empty(account.id.clone());
+        status.last_probed_at = Some(now);
         status.windows.push(QuotaWindow {
             window_name: "5h".to_owned(),
             bucket: "gemini".parse().expect("bucket"),
@@ -886,6 +885,7 @@ mod tests {
         let account =
             AccountConfig::new("agy-host".parse().expect("id"), ProviderKind::Agy, "Host");
         let mut status = AccountStatus::empty(account.id.clone());
+        status.last_probed_at = Some(now);
 
         for (bucket, pct) in [("gemini", TEST_GEMINI_PCT), ("claude", TEST_CLAUDE_PCT)] {
             let bucket: ModelBucket = bucket.parse().expect("bucket");
@@ -959,6 +959,8 @@ mod tests {
         failed.priority = 10;
 
         let mut failed_status = AccountStatus::empty(failed.id.clone());
+
+        failed_status.last_probed_at = Some(now);
         failed_status.set_probe_failure(ProbeFailure::authentication(
             "account 'alpha' is not logged in",
         ));

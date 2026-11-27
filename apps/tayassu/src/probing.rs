@@ -50,6 +50,7 @@ pub fn probe_accounts(
 
     let mut ok_count = 0usize;
     let mut err_count = 0usize;
+    let mut auth_failures = 0usize;
     let mut cleared_notifications = Vec::new();
 
     let (updated_state, ()) = RuntimeState::update_locked(&paths.state_file, |locked_state| {
@@ -59,8 +60,15 @@ pub fn probe_accounts(
                     let window_count = parsed.windows.len();
                     let cooldown_count = parsed.cooldowns.len();
                     let status = locked_state.status_for_mut(&account_id);
-                    status.last_probed_at = Some(now);
-                    status.windows = parsed.windows;
+                    let contradicted = status.replace_windows(parsed.windows, now);
+                    if let Some(writer) = out.as_deref_mut() {
+                        for bucket in contradicted {
+                            let _ = writeln!(
+                                writer,
+                                "{account_id}: estimated reset for '{bucket}' was wrong; provider reports it exhausted"
+                            );
+                        }
+                    }
                     status.prune_expired(now);
                     status.clear_probe_failure();
                     for cooldown in parsed.cooldowns {
@@ -82,14 +90,10 @@ pub fn probe_accounts(
                 }
                 Err(err) => {
                     err_count += 1;
-                    let failure = if matches!(
-                        err.downcast_ref::<ProviderError>(),
-                        Some(ProviderError::AuthenticationRequired { .. })
-                    ) {
-                        ProbeFailure::authentication(err.to_string())
-                    } else {
-                        ProbeFailure::other(err.to_string())
-                    };
+                    let failure = classify_failure(&err);
+                    if failure.is_authentication() {
+                        auth_failures += 1;
+                    }
                     locked_state
                         .status_for_mut(&account_id)
                         .set_probe_failure(failure);
@@ -105,16 +109,42 @@ pub fn probe_accounts(
 
     *state = updated_state;
 
+    if ok_count == 0
+        && err_count > 0
+        && auth_failures == 0
+        && let Some(writer) = out
+    {
+        let _ = writeln!(
+            writer,
+            "all probes failed (offline?); keeping cached quota, run `tayassu ls` to review it"
+        );
+    }
+
     if notify {
-        for (account_id, bucket) in cleared_notifications {
-            send_desktop_notification(
-                "tayassu: cooldown cleared",
-                &format!("Account '{account_id}' (bucket '{bucket}') is ready again."),
-            );
-        }
+        notify_cleared(&cleared_notifications);
     }
 
     Ok((ok_count, err_count))
+}
+
+fn classify_failure(err: &anyhow::Error) -> ProbeFailure {
+    if matches!(
+        err.downcast_ref::<ProviderError>(),
+        Some(ProviderError::AuthenticationRequired { .. })
+    ) {
+        ProbeFailure::authentication(err.to_string())
+    } else {
+        ProbeFailure::other(err.to_string())
+    }
+}
+
+fn notify_cleared(cleared: &[(AccountId, ModelBucket)]) {
+    for (account_id, bucket) in cleared {
+        send_desktop_notification(
+            "tayassu: cooldown cleared",
+            &format!("Account '{account_id}' (bucket '{bucket}') is ready again."),
+        );
+    }
 }
 
 fn send_desktop_notification(title: &str, body: &str) {

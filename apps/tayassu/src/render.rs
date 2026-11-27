@@ -52,14 +52,14 @@ impl<'a> StatusTable<'a> {
         if filtered.is_empty() {
             return writeln!(
                 writer,
-                "No accounts configured. Add one with: tayassu account add <id> <provider>"
+                "No accounts configured. Add one with: tayassu add <provider>"
             );
         }
 
         writeln!(
             writer,
-            "{:<18} {:<10} {:<4} {:<18} {:<28} LABEL",
-            "ACCOUNT", "PROVIDER", "PRI", "STATE", "QUOTA"
+            "{:<18} {:<10} {:<4} {:<18} {:<28} {:<10} LABEL",
+            "ACCOUNT", "PROVIDER", "PRI", "STATE", "QUOTA", "CHECKED"
         )?;
 
         let default_bucket = ModelBucket::default_bucket();
@@ -76,12 +76,13 @@ impl<'a> StatusTable<'a> {
 
             writeln!(
                 writer,
-                "{:<18} {:<10} {:<4} {:<18} {:<28} {}",
+                "{:<18} {:<10} {:<4} {:<18} {:<28} {:<10} {}",
                 account.id,
                 account.provider,
                 account.priority,
                 state_text,
                 quota_text,
+                render_checked(status, now),
                 account.label
             )?;
         }
@@ -129,8 +130,8 @@ fn render_quota(
 
     if let Some(bucket) = bucket_filter {
         return st
-            .lowest_remaining_percent(bucket)
-            .map_or_else(|| "-".to_owned(), |pct| pct.to_string());
+            .bucket_state(bucket, now)
+            .map_or_else(|| "-".to_owned(), |_| st.quota_label(bucket, now));
     }
 
     let mut buckets = BTreeSet::new();
@@ -150,9 +151,7 @@ fn render_quota(
     let parts: Vec<String> = buckets
         .iter()
         .map(|bucket| {
-            let pct = st
-                .lowest_remaining_percent(bucket)
-                .map_or_else(|| "ok".to_owned(), |val| val.to_string());
+            let pct = st.quota_label(bucket, now);
             if let Some(cd) = st.active_cooldown(bucket, now) {
                 let rem = cd
                     .remaining(now)
@@ -165,6 +164,19 @@ fn render_quota(
         .collect();
 
     parts.join(" ")
+}
+
+/// Age of the last probe (`never`, `3m ago`, `2h05m ago`).
+fn render_checked(status: Option<&AccountStatus>, now: DateTime<Utc>) -> String {
+    status.and_then(|st| st.last_probed_at).map_or_else(
+        || "never".to_owned(),
+        |at| {
+            format!(
+                "{} ago",
+                format_countdown(now.signed_duration_since(at).max(TimeDelta::zero()))
+            )
+        },
+    )
 }
 
 /// Formats a positive duration into a compact `XhYYm` or `Ym` countdown.
@@ -200,6 +212,7 @@ mod tests {
             "Work",
         );
         let mut status = AccountStatus::empty(account.id.clone());
+        status.last_probed_at = Some(now);
         status.set_probe_failure(tayassu_core::ProbeFailure::authentication("not logged in"));
 
         let accounts = [account];
@@ -228,6 +241,8 @@ mod tests {
         );
 
         let mut cooling_status = AccountStatus::empty(cooling.id.clone());
+
+        cooling_status.last_probed_at = Some(now);
         cooling_status.windows.push(QuotaWindow {
             window_name: "weekly".to_owned(),
             bucket: "gemini".parse().expect("bucket"),

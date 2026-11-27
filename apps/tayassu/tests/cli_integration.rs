@@ -562,3 +562,48 @@ fn use_and_config_persist_routing_settings() {
         "soonest-reset"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn cached_window_past_its_reset_is_shown_as_reset_and_routable() {
+    let env = TestEnv::new();
+    let script = env.write_mock_script(
+        "mock-agy-old.sh",
+        "#!/usr/bin/env bash\ncat <<'EOF'\nQuota:\nGemini Models          Five Hour Limit Remaining  0%  2000-01-01 00:00 -03\nEOF\n",
+    );
+    env.run_ok(&["add", "agy", "old", "--binary", &script, "--no-login"]);
+    env.run_ok(&["probe"]);
+
+    let table = env.run_ok(&["ls"]);
+    assert!(table.contains("gemini:reset✓"), "{table}");
+    assert!(table.contains("READY"));
+    assert!(!table.contains("EXHAUSTED"));
+
+    let json = env.run_ok(&["ls", "--json"]);
+    let parsed: serde_json::Value = serde_json::from_str(&json).expect("json");
+    assert_eq!(parsed["quota"][0]["state"], "reset");
+
+    let routed = env.run_ok(&["where", "agy", "--model", "gemini"]);
+    assert!(routed.contains("account: old"));
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_probe_keeps_cached_windows() {
+    let env = TestEnv::new();
+    let ok = env.write_mock_script(
+        "mock-agy-ok.sh",
+        "#!/usr/bin/env bash\ncat <<'EOF'\nQuota:\nGemini Models          Weekly Limit Remaining  43%  2099-12-03 06:02 -03\nEOF\n",
+    );
+    env.run_ok(&["add", "agy", "cached", "--binary", &ok, "--no-login"]);
+    env.run_ok(&["probe"]);
+
+    let broken = env.write_mock_script("mock-agy-broken.sh", "#!/usr/bin/env bash\nexit 1\n");
+    let config = env.dir.path().join("config/tayassu/config.toml");
+    let raw = fs::read_to_string(&config).expect("config");
+    fs::write(&config, raw.replace(&ok, &broken)).expect("rewrite config");
+
+    let out = env.run_ok(&["probe"]);
+    assert!(out.contains("all probes failed"), "{out}");
+    assert!(env.run_ok(&["ls"]).contains("gemini:43%"));
+}

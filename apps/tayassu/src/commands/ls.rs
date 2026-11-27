@@ -31,9 +31,29 @@ impl Execute for Ls {
                 .iter()
                 .filter(|account| self.provider.is_none_or(|p| account.provider == p))
                 .collect();
+            let now = Utc::now();
+            let quota: Vec<_> = app
+                .state
+                .statuses
+                .iter()
+                .flat_map(|status| {
+                    status.windows.iter().map(move |window| {
+                        serde_json::json!({
+                            "account": status.account_id,
+                            "bucket": window.bucket,
+                            "window": window.window_name,
+                            "remaining": window.remaining,
+                            "resets_at": window.resets_at,
+                            "probed_at": status.last_probed_at,
+                            "state": window.state(status.last_probed_at, now),
+                        })
+                    })
+                })
+                .collect();
             let json = serde_json::json!({
                 "accounts": accounts,
                 "statuses": app.state.statuses,
+                "quota": quota,
             });
             return writeln!(out, "{json:#}").context("failed to write JSON");
         }

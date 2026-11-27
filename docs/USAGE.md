@@ -76,6 +76,16 @@ removed after a verified copy.
 
 `tayassu cooldown ls|set|clear` exists for manual overrides but is hidden from `--help`.
 
+### Cached quota and offline use
+
+Every probe is cached in `state.json`, so `tayassu ls` works offline. Quota
+text shows how much to trust it: `43%` (probed in the last 15 minutes), `~43%`
+(older reading), `reset✓` (the recorded reset time has passed, so the quota is
+presumed restored and the account is routable) and the `CHECKED` column shows the
+probe age. A failed probe never discards cached windows. When the network
+returns, `tayassu probe` overwrites the cache; it is always the source of truth
+and reports when an estimated reset turned out wrong.
+
 ### `tayassu add`
 
 ```bash
