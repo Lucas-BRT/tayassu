@@ -113,6 +113,51 @@ impl CooldownEntry {
     }
 }
 
+/// Classification of the most recent failed probe for an account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProbeFailureKind {
+    /// The isolated profile has no valid credentials.
+    Authentication,
+    /// Any other probe failure.
+    Other,
+}
+
+/// Detail about the most recent failed probe, persisted in `state.json`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProbeFailure {
+    /// Failure category used by the UI.
+    pub kind: ProbeFailureKind,
+    /// Human-readable failure message.
+    pub message: String,
+}
+
+impl ProbeFailure {
+    /// Creates an authentication failure.
+    #[must_use]
+    pub fn authentication(message: impl Into<String>) -> Self {
+        Self {
+            kind: ProbeFailureKind::Authentication,
+            message: message.into(),
+        }
+    }
+
+    /// Creates a non-authentication failure.
+    #[must_use]
+    pub fn other(message: impl Into<String>) -> Self {
+        Self {
+            kind: ProbeFailureKind::Other,
+            message: message.into(),
+        }
+    }
+
+    /// Returns `true` when the profile needs a fresh login.
+    #[must_use]
+    pub const fn is_authentication(&self) -> bool {
+        matches!(self.kind, ProbeFailureKind::Authentication)
+    }
+}
+
 /// Mutable runtime state tracked locally for one account.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccountStatus {
@@ -126,6 +171,9 @@ pub struct AccountStatus {
     /// Recorded cooldown entries per model bucket.
     #[serde(default)]
     pub cooldowns: Vec<CooldownEntry>,
+    /// Most recent failed probe, cleared on the next successful probe.
+    #[serde(default)]
+    pub last_probe_error: Option<ProbeFailure>,
     /// Number of concurrent `tayassu run` sessions currently using this account.
     #[serde(default)]
     pub active_sessions: u32,
@@ -140,8 +188,19 @@ impl AccountStatus {
             last_probed_at: None,
             windows: Vec::new(),
             cooldowns: Vec::new(),
+            last_probe_error: None,
             active_sessions: 0,
         }
+    }
+
+    /// Records a failed probe.
+    pub fn set_probe_failure(&mut self, failure: ProbeFailure) {
+        self.last_probe_error = Some(failure);
+    }
+
+    /// Clears any recorded probe failure after a successful probe.
+    pub fn clear_probe_failure(&mut self) {
+        self.last_probe_error = None;
     }
 
     /// Returns the active cooldown blocking `bucket` (or the default bucket) at `now`.

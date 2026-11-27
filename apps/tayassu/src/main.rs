@@ -20,10 +20,12 @@ use std::process::{Command as ProcessCommand, ExitStatus, Stdio};
 use std::thread;
 use systemd::SystemdUnits;
 use tayassu_core::{
-    AccountConfig, AccountId, AccountRouter, CooldownEntry, ModelBucket, ProviderKind,
-    SelectionPolicy,
+    AccountConfig, AccountId, AccountRouter, CooldownEntry, ModelBucket, ProbeFailure,
+    ProviderKind, SelectionPolicy,
 };
-use tayassu_providers::{AdapterRegistry, HostDiscovery, MigrationMode, ProbeOutput};
+use tayassu_providers::{
+    AdapterRegistry, HostDiscovery, MigrationMode, ProbeOutput, ProviderError,
+};
 use tayassu_store::{AppConfig, ProjectConfig, RuntimeState, XdgPaths};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
@@ -813,6 +815,7 @@ fn probe_accounts(
                     status.last_probed_at = Some(now);
                     status.windows = parsed.windows;
                     status.prune_expired(now);
+                    status.clear_probe_failure();
                     for cooldown in parsed.cooldowns {
                         status.set_cooldown(cooldown);
                     }
@@ -832,6 +835,17 @@ fn probe_accounts(
                 }
                 Err(err) => {
                     err_count += 1;
+                    let failure = if matches!(
+                        err.downcast_ref::<ProviderError>(),
+                        Some(ProviderError::AuthenticationRequired { .. })
+                    ) {
+                        ProbeFailure::authentication(err.to_string())
+                    } else {
+                        ProbeFailure::other(err.to_string())
+                    };
+                    locked_state
+                        .status_for_mut(&account_id)
+                        .set_probe_failure(failure);
                     warn!(account = %account_id, error = %err, "probe failed");
                     if let Some(writer) = out.as_deref_mut() {
                         let _ = writeln!(writer, "{account_id}: {err}");

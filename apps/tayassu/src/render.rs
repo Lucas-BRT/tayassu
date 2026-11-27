@@ -99,6 +99,13 @@ fn render_state(
     if !account.enabled {
         return "DISABLED".to_owned();
     }
+    if let Some(failure) = status.and_then(|st| st.last_probe_error.as_ref()) {
+        return if failure.is_authentication() {
+            "AUTH".to_owned()
+        } else {
+            "ERROR".to_owned()
+        };
+    }
     if let Some(cooldown) = status.and_then(|st| st.active_cooldown(bucket, now)) {
         let rem = cooldown
             .remaining(now)
@@ -183,6 +190,28 @@ mod tests {
 
     /// Gemini remaining quota percentage fixture.
     const GEMINI_PCT: u8 = 43;
+
+    #[test]
+    fn renders_auth_failure_state() {
+        let now = Utc::now();
+        let account = AccountConfig::new(
+            "claude-work".parse().expect("id"),
+            ProviderKind::Claude,
+            "Work",
+        );
+        let mut status = AccountStatus::empty(account.id.clone());
+        status.set_probe_failure(tayassu_core::ProbeFailure::authentication("not logged in"));
+
+        let accounts = [account];
+        let statuses = [status];
+        let table = StatusTable::new(&accounts, &statuses, None, None);
+
+        let mut buf = Vec::new();
+        table.write_to(&mut buf, now).expect("render table");
+        let output = String::from_utf8(buf).expect("utf8");
+
+        assert!(output.contains("AUTH"));
+    }
 
     #[test]
     fn renders_ready_and_cooldown_rows() {

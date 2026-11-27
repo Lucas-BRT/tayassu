@@ -17,7 +17,9 @@ pub use state::{RuntimeState, STATE_SCHEMA_VERSION};
 mod tests {
     use super::*;
     use chrono::{TimeDelta, Utc};
-    use tayassu_core::{AccountConfig, AccountId, CooldownEntry, ModelBucket, ProviderKind};
+    use tayassu_core::{
+        AccountConfig, AccountId, CooldownEntry, ModelBucket, ProbeFailure, ProviderKind,
+    };
     use tempfile::TempDir;
 
     /// Cooldown duration in hours used for persistence round-trip tests.
@@ -54,11 +56,20 @@ mod tests {
                 resets_at: Utc::now() + TimeDelta::hours(TEST_COOLDOWN_HOURS),
                 reason: "manual".to_owned(),
             });
+        state
+            .status_for_mut(&account_id)
+            .set_probe_failure(ProbeFailure::authentication("not logged in"));
         state.save_atomic(&paths.state_file).expect("save state");
 
         let loaded = RuntimeState::load(&paths.state_file).expect("load state");
         assert_eq!(loaded.schema_version, STATE_SCHEMA_VERSION);
-        assert!(loaded.status_for(&account_id).is_some());
+        let status = loaded.status_for(&account_id).expect("status");
+        assert!(
+            status
+                .last_probe_error
+                .as_ref()
+                .is_some_and(ProbeFailure::is_authentication)
+        );
     }
 
     #[test]

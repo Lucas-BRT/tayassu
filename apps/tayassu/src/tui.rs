@@ -25,8 +25,11 @@ const EVENT_POLL_MS: u64 = 500;
 /// Header pane height in terminal rows.
 const HEADER_HEIGHT: u16 = 3;
 
-/// Detail pane height in terminal rows.
-const DETAIL_HEIGHT: u16 = 8;
+/// Minimum height of the details pane, in terminal rows (borders included).
+const DETAIL_MIN_HEIGHT: u16 = 3;
+
+/// Maximum height of the details pane before its content scrolls out of view.
+const DETAIL_MAX_HEIGHT: u16 = 12;
 
 /// Footer help bar height in terminal rows.
 const FOOTER_HEIGHT: u16 = 1;
@@ -54,6 +57,10 @@ const COL_QUOTA_HEADER: &str = "QUOTA";
 enum AccountState {
     /// Account is disabled in `config.toml`.
     Disabled,
+    /// Last probe failed because the profile needs a fresh login.
+    AuthRequired,
+    /// Last probe failed for another reason.
+    ProbeError,
     /// Account has an active cooldown on the evaluated bucket.
     Cooling(Option<chrono::TimeDelta>),
     /// Account has no remaining quota on the evaluated bucket.
@@ -62,6 +69,96 @@ enum AccountState {
     Partial,
     /// Account is fully available.
     Ready,
+}
+
+impl AccountState {
+    /// Sort severity, with the most actionable states first.
+    const fn severity(self) -> u8 {
+        match self {
+            Self::AuthRequired => 0,
+            Self::ProbeError => 1,
+            Self::Cooling(_) => 2,
+            Self::Exhausted => 3,
+            Self::Partial => 4,
+            Self::Disabled => 5,
+            Self::Ready => 6,
+        }
+    }
+}
+
+/// Ordering applied to the accounts table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SortMode {
+    /// Original order from `config.toml`.
+    Configured,
+    /// Lowest priority value first.
+    Priority,
+    /// Provider name, then priority.
+    Provider,
+    /// Most actionable state first.
+    State,
+}
+
+impl SortMode {
+    /// Advances to the next sort mode.
+    const fn next(self) -> Self {
+        match self {
+            Self::Configured => Self::Priority,
+            Self::Priority => Self::Provider,
+            Self::Provider => Self::State,
+            Self::State => Self::Configured,
+        }
+    }
+
+    /// Short label shown in the table title.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Configured => "config",
+            Self::Priority => "priority",
+            Self::Provider => "provider",
+            Self::State => "state",
+        }
+    }
+}
+
+/// Row filter applied to the accounts table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FilterMode {
+    /// Show every account.
+    All,
+    /// Show only accounts that need attention.
+    Problems,
+    /// Show only fully ready accounts.
+    Ready,
+}
+
+impl FilterMode {
+    /// Advances to the next filter.
+    const fn next(self) -> Self {
+        match self {
+            Self::All => Self::Problems,
+            Self::Problems => Self::Ready,
+            Self::Ready => Self::All,
+        }
+    }
+
+    /// Short label shown in the table title.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Problems => "problems",
+            Self::Ready => "ready",
+        }
+    }
+
+    /// Returns `true` when `state` should be visible.
+    const fn matches(self, state: AccountState) -> bool {
+        match self {
+            Self::All => true,
+            Self::Problems => !matches!(state, AccountState::Ready),
+            Self::Ready => matches!(state, AccountState::Ready),
+        }
+    }
 }
 
 /// Actions returned by keyboard input handling in [`DashboardState`].
@@ -82,6 +179,8 @@ pub enum DashAction {
 pub struct DashboardState {
     selected: usize,
     status_message: String,
+    sort_mode: SortMode,
+    filter_mode: FilterMode,
 }
 
 impl Default for DashboardState {
@@ -89,6 +188,8 @@ impl Default for DashboardState {
         Self {
             selected: 0,
             status_message: "Ready".to_owned(),
+            sort_mode: SortMode::Configured,
+            filter_mode: FilterMode::All,
         }
     }
 }
@@ -99,10 +200,67 @@ impl DashboardState {
         self.status_message = message.into();
     }
 
-    /// Returns the currently selected account id, if any accounts exist.
+    /// Returns the accounts visible under the current filter, in sort order.
     #[must_use]
-    pub fn selected_account<'a>(&self, accounts: &'a [AccountConfig]) -> Option<&'a AccountConfig> {
-        accounts.get(self.selected)
+    pub fn visible_accounts<'a>(
+        &self,
+        accounts: &'a [AccountConfig],
+        statuses: &[AccountStatus],
+        now: DateTime<Utc>,
+    ) -> Vec<&'a AccountConfig> {
+        let default_bucket = ModelBucket::default_bucket();
+        let mut visible: Vec<&AccountConfig> = accounts
+            .iter()
+            .filter(|account| {
+                let status = statuses.iter().find(|st| st.account_id == account.id);
+                self.filter_mode
+                    .matches(account_state(account, status, &default_bucket, now))
+            })
+            .collect();
+
+        match self.sort_mode {
+            SortMode::Configured => {}
+            SortMode::Priority => {
+                visible.sort_by(|a, b| a.priority.cmp(&b.priority).then_with(|| a.id.cmp(&b.id)));
+            }
+            SortMode::Provider => visible.sort_by(|a, b| {
+                a.provider
+                    .as_str()
+                    .cmp(b.provider.as_str())
+                    .then_with(|| a.priority.cmp(&b.priority))
+                    .then_with(|| a.id.cmp(&b.id))
+            }),
+            SortMode::State => visible.sort_by(|a, b| {
+                let a_state = account_state(
+                    a,
+                    statuses.iter().find(|st| st.account_id == a.id),
+                    &default_bucket,
+                    now,
+                );
+                let b_state = account_state(
+                    b,
+                    statuses.iter().find(|st| st.account_id == b.id),
+                    &default_bucket,
+                    now,
+                );
+                a_state
+                    .severity()
+                    .cmp(&b_state.severity())
+                    .then_with(|| a.priority.cmp(&b.priority))
+                    .then_with(|| a.id.cmp(&b.id))
+            }),
+        }
+
+        visible
+    }
+
+    /// Returns the selected account from a precomputed visible list.
+    #[must_use]
+    pub fn selected_visible_account<'a>(
+        &self,
+        visible: &[&'a AccountConfig],
+    ) -> Option<&'a AccountConfig> {
+        visible.get(self.selected).copied()
     }
 
     /// Advances selection to the next account (wrapping around).
@@ -154,6 +312,16 @@ impl DashboardState {
             }
             KeyCode::Char('r') => DashAction::ProbeAll,
             KeyCode::Char('c') => DashAction::ClearSelectedCooldowns,
+            KeyCode::Char('s') => {
+                self.sort_mode = self.sort_mode.next();
+                self.selected = 0;
+                DashAction::None
+            }
+            KeyCode::Char('f') => {
+                self.filter_mode = self.filter_mode.next();
+                self.selected = 0;
+                DashAction::None
+            }
             _ => DashAction::None,
         }
     }
@@ -166,19 +334,38 @@ impl DashboardState {
         statuses: &[AccountStatus],
         now: DateTime<Utc>,
     ) {
+        let visible = self.visible_accounts(accounts, statuses, now);
+        let detail_lines = visible.get(self.selected).map_or_else(
+            || {
+                vec![Line::from(if accounts.is_empty() {
+                    "No accounts configured. Run: tayassu account add <id> <provider>"
+                } else {
+                    "No accounts match the current filter."
+                })]
+            },
+            |account| {
+                let status = statuses.iter().find(|entry| entry.account_id == account.id);
+                build_detail_lines(account, status, now)
+            },
+        );
+        let detail_height = u16::try_from(detail_lines.len())
+            .unwrap_or(u16::MAX)
+            .saturating_add(2)
+            .clamp(DETAIL_MIN_HEIGHT, DETAIL_MAX_HEIGHT);
+
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(HEADER_HEIGHT),
                 Constraint::Min(0),
-                Constraint::Length(DETAIL_HEIGHT),
+                Constraint::Length(detail_height),
                 Constraint::Length(FOOTER_HEIGHT),
             ])
             .split(frame.area());
 
         render_header(frame, chunks[0], accounts, statuses, now);
-        self.render_table(frame, chunks[1], accounts, statuses, now);
-        self.render_details(frame, chunks[2], accounts, statuses, now);
+        self.render_table(frame, chunks[1], &visible, statuses, now);
+        Self::render_details(frame, chunks[2], detail_lines);
         self.render_footer(frame, chunks[3]);
     }
 
@@ -186,7 +373,7 @@ impl DashboardState {
         &self,
         frame: &mut Frame<'_>,
         area: ratatui::layout::Rect,
-        accounts: &[AccountConfig],
+        accounts: &[&AccountConfig],
         statuses: &[AccountStatus],
         now: DateTime<Utc>,
     ) {
@@ -233,9 +420,14 @@ impl DashboardState {
             Constraint::Min(COL_LABEL_MIN_WIDTH),
         ];
 
+        let title = format!(
+            " Accounts [sort: {} | filter: {}] ",
+            self.sort_mode.label(),
+            self.filter_mode.label()
+        );
         let table = Table::new(rows, widths)
             .header(header)
-            .block(Block::default().title(" Accounts ").borders(Borders::ALL))
+            .block(Block::default().title(title).borders(Borders::ALL))
             .row_highlight_style(
                 Style::default()
                     .bg(Color::DarkGray)
@@ -250,23 +442,7 @@ impl DashboardState {
         frame.render_stateful_widget(table, area, &mut table_state);
     }
 
-    fn render_details(
-        &self,
-        frame: &mut Frame<'_>,
-        area: ratatui::layout::Rect,
-        accounts: &[AccountConfig],
-        statuses: &[AccountStatus],
-        now: DateTime<Utc>,
-    ) {
-        let lines = if let Some(account) = self.selected_account(accounts) {
-            let status = statuses.iter().find(|entry| entry.account_id == account.id);
-            build_detail_lines(account, status, now)
-        } else {
-            vec![Line::from(
-                "No accounts configured. Run: tayassu account add <id> <provider>",
-            )]
-        };
-
+    fn render_details(frame: &mut Frame<'_>, area: ratatui::layout::Rect, lines: Vec<Line<'_>>) {
         let details = Paragraph::new(lines)
             .block(Block::default().title(" Details ").borders(Borders::ALL))
             .wrap(Wrap { trim: true });
@@ -276,7 +452,7 @@ impl DashboardState {
     fn render_footer(&self, frame: &mut Frame<'_>, area: ratatui::layout::Rect) {
         let footer = Paragraph::new(Line::from(vec![
             Span::styled(
-                " j/k: move | r: probe | c: clear cooldowns | q: quit ",
+                " j/k: move | s: sort | f: filter | r: probe | c: clear | q: quit ",
                 Style::default()
                     .fg(Color::Black)
                     .bg(Color::Cyan)
@@ -335,8 +511,9 @@ where
     let mut ui = DashboardState::default();
 
     loop {
-        ui.clamp_selection(accounts.len());
         let now = Utc::now();
+        let visible = ui.visible_accounts(accounts, &runtime_state.statuses, now);
+        ui.clamp_selection(visible.len());
 
         guard
             .terminal
@@ -361,7 +538,7 @@ where
                     }
                 }
                 DashAction::ClearSelectedCooldowns => {
-                    if let Some(account) = ui.selected_account(accounts) {
+                    if let Some(account) = ui.selected_visible_account(&visible) {
                         match on_clear_cooldowns(runtime_state, &account.id) {
                             Ok(summary) => ui.set_status(summary),
                             Err(err) => ui.set_status(format!("Clear error: {err}")),
@@ -387,6 +564,7 @@ fn render_header(
     let mut ready = 0u16;
     let mut partial = 0u16;
     let mut unavailable = 0u16;
+    let mut failed = 0u16;
     let mut disabled = 0u16;
 
     for account in accounts {
@@ -395,12 +573,13 @@ fn render_header(
             AccountState::Ready => ready += 1,
             AccountState::Partial => partial += 1,
             AccountState::Cooling(_) | AccountState::Exhausted => unavailable += 1,
+            AccountState::AuthRequired | AccountState::ProbeError => failed += 1,
             AccountState::Disabled => disabled += 1,
         }
     }
 
     let mut summary = format!(
-        "| {total} accounts  •  {ready} ready  •  {partial} partial  •  {unavailable} unavailable"
+        "| {total} accounts  •  {ready} ready  •  {partial} partial  •  {unavailable} unavailable  •  {failed} failed"
     );
     if disabled > 0 {
         let _ = write!(summary, "  •  {disabled} disabled");
@@ -434,6 +613,13 @@ fn account_state(
     if !account.enabled {
         return AccountState::Disabled;
     }
+    if let Some(failure) = status.and_then(|st| st.last_probe_error.as_ref()) {
+        return if failure.is_authentication() {
+            AccountState::AuthRequired
+        } else {
+            AccountState::ProbeError
+        };
+    }
     if let Some(cd) = status.and_then(|st| st.active_cooldown(bucket, now)) {
         return AccountState::Cooling(cd.remaining(now));
     }
@@ -455,6 +641,8 @@ fn account_state_cell(
 ) -> (String, Color) {
     match account_state(account, status, bucket, now) {
         AccountState::Disabled => ("DISABLED".to_owned(), Color::DarkGray),
+        AccountState::AuthRequired => ("AUTH".to_owned(), Color::Yellow),
+        AccountState::ProbeError => ("ERROR".to_owned(), Color::Red),
         AccountState::Cooling(remaining) => (
             format!(
                 "COOLDOWN ({})",
@@ -469,7 +657,7 @@ fn account_state_cell(
 }
 
 fn quota_column_width(
-    accounts: &[AccountConfig],
+    accounts: &[&AccountConfig],
     statuses: &[AccountStatus],
     now: DateTime<Utc>,
     table_width: u16,
@@ -554,6 +742,18 @@ fn build_detail_lines<'a>(
         probed
     )));
 
+    if let Some(failure) = status.and_then(|st| st.last_probe_error.as_ref()) {
+        let color = if failure.is_authentication() {
+            Color::Yellow
+        } else {
+            Color::Red
+        };
+        lines.push(Line::from(vec![
+            Span::styled("Probe error: ", Style::default().fg(color)),
+            Span::raw(failure.message.clone()),
+        ]));
+    }
+
     if let Some(st) = status {
         if !st.windows.is_empty() {
             let windows_summary: Vec<String> = st
@@ -599,7 +799,7 @@ mod tests {
     use super::*;
     use chrono::TimeDelta;
     use ratatui::backend::TestBackend;
-    use tayassu_core::{CooldownEntry, ProviderKind, QuotaWindow, RemainingPercent};
+    use tayassu_core::{CooldownEntry, ProbeFailure, ProviderKind, QuotaWindow, RemainingPercent};
 
     /// Virtual terminal width for `TestBackend` rendering checks.
     const TEST_TERM_WIDTH: u16 = 100;
@@ -733,6 +933,73 @@ mod tests {
 
         assert!(rendered.contains("claude:50%(1h30m)"), "{rendered}");
         assert!(rendered.contains("gemini:31%(1h30m)"), "{rendered}");
+    }
+
+    #[test]
+    fn dashboard_sorts_filters_and_surfaces_auth_failures() {
+        let now = Utc::now();
+        let mut ready =
+            AccountConfig::new("zeta".parse().expect("id"), ProviderKind::Codex, "Ready");
+        ready.priority = 30;
+        let mut failed = AccountConfig::new(
+            "alpha".parse().expect("id"),
+            ProviderKind::Claude,
+            "Needs login",
+        );
+        failed.priority = 10;
+
+        let mut failed_status = AccountStatus::empty(failed.id.clone());
+        failed_status.set_probe_failure(ProbeFailure::authentication(
+            "account 'alpha' is not logged in",
+        ));
+
+        let accounts = [ready, failed];
+        let statuses = [failed_status];
+        let mut state = DashboardState::default();
+
+        let visible = state.visible_accounts(&accounts, &statuses, now);
+        assert_eq!(
+            visible.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(),
+            ["zeta", "alpha"]
+        );
+
+        assert_eq!(
+            state.handle_key(KeyCode::Char('s'), KeyModifiers::NONE, 2),
+            DashAction::None
+        );
+        let visible = state.visible_accounts(&accounts, &statuses, now);
+        assert_eq!(
+            visible.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(),
+            ["alpha", "zeta"]
+        );
+
+        state.handle_key(KeyCode::Char('f'), KeyModifiers::NONE, 2);
+        let visible = state.visible_accounts(&accounts, &statuses, now);
+        assert_eq!(
+            visible.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(),
+            ["alpha"]
+        );
+
+        let backend = TestBackend::new(WIDE_TEST_TERM_WIDTH, TEST_TERM_HEIGHT);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| state.render(frame, &accounts, &statuses, now))
+            .expect("draw frame");
+
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+
+        assert!(rendered.contains("AUTH"), "{rendered}");
+        assert!(rendered.contains("Probe error:"), "{rendered}");
+        assert!(rendered.contains("1 failed"), "{rendered}");
+        assert!(rendered.contains("sort: priority"), "{rendered}");
+        assert!(rendered.contains("filter: problems"), "{rendered}");
+        assert!(!rendered.contains("zeta"), "{rendered}");
     }
 
     #[test]
