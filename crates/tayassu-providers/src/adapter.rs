@@ -122,6 +122,10 @@ pub struct ProbeOutput {
     pub windows: Vec<QuotaWindow>,
     /// Cooldown entries derived from the probe output.
     pub cooldowns: Vec<CooldownEntry>,
+    /// Discovered model IDs and their shared quota buckets.
+    pub model_buckets: std::collections::BTreeMap<ModelBucket, ModelBucket>,
+    /// Current `OpenRouter` key budget if provided.
+    pub key_budget: Option<tayassu_core::KeyBudget>,
 }
 
 /// Contract implemented by each AI CLI provider adapter.
@@ -478,7 +482,7 @@ impl ProviderAdapter for ClaudeAdapter {
                 remaining: None,
                 resets_at: status.login_expires_at,
             }],
-            cooldowns: Vec::new(),
+            ..ProbeOutput::default()
         })
     }
 }
@@ -534,7 +538,7 @@ impl ProviderAdapter for CodexAdapter {
                     remaining: None,
                     resets_at: None,
                 }],
-                cooldowns: Vec::new(),
+                ..ProbeOutput::default()
             });
         }
 
@@ -589,7 +593,7 @@ impl ProviderAdapter for CopilotAdapter {
                     remaining: None,
                     resets_at: None,
                 }],
-                cooldowns: Vec::new(),
+                ..ProbeOutput::default()
             }))
         } else {
             Some(Err(ProviderError::AuthenticationRequired {
@@ -685,7 +689,7 @@ impl ProviderAdapter for OpencodeAdapter {
 
         Ok(ProbeOutput {
             windows,
-            cooldowns: Vec::new(),
+            ..ProbeOutput::default()
         })
     }
 }

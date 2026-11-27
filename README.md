@@ -30,6 +30,10 @@ tayassu run claude --dry-run -- --help
 tayassu run claude -- --help
 ```
 
+For more setup options, see how to
+[connect two accounts from the same provider](docs/USAGE.md#connect-two-accounts-from-the-same-provider)
+or [let Tayassu choose a provider](docs/USAGE.md#let-tayassu-choose-a-provider).
+
 ## Documentation
 
 See [docs/USAGE.md](docs/USAGE.md) for the full command reference, configuration format, shell integration, background probing, and troubleshooting.

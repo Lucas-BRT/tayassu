@@ -124,13 +124,85 @@ impl fmt::Display for FallbackTarget {
 #[derive(Debug, Clone, Copy)]
 pub struct AccountRouter {
     policy: SelectionPolicy,
+    require_quota: bool,
 }
 
 impl AccountRouter {
     /// Creates a router using `policy`.
     #[must_use]
     pub const fn new(policy: SelectionPolicy) -> Self {
-        Self { policy }
+        Self {
+            policy,
+            require_quota: false,
+        }
+    }
+
+    /// Requires a current, positive quota measurement for automatic selection.
+    #[must_use]
+    pub const fn require_quota(mut self, required: bool) -> Self {
+        self.require_quota = required;
+        self
+    }
+
+    /// Returns whether the latest account status satisfies this router.
+    #[must_use]
+    pub fn accepts(
+        &self,
+        status: Option<&AccountStatus>,
+        bucket: &ModelBucket,
+        now: DateTime<Utc>,
+    ) -> bool {
+        if self.require_quota {
+            return status.is_some_and(|st| {
+                st.last_probe_error.is_none()
+                    && st.can_route(bucket, now)
+                    && st
+                        .lowest_remaining_percent(bucket, now)
+                        .is_some_and(|quota| !quota.is_exhausted())
+            });
+        }
+        status.is_none_or(|st| st.can_route(bucket, now))
+    }
+
+    /// Resolves the concrete bucket eligible for the request.
+    #[must_use]
+    pub fn resolve_bucket(
+        &self,
+        provider: ProviderKind,
+        status: Option<&AccountStatus>,
+        requested: &ModelBucket,
+        now: DateTime<Utc>,
+    ) -> Option<ModelBucket> {
+        if self.require_quota && provider == ProviderKind::Opencode {
+            let status = status?;
+            if requested == &ModelBucket::default_bucket() {
+                return status
+                    .model_buckets
+                    .keys()
+                    .filter(|model| self.accepts(Some(status), model, now))
+                    .max_by_key(|model| {
+                        (status.lowest_remaining_percent(model, now), Reverse(*model))
+                    })
+                    .cloned();
+            }
+            return (status.model_buckets.contains_key(requested)
+                && self.accepts(Some(status), requested, now))
+            .then(|| requested.clone());
+        }
+        if self.require_quota
+            && provider == ProviderKind::Claude
+            && requested == &ModelBucket::default_bucket()
+            && let Some(status) = status
+            && status
+                .windows
+                .iter()
+                .any(|window| window.remaining.is_some() && window.bucket != *requested)
+        {
+            // A family-specific limit requires an explicit model to avoid running the wrong family.
+            return None;
+        }
+        self.accepts(status, requested, now)
+            .then(|| requested.clone())
     }
 
     /// Selects the highest-ranked available account for `provider` and `bucket` at `now`.
@@ -147,21 +219,21 @@ impl AccountRouter {
         bucket: &ModelBucket,
         now: DateTime<Utc>,
     ) -> Result<&'a AccountConfig, CoreError> {
-        let mut candidates: Vec<(&'a AccountConfig, Option<&AccountStatus>)> = accounts
+        let mut candidates: Vec<_> = accounts
             .iter()
             .filter(|account| account.enabled && account.provider == provider)
-            .map(|account| {
+            .filter_map(|account| {
                 let status = statuses
                     .iter()
                     .find(|status| status.account_id == account.id);
-                (account, status)
+                let resolved = self.resolve_bucket(provider, status, bucket, now)?;
+                Some((account, status, resolved))
             })
-            .filter(|(_, status)| status.is_none_or(|st| st.can_route(bucket, now)))
             .collect();
 
         match self.policy {
             SelectionPolicy::Priority => {
-                candidates.sort_by_key(|(account, status)| {
+                candidates.sort_by_key(|(account, status, bucket)| {
                     let active = status.map_or(0, |st| st.active_sessions);
                     let remaining = status.and_then(|st| st.lowest_remaining_percent(bucket, now));
                     (
@@ -173,7 +245,7 @@ impl AccountRouter {
                 });
             }
             SelectionPolicy::MostQuota => {
-                candidates.sort_by_key(|(account, status)| {
+                candidates.sort_by_key(|(account, status, bucket)| {
                     let active = status.map_or(0, |st| st.active_sessions);
                     let remaining = status.and_then(|st| st.lowest_remaining_percent(bucket, now));
                     (
@@ -185,7 +257,7 @@ impl AccountRouter {
                 });
             }
             SelectionPolicy::SoonestReset => {
-                candidates.sort_by_key(|(account, status)| {
+                candidates.sort_by_key(|(account, status, bucket)| {
                     let active = status.map_or(0, |st| st.active_sessions);
                     let reset_ts = status
                         .and_then(|st| st.soonest_reset(bucket, now))
@@ -197,7 +269,7 @@ impl AccountRouter {
 
         candidates
             .first()
-            .map(|(account, _)| *account)
+            .map(|(account, _, _)| *account)
             .ok_or_else(|| CoreError::NoAvailableAccount {
                 provider,
                 bucket: bucket.clone(),
@@ -219,8 +291,16 @@ impl AccountRouter {
         for target in chain {
             if let Ok(account) =
                 self.select(accounts, statuses, target.provider, &target.bucket, now)
+                && let Some(bucket) = self.resolve_bucket(
+                    target.provider,
+                    statuses
+                        .iter()
+                        .find(|status| status.account_id == account.id),
+                    &target.bucket,
+                    now,
+                )
             {
-                return Ok((account, target.bucket.clone()));
+                return Ok((account, bucket));
             }
         }
         Err(CoreError::NoAvailableAccountInChain)

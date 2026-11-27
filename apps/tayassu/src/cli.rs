@@ -31,6 +31,16 @@ pub enum Command {
         /// Model bucket to evaluate availability against.
         #[arg(long)]
         model: Option<ModelBucket>,
+        /// List discovered `OpenCode` models and their measured quota.
+        #[arg(long, conflicts_with = "model")]
+        list_models: bool,
+    },
+
+    /// Automatic routing and background probing.
+    Auto {
+        /// Automatic operation.
+        #[command(subcommand)]
+        action: AutoAction,
     },
 
     /// Open an interactive live terminal dashboard for accounts, quotas, and cooldowns.
@@ -59,6 +69,9 @@ pub enum Command {
         /// Print the chosen account and isolated environment without spawning the CLI.
         #[arg(long)]
         dry_run: bool,
+        /// Refresh usage before launch and select only an account with measured quota remaining.
+        #[arg(long, conflicts_with = "account")]
+        require_quota: bool,
         /// Retry once on the next available account if the first run hits a rate limit.
         #[arg(long, conflicts_with = "account")]
         failover: bool,
@@ -136,6 +149,25 @@ pub enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+}
+
+/// Automatic operations.
+#[derive(Debug, Subcommand)]
+pub enum AutoAction {
+    /// Select a configured fallback target with confirmed quota and launch it.
+    Run {
+        /// Override the configured fallback chain.
+        #[arg(long)]
+        chain: Option<String>,
+        /// Show the selected target using the last recorded quota.
+        #[arg(long)]
+        dry_run: bool,
+        /// Arguments forwarded to the selected agent.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Enable periodic probing and refresh quotas now.
+    Probe,
 }
 
 /// Options for discovering and importing host accounts.

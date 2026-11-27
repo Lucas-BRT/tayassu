@@ -736,3 +736,188 @@ fn opencode_outside_path_works_for_doctor_probe_and_run() {
     );
     assert!(env.run_ok(&["run", "opencode"]).contains("ran opencode"));
 }
+
+#[cfg(unix)]
+#[test]
+fn strict_routing_probes_each_profile_and_skips_unknown_or_exhausted_quota() {
+    let env = TestEnv::new();
+    let mock_codex = env.write_mock_script(
+        "codex-quota",
+        r#"#!/bin/bash
+set -eu
+if [[ "${1:-}" == app-server ]]; then
+  IFS= read -r initialize
+  [[ "$initialize" == *'"method":"initialize"'* ]]
+  printf '%s\n' '{"id":1,"result":{}}'
+  IFS= read -r initialized
+  [[ "$initialized" == *'"method":"initialized"'* ]]
+  IFS= read -r quota
+  [[ "$quota" == *'"method":"account/rateLimits/read"'* ]]
+  case "$CODEX_HOME" in
+    */codex-full) used=100 ;;
+    */codex-available) used=27 ;;
+    *) exit 2 ;;
+  esac
+  printf '{"id":2,"result":{"rateLimits":{"primary":{"usedPercent":%s,"resetsAt":4102444800}}}}\n' "$used"
+else
+  printf 'ran %s\n' "${CODEX_HOME##*/}"
+fi
+"#,
+    );
+    let mock_claude =
+        env.write_mock_script("claude-auth", "#!/bin/sh\nprintf '{\"loggedIn\":true}\n'\n");
+    for (id, provider, priority, binary) in [
+        ("codex-full", "codex", "10", &mock_codex),
+        ("codex-available", "codex", "20", &mock_codex),
+        ("claude-unknown", "claude", "1", &mock_claude),
+    ] {
+        env.run_ok(&[
+            "account",
+            "add",
+            id,
+            provider,
+            "--priority",
+            priority,
+            "--binary",
+            binary,
+        ]);
+    }
+    let config = env.dir.path().join("config/tayassu/config.toml");
+    let contents = fs::read_to_string(&config).expect("read config");
+    fs::write(
+        &config,
+        contents.replace(
+            "[fallback_chains]",
+            "[fallback_chains]\nauto = [\"claude\", \"codex\"]",
+        ),
+    )
+    .expect("configure chain");
+
+    let launch = env.run_ok(&["run", "--chain", "auto", "--require-quota"]);
+    assert!(launch.contains("ran codex-available"));
+    let automatic = env.run_ok(&["auto", "run"]);
+    assert!(automatic.contains("ran codex-available"));
+    fs::write(&config, contents).expect("remove configured chain");
+    let automatic = env.run_ok(&["auto", "run"]);
+    assert!(automatic.contains("ran codex-available"));
+    fs::write(
+        &config,
+        fs::read_to_string(&config).expect("config").replace(
+            "[fallback_chains]",
+            "[fallback_chains]\nauto = [\"claude\", \"codex\"]",
+        ),
+    )
+    .expect("restore chain");
+    let status = env.run_ok(&["status"]);
+    assert!(status.contains("default:73%"));
+    assert!(status.contains("EXHAUSTED"));
+
+    let preview = env.run_ok(&["run", "--chain", "auto", "--require-quota", "--dry-run"]);
+    assert!(preview.contains("account: codex-available"));
+}
+
+#[cfg(unix)]
+#[test]
+fn opencode_strict_routing_uses_the_catalog_and_passes_the_measured_model() {
+    let env = TestEnv::new();
+    let mock_opencode = env.write_mock_script(
+        "opencode-catalog",
+        r#"#!/bin/sh
+case "$1" in
+  auth) printf '%s\n' '[{"id":"github-copilot","connections":[{"id":"linked"}]},{"id":"google","connections":[{"id":"unknown"}]}]' ;;
+  models) printf '%s\n' 'github-copilot/gpt-test' 'google/gemini-test' ;;
+  *) printf '%s\n' "$*" ;;
+esac
+"#,
+    );
+    let mock_copilot = env.write_mock_script(
+        "copilot-quota",
+        r#"#!/bin/bash
+IFS= read -r header
+IFS= read -r empty
+length="${header#Content-Length: }"
+IFS= read -r -N "${length//$'\r'/}" request
+[[ "$request" == *'account.getQuota'* ]] || exit 2
+response='{"jsonrpc":"2.0","id":2,"result":{"quotaSnapshots":{"premium_interactions":{"entitlementRequests":300,"remainingPercentage":42,"resetDate":"2099-01-01T00:00:00Z"}}}}'
+printf 'Content-Length: %s\r\n\r\n%s' "${#response}" "$response"
+"#,
+    );
+    env.run_ok(&[
+        "account",
+        "add",
+        "open",
+        "opencode",
+        "--binary",
+        &mock_opencode,
+    ]);
+    env.run_ok(&[
+        "account",
+        "add",
+        "copilot",
+        "copilot",
+        "--binary",
+        &mock_copilot,
+    ]);
+    let config = env.dir.path().join("config/tayassu/config.toml");
+    let contents = fs::read_to_string(&config).expect("read config");
+    let contents = contents.replace(
+        "provider = \"opencode\"",
+        "provider = \"opencode\"\nopencode_copilot_account = \"copilot\"",
+    );
+    fs::write(config, contents).expect("link matching Copilot profile");
+
+    let launch = env.run_ok(&["run", "opencode", "--require-quota"]);
+    assert!(launch.contains("--model github-copilot/gpt-test"));
+    let models = env.run_ok(&["status", "--provider", "opencode", "--list-models"]);
+    assert!(models.contains("github-copilot/gpt-test 42% github-copilot"));
+    assert!(models.contains("google/gemini-test unknown google"));
+    let unavailable = env.run_cli(&[
+        "run",
+        "opencode",
+        "--require-quota",
+        "--model",
+        "google/gemini-test",
+        "--dry-run",
+    ]);
+    assert!(!unavailable.status.success());
+}
+
+#[cfg(unix)]
+#[test]
+fn auto_probe_installs_and_enables_timer_without_overwriting_existing_units() {
+    let env = TestEnv::new();
+    env.write_mock_script(
+        "systemctl",
+        "#!/bin/sh\ncase \"$*\" in *is-enabled*) exit 1;; esac\nexit 0\n",
+    );
+    let path = format!("{}:/usr/bin:/bin", env.dir.path().display());
+    let run = || {
+        env.command()
+            .env("PATH", &path)
+            .args(["auto", "probe"])
+            .output()
+            .expect("run auto probe")
+    };
+    let first = run();
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let timer = env
+        .dir
+        .path()
+        .join("config/systemd/user/tayassu-probe.timer");
+    assert!(timer.exists());
+    fs::write(&timer, "custom timer").expect("customize timer");
+    let second = run();
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(timer).expect("read timer"),
+        "custom timer"
+    );
+}

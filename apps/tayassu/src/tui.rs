@@ -1,4 +1,6 @@
-use crate::render::{format_countdown, render_login};
+mod mascot;
+
+use crate::render::format_countdown;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -6,11 +8,12 @@ use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
+use mascot::Mascot;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Cell, Paragraph, Row, Table, TableState};
 use ratatui::{Frame, Terminal};
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
@@ -22,23 +25,26 @@ use tayassu_store::RuntimeState;
 /// Poll interval in milliseconds for live cooldown countdown ticks in the TUI.
 const EVENT_POLL_MS: u64 = 500;
 
-/// Header pane height in terminal rows.
+/// Compact header height in terminal rows.
 const HEADER_HEIGHT: u16 = 3;
 
-/// Minimum height of the details pane, in terminal rows (borders included).
-const DETAIL_MIN_HEIGHT: u16 = 3;
-
-/// Maximum height of the details pane before its content scrolls out of view.
-const DETAIL_MAX_HEIGHT: u16 = 12;
+/// Width of the quota bar, in terminal cells.
+const QUOTA_BAR_WIDTH: usize = 10;
+/// Maximum number of expanded entries, keeping other accounts visible.
+const QUOTA_PAGE_SIZE: usize = 5;
+/// Quota below this percentage is displayed in red.
+const QUOTA_CRITICAL_PERCENT: u8 = 10;
+/// Quota below this percentage is displayed in orange.
+const QUOTA_LOW_PERCENT: u8 = 25;
 
 /// Footer help bar height in terminal rows.
 const FOOTER_HEIGHT: u16 = 1;
 
 /// Column widths in the main accounts table.
-const COL_ACCOUNT_WIDTH: u16 = 18;
-const COL_PROVIDER_WIDTH: u16 = 10;
-const COL_PRIORITY_WIDTH: u16 = 5;
-const COL_STATE_WIDTH: u16 = 18;
+const COL_ACCOUNT_WIDTH: u16 = 14;
+const COL_PROVIDER_WIDTH: u16 = 8;
+const COL_PRIORITY_WIDTH: u16 = 3;
+const COL_STATE_WIDTH: u16 = 14;
 /// Minimum quota column width, used on narrow terminals.
 const COL_QUOTA_MIN_WIDTH: u16 = 12;
 /// Minimum label column width; zero lets it collapse before the quota column clips.
@@ -67,6 +73,8 @@ enum AccountState {
     Exhausted,
     /// Account is available on the default bucket but has a sub-bucket cooldown.
     Partial,
+    /// No current quota measurement is available.
+    Unknown,
     /// Account is fully available.
     Ready,
 }
@@ -81,7 +89,8 @@ impl AccountState {
             Self::Exhausted => 3,
             Self::Partial => 4,
             Self::Disabled => 5,
-            Self::Ready => 6,
+            Self::Unknown => 6,
+            Self::Ready => 7,
         }
     }
 }
@@ -155,7 +164,7 @@ impl FilterMode {
     const fn matches(self, state: AccountState) -> bool {
         match self {
             Self::All => true,
-            Self::Problems => !matches!(state, AccountState::Ready),
+            Self::Problems => !matches!(state, AccountState::Ready | AccountState::Unknown),
             Self::Ready => matches!(state, AccountState::Ready),
         }
     }
@@ -181,6 +190,10 @@ pub struct DashboardState {
     status_message: String,
     sort_mode: SortMode,
     filter_mode: FilterMode,
+    detail_scroll: u16,
+    show_models: bool,
+    scope_index: usize,
+    mascot: Mascot,
 }
 
 impl Default for DashboardState {
@@ -190,6 +203,10 @@ impl Default for DashboardState {
             status_message: "Ready".to_owned(),
             sort_mode: SortMode::Configured,
             filter_mode: FilterMode::All,
+            detail_scroll: 0,
+            show_models: false,
+            scope_index: 0,
+            mascot: Mascot::default(),
         }
     }
 }
@@ -304,10 +321,36 @@ impl DashboardState {
             KeyCode::Char('q') | KeyCode::Esc => DashAction::Quit,
             KeyCode::Down | KeyCode::Char('j') => {
                 self.select_next(account_count);
+                self.detail_scroll = 0;
+                self.scope_index = 0;
                 DashAction::None
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 self.select_prev(account_count);
+                self.detail_scroll = 0;
+                self.scope_index = 0;
+                DashAction::None
+            }
+            KeyCode::PageDown => {
+                self.detail_scroll = self
+                    .detail_scroll
+                    .saturating_add(u16::try_from(QUOTA_PAGE_SIZE).unwrap_or(u16::MAX));
+                DashAction::None
+            }
+            KeyCode::PageUp => {
+                self.detail_scroll = self
+                    .detail_scroll
+                    .saturating_sub(u16::try_from(QUOTA_PAGE_SIZE).unwrap_or(u16::MAX));
+                DashAction::None
+            }
+            KeyCode::Char('g') => {
+                self.scope_index = self.scope_index.wrapping_add(1);
+                self.detail_scroll = 0;
+                DashAction::None
+            }
+            KeyCode::Char('m') => {
+                self.show_models = !self.show_models;
+                self.detail_scroll = 0;
                 DashAction::None
             }
             KeyCode::Char('r') => DashAction::ProbeAll,
@@ -315,11 +358,13 @@ impl DashboardState {
             KeyCode::Char('s') => {
                 self.sort_mode = self.sort_mode.next();
                 self.selected = 0;
+                self.detail_scroll = 0;
                 DashAction::None
             }
             KeyCode::Char('f') => {
                 self.filter_mode = self.filter_mode.next();
                 self.selected = 0;
+                self.detail_scroll = 0;
                 DashAction::None
             }
             _ => DashAction::None,
@@ -335,38 +380,23 @@ impl DashboardState {
         now: DateTime<Utc>,
     ) {
         let visible = self.visible_accounts(accounts, statuses, now);
-        let detail_lines = visible.get(self.selected).map_or_else(
-            || {
-                vec![Line::from(if accounts.is_empty() {
-                    "No accounts configured. Run: tayassu account add <id> <provider>"
-                } else {
-                    "No accounts match the current filter."
-                })]
-            },
-            |account| {
-                let status = statuses.iter().find(|entry| entry.account_id == account.id);
-                build_detail_lines(account, status, now)
-            },
-        );
-        let detail_height = u16::try_from(detail_lines.len())
-            .unwrap_or(u16::MAX)
-            .saturating_add(2)
-            .clamp(DETAIL_MIN_HEIGHT, DETAIL_MAX_HEIGHT);
-
+        let area = frame.area();
+        let header_height = if Mascot::fits(area.as_size()) {
+            mascot::HEADER_HEIGHT
+        } else {
+            HEADER_HEIGHT
+        };
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(HEADER_HEIGHT),
+                Constraint::Length(header_height),
                 Constraint::Min(0),
-                Constraint::Length(detail_height),
                 Constraint::Length(FOOTER_HEIGHT),
             ])
             .split(frame.area());
-
-        render_header(frame, chunks[0], accounts, statuses, now);
+        render_header(frame, chunks[0], accounts, statuses, now, &self.mascot);
         self.render_table(frame, chunks[1], &visible, statuses, now);
-        Self::render_details(frame, chunks[2], detail_lines);
-        self.render_footer(frame, chunks[3]);
+        self.render_footer(frame, chunks[2]);
     }
 
     fn render_table(
@@ -388,22 +418,57 @@ impl DashboardState {
 
         let rows: Vec<Row<'_>> = accounts
             .iter()
-            .map(|account| {
+            .enumerate()
+            .map(|(index, account)| {
                 let status = statuses.iter().find(|entry| entry.account_id == account.id);
                 let (state_text, state_color) =
                     account_state_cell(account, status, &default_bucket, now);
-                let quota_lines = summarize_buckets(status, now);
+                let mut quota_lines: Vec<Line<'_>> = summarize_buckets(status, now)
+                    .into_iter()
+                    .take(2)
+                    .map(Line::from)
+                    .collect();
+                if index == self.selected {
+                    if let Some(failure) = status.and_then(|st| st.last_probe_error.as_ref()) {
+                        quota_lines.push(Line::styled(
+                            format!("Probe error: {}", failure.message),
+                            Style::default().fg(Color::Red),
+                        ));
+                    }
+                    let entries = quota_view_lines(status, now, self.show_models, self.scope_index);
+                    let max_lines = usize::from(area.height.saturating_sub(7))
+                        .saturating_sub(quota_lines.len())
+                        .clamp(1, QUOTA_PAGE_SIZE);
+                    let offset = usize::from(self.detail_scroll)
+                        .min(entries.len().saturating_sub(1) / max_lines * max_lines);
+                    let end = (offset + max_lines).min(entries.len());
+                    let scope = status.and_then(|st| {
+                        model_scopes(st)
+                            .get(self.scope_index % model_scopes(st).len().max(1))
+                            .cloned()
+                    });
+                    let title = if self.show_models {
+                        scope.map_or_else(|| "Models".to_owned(), |name| format!("Models: {name}"))
+                    } else {
+                        "Quota windows".to_owned()
+                    };
+                    quota_lines.push(Line::styled(
+                        format!(
+                            "  {title} {}–{end}/{} · m switch",
+                            offset + 1,
+                            entries.len()
+                        ),
+                        Style::default().fg(Color::Cyan),
+                    ));
+                    quota_lines.extend(entries.into_iter().skip(offset).take(max_lines));
+                }
                 let quota_height = u16::try_from(quota_lines.len()).unwrap_or(u16::MAX);
-                let quota_cell = Cell::from(Text::from(
-                    quota_lines.into_iter().map(Line::from).collect::<Vec<_>>(),
-                ));
-
                 Row::new([
                     Cell::from(account.id.as_str().to_owned()),
                     Cell::from(account.provider.as_str().to_owned()),
                     Cell::from(account.priority.to_string()),
                     Cell::from(state_text).style(Style::default().fg(state_color)),
-                    quota_cell,
+                    Cell::from(Text::from(quota_lines)),
                     Cell::from(account.label.clone()),
                 ])
                 .height(quota_height)
@@ -427,7 +492,7 @@ impl DashboardState {
         );
         let table = Table::new(rows, widths)
             .header(header)
-            .block(Block::default().title(title).borders(Borders::ALL))
+            .block(panel(title, true))
             .row_highlight_style(
                 Style::default()
                     .bg(Color::DarkGray)
@@ -442,23 +507,64 @@ impl DashboardState {
         frame.render_stateful_widget(table, area, &mut table_state);
     }
 
-    fn render_details(frame: &mut Frame<'_>, area: ratatui::layout::Rect, lines: Vec<Line<'_>>) {
-        let details = Paragraph::new(lines)
-            .block(Block::default().title(" Details ").borders(Borders::ALL))
-            .wrap(Wrap { trim: true });
-        frame.render_widget(details, area);
-    }
-
     fn render_footer(&self, frame: &mut Frame<'_>, area: ratatui::layout::Rect) {
         let footer = Paragraph::new(Line::from(vec![
             Span::styled(
-                " j/k: move | s: sort | f: filter | r: probe | c: clear | q: quit ",
+                " j/k ",
                 Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Cyan)
+                    .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw("  "),
+            Span::raw("account  "),
+            Span::styled(
+                "PgUp/PgDn ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("page  "),
+            Span::styled(
+                "m ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("view  "),
+            Span::styled(
+                "g ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("scope  "),
+            Span::styled(
+                "s/f ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("sort/filter  "),
+            Span::styled(
+                "r ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("probe  "),
+            Span::styled(
+                "c ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("clear  "),
+            Span::styled(
+                "q ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("quit  ·  "),
             Span::styled(
                 self.status_message.as_str(),
                 Style::default().fg(Color::Gray),
@@ -510,27 +616,69 @@ impl Drop for TerminalGuard {
 pub fn run_dashboard<FProbe, FClear>(
     accounts: &[AccountConfig],
     runtime_state: &mut RuntimeState,
-    mut on_probe_all: FProbe,
+    state_file: &std::path::Path,
+    on_probe_all: FProbe,
     mut on_clear_cooldowns: FClear,
 ) -> Result<()>
 where
-    FProbe: FnMut(&mut RuntimeState) -> Result<String>,
+    FProbe: Fn(&mut RuntimeState) -> Result<String> + Send + Sync + 'static,
     FClear: FnMut(&mut RuntimeState, &AccountId) -> Result<String>,
 {
     let mut guard = TerminalGuard::enter()?;
-    let mut ui = DashboardState::default();
+    let mut ui = DashboardState {
+        mascot: Mascot::start(),
+        ..DashboardState::default()
+    };
+    let probe = std::sync::Arc::new(on_probe_all);
+    let mut pending: Option<std::sync::mpsc::Receiver<Result<String>>> = None;
 
     loop {
+        if let Some(receiver) = &pending {
+            match receiver.try_recv() {
+                Ok(result) => {
+                    match RuntimeState::load(state_file) {
+                        Ok(updated) => *runtime_state = updated,
+                        Err(err) => {
+                            ui.set_status(format!("State reload error: {err}"));
+                            pending = None;
+                            continue;
+                        }
+                    }
+                    match result {
+                        Ok(summary) => ui.set_status(summary),
+                        Err(err) => ui.set_status(format!("Probe error: {err:#}")),
+                    }
+                    pending = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    ui.set_status("Probe worker stopped unexpectedly");
+                    pending = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
         let now = Utc::now();
+        if pending.is_some() {
+            const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+            let tick =
+                usize::try_from(now.timestamp_millis().unsigned_abs() / EVENT_POLL_MS).unwrap_or(0);
+            ui.set_status(format!(
+                "{} Probing accounts",
+                SPINNER[tick % SPINNER.len()]
+            ));
+        }
         let visible = ui.visible_accounts(accounts, &runtime_state.statuses, now);
         ui.clamp_selection(visible.len());
 
-        guard
+        let drawn = guard
             .terminal
             .draw(|frame| ui.render(frame, accounts, &runtime_state.statuses, now))
             .context("failed to draw TUI frame")?;
 
-        if event::poll(Duration::from_millis(EVENT_POLL_MS)).context("failed to poll key events")?
+        let poll_interval = ui
+            .mascot
+            .poll_interval(drawn.area.as_size(), Duration::from_millis(EVENT_POLL_MS));
+        if event::poll(poll_interval).context("failed to poll key events")?
             && let Event::Key(key) = event::read().context("failed to read key event")?
             && key.kind == KeyEventKind::Press
         {
@@ -538,13 +686,17 @@ where
                 DashAction::None => {}
                 DashAction::Quit => break,
                 DashAction::ProbeAll => {
-                    ui.set_status("Probing all accounts...");
-                    let _ = guard.terminal.draw(|frame| {
-                        ui.render(frame, accounts, &runtime_state.statuses, Utc::now());
-                    });
-                    match on_probe_all(runtime_state) {
-                        Ok(summary) => ui.set_status(summary),
-                        Err(err) => ui.set_status(format!("Probe error: {err}")),
+                    if pending.is_some() {
+                        ui.set_status("Probe already in progress");
+                    } else {
+                        ui.set_status("Probing all accounts...");
+                        let mut snapshot = runtime_state.clone();
+                        let worker = std::sync::Arc::clone(&probe);
+                        let (sender, receiver) = std::sync::mpsc::channel();
+                        std::thread::spawn(move || {
+                            let _ = sender.send(worker(&mut snapshot));
+                        });
+                        pending = Some(receiver);
                     }
                 }
                 DashAction::ClearSelectedCooldowns => {
@@ -562,15 +714,30 @@ where
     Ok(())
 }
 
+fn panel(title: String, active: bool) -> Block<'static> {
+    Block::default()
+        .title(title)
+        .title_style(
+            Style::default()
+                .fg(if active { Color::Cyan } else { Color::White })
+                .add_modifier(Modifier::BOLD),
+        )
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(if active { Color::Cyan } else { Color::DarkGray }))
+}
+
 fn render_header(
     frame: &mut Frame<'_>,
     area: ratatui::layout::Rect,
     accounts: &[AccountConfig],
     statuses: &[AccountStatus],
     now: DateTime<Utc>,
+    mascot: &Mascot,
 ) {
     let default_bucket = ModelBucket::default_bucket();
     let total = accounts.len();
+    let mut unknown = 0u16;
     let mut ready = 0u16;
     let mut partial = 0u16;
     let mut unavailable = 0u16;
@@ -581,6 +748,7 @@ fn render_header(
         let status = statuses.iter().find(|st| st.account_id == account.id);
         match account_state(account, status, &default_bucket, now) {
             AccountState::Ready => ready += 1,
+            AccountState::Unknown => unknown += 1,
             AccountState::Partial => partial += 1,
             AccountState::Cooling(_) | AccountState::Exhausted => unavailable += 1,
             AccountState::AuthRequired | AccountState::ProbeError => failed += 1,
@@ -588,30 +756,58 @@ fn render_header(
         }
     }
 
-    let mut summary = format!(
-        "| {total} accounts  •  {ready} ready  •  {partial} partial  •  {unavailable} unavailable  •  {failed} failed"
-    );
+    let mut alerts = format!("{failed} failed");
     if disabled > 0 {
-        let _ = write!(summary, "  •  {disabled} disabled");
+        let _ = write!(alerts, "  •  {disabled} disabled");
     }
-    let _ = write!(summary, "  •  {}", now.format("%H:%M:%S UTC"));
-
-    let line = Line::from(vec![
-        Span::styled(
-            " tayassu ",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(summary),
-    ]);
-
-    let header = Paragraph::new(line).block(
-        Block::default()
-            .title(" AI CLI Session & Cooldown Dashboard ")
-            .borders(Borders::ALL),
-    );
-    frame.render_widget(header, area);
+    let title = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+    let block = panel(" Overview ".to_owned(), false);
+    let content = block.inner(area);
+    frame.render_widget(block, area);
+    if area.height >= mascot::HEADER_HEIGHT {
+        let [lane, summary] = Layout::horizontal([
+            Constraint::Length(Mascot::lane_width(content)),
+            Constraint::Min(0),
+        ])
+        .areas(content);
+        mascot.render(frame, lane);
+        let version = Span::styled(concat!("tayassu v", env!("CARGO_PKG_VERSION")), title);
+        let lines = if summary.width >= mascot::FULL_SUMMARY_WIDTH {
+            vec![
+                Line::from(vec![
+                    version,
+                    Span::raw(format!("  ·  {}", now.format("%H:%M:%S UTC"))),
+                ]),
+                Line::raw(format!(
+                    "{total} accounts  ·  {ready} ready  ·  {partial} partial"
+                )),
+                Line::raw(format!("{unknown} unknown  ·  {unavailable} unavailable")),
+                Line::raw(alerts),
+            ]
+        } else {
+            let mut accounts_line = format!("{total} total · {ready} ready");
+            if disabled > 0 {
+                let _ = write!(accounts_line, " · {disabled} off");
+            }
+            vec![
+                Line::from(version),
+                Line::raw(accounts_line),
+                Line::raw(format!("{partial} partial · {unknown} unknown")),
+                Line::raw(format!("{unavailable} unavailable · {failed} failed")),
+            ]
+        };
+        frame.render_widget(Paragraph::new(lines), summary);
+    } else {
+        let line = Line::from(vec![
+            Span::styled(" tayassu ", title),
+            Span::raw(format!(
+                "{total} accounts  ·  {ready} ready  ·  {partial} partial  ·  {unknown} unknown  ·  {unavailable} unavailable  ·  {alerts}"
+            )),
+        ]);
+        frame.render_widget(Paragraph::new(line), content);
+    }
 }
 
 fn account_state(
@@ -636,9 +832,19 @@ fn account_state(
     if status.is_some_and(|st| !st.is_available(bucket, now)) {
         return AccountState::Exhausted;
     }
-    let has_sub_cooldown = status.is_some_and(|st| st.cooldowns.iter().any(|cd| cd.is_active(now)));
+    let has_sub_cooldown = status.is_some_and(|st| {
+        st.cooldowns.iter().any(|cd| cd.is_active(now))
+            || st.windows.iter().any(|window| window.is_exhausted_at(now))
+    });
     if has_sub_cooldown {
         return AccountState::Partial;
+    }
+    if status.is_none_or(|st| {
+        st.windows.iter().all(|window| {
+            window.remaining.is_none() || window.resets_at.is_some_and(|reset| reset <= now)
+        })
+    }) {
+        return AccountState::Unknown;
     }
     AccountState::Ready
 }
@@ -662,8 +868,130 @@ fn account_state_cell(
         ),
         AccountState::Exhausted => ("EXHAUSTED".to_owned(), Color::Red),
         AccountState::Partial => ("PARTIAL".to_owned(), Color::Yellow),
+        AccountState::Unknown => ("UNKNOWN".to_owned(), Color::Gray),
         AccountState::Ready => ("READY".to_owned(), Color::Green),
     }
+}
+
+fn model_visible(status: &AccountStatus, model: &ModelBucket) -> bool {
+    model
+        .as_str()
+        .split_once('/')
+        .is_none_or(|(provider, name)| {
+            name.ends_with(":free")
+                || name == "free"
+                || status.windows.iter().any(|window| {
+                    window.window_name == "auth" && window.bucket.as_str() == provider
+                })
+        })
+}
+
+fn model_scopes(status: &AccountStatus) -> Vec<ModelBucket> {
+    status
+        .model_buckets
+        .iter()
+        .filter(|(model, _)| model_visible(status, model))
+        .map(|(_, scope)| scope.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn quota_view_lines(
+    status: Option<&AccountStatus>,
+    now: DateTime<Utc>,
+    show_models: bool,
+    scope_index: usize,
+) -> Vec<Line<'static>> {
+    let Some(status) = status else {
+        return vec![Line::from("  No quota data · press r")];
+    };
+    let mut entries = Vec::new();
+    if show_models {
+        let scopes = model_scopes(status);
+        let selected_scope = scopes.get(scope_index % scopes.len().max(1));
+        for (model, scope) in &status.model_buckets {
+            if Some(scope) == selected_scope && model_visible(status, model) {
+                entries.push(quota_line(
+                    model.as_str(),
+                    status.lowest_remaining_percent(model, now),
+                    status.active_cooldown(model, now).is_some(),
+                    None,
+                ));
+            }
+        }
+        if entries.is_empty() {
+            entries.push(Line::from("  No model catalog · press r"));
+        }
+    } else {
+        for window in status
+            .windows
+            .iter()
+            .filter(|window| window.remaining.is_some())
+        {
+            let expired = window.resets_at.is_some_and(|reset| reset <= now);
+            let reset = window.resets_at.map(|time| {
+                if expired {
+                    "expired".to_owned()
+                } else {
+                    format!("reset {}", time.format("%m-%d %H:%M UTC"))
+                }
+            });
+            entries.push(quota_line(
+                &format!("{}/{}", window.bucket, window.window_name),
+                if expired { None } else { window.remaining },
+                window.is_exhausted_at(now),
+                reset.as_deref(),
+            ));
+        }
+        if entries.is_empty() {
+            entries.push(Line::from("  No measured quota · press r"));
+        }
+    }
+    entries
+}
+
+fn quota_line(
+    name: &str,
+    remaining: Option<tayassu_core::RemainingPercent>,
+    blocked: bool,
+    reset: Option<&str>,
+) -> Line<'static> {
+    let (bar, mut color, label) = remaining.map_or_else(
+        || {
+            (
+                "░".repeat(QUOTA_BAR_WIDTH),
+                Color::Gray,
+                "unknown".to_owned(),
+            )
+        },
+        |value| {
+            let pct = value.value();
+            let filled = usize::from(pct) * QUOTA_BAR_WIDTH
+                / usize::from(tayassu_core::MAX_REMAINING_PERCENT);
+            let bar = format!(
+                "{}{}",
+                "█".repeat(filled),
+                "░".repeat(QUOTA_BAR_WIDTH - filled)
+            );
+            let color = if pct < QUOTA_CRITICAL_PERCENT {
+                Color::Red
+            } else if pct < QUOTA_LOW_PERCENT {
+                Color::Rgb(255, 165, 0)
+            } else {
+                Color::Green
+            };
+            (bar, color, value.to_string())
+        },
+    );
+    if blocked {
+        color = Color::Red;
+    }
+    let suffix = reset.map_or_else(String::new, |text| format!(" · {text}"));
+    Line::from(vec![
+        Span::styled(format!("  {bar} {label} "), Style::default().fg(color)),
+        Span::raw(format!("{name}{suffix}")),
+    ])
 }
 
 fn quota_column_width(
@@ -696,7 +1024,9 @@ fn quota_column_width(
         + COLUMN_SPACING * 5
         + TABLE_CHROME_WIDTH;
     let available = table_width.saturating_sub(fixed);
-    desired.min(available.max(COL_QUOTA_MIN_WIDTH))
+    desired
+        .max(available)
+        .min(available.max(COL_QUOTA_MIN_WIDTH))
 }
 
 fn summarize_buckets(status: Option<&AccountStatus>, now: DateTime<Utc>) -> Vec<String> {
@@ -743,90 +1073,6 @@ fn summarize_buckets(status: Option<&AccountStatus>, now: DateTime<Utc>) -> Vec<
             }
         })
         .collect()
-}
-
-fn build_detail_lines<'a>(
-    account: &'a AccountConfig,
-    status: Option<&'a AccountStatus>,
-    now: DateTime<Utc>,
-) -> Vec<Line<'a>> {
-    let mut lines = Vec::new();
-    let probed = status.and_then(|st| st.last_probed_at).map_or_else(
-        || "never".to_owned(),
-        |ts| ts.format("%Y-%m-%d %H:%M UTC").to_string(),
-    );
-
-    lines.push(Line::from(format!(
-        "Account: {} ({})  |  Executable: {}  |  Login: {}  |  Last probe: {}",
-        account.id,
-        account.provider,
-        account.executable(),
-        render_login(status),
-        probed
-    )));
-
-    if let Some(failure) = status.and_then(|st| st.last_probe_error.as_ref()) {
-        let color = if failure.is_authentication() {
-            Color::Yellow
-        } else {
-            Color::Red
-        };
-        lines.push(Line::from(vec![
-            Span::styled("Probe error: ", Style::default().fg(color)),
-            Span::raw(failure.message.clone()),
-        ]));
-    }
-
-    if let Some(st) = status {
-        if !st.windows.is_empty() {
-            let windows_summary: Vec<String> = st
-                .windows
-                .iter()
-                .map(|win| {
-                    let pct = win.remaining.map_or_else(
-                        || "unknown quota".to_owned(),
-                        |val| {
-                            if win.resets_at.is_some_and(|reset| reset <= now) {
-                                format!("{val} (expired)")
-                            } else {
-                                val.to_string()
-                            }
-                        },
-                    );
-                    format!("{}/{}={}", win.bucket, win.window_name, pct)
-                })
-                .collect();
-            lines.push(Line::from(format!(
-                "Windows{}: {}",
-                if st.last_probe_error.is_some() {
-                    " (last successful probe)"
-                } else {
-                    ""
-                },
-                windows_summary.join("  ")
-            )));
-        }
-
-        let active_cds: Vec<String> = st
-            .cooldowns
-            .iter()
-            .filter(|cd| cd.is_active(now))
-            .map(|cd| {
-                let rem = cd
-                    .remaining(now)
-                    .map_or_else(|| "0m".to_owned(), format_countdown);
-                format!("{} ({rem}, {})", cd.bucket, cd.reason)
-            })
-            .collect();
-        if !active_cds.is_empty() {
-            lines.push(Line::from(vec![
-                Span::styled("Cooldowns: ", Style::default().fg(Color::Red)),
-                Span::raw(active_cds.join("  ")),
-            ]));
-        }
-    }
-
-    lines
 }
 
 #[cfg(test)]
@@ -1035,6 +1281,67 @@ mod tests {
         assert!(rendered.contains("sort: priority"), "{rendered}");
         assert!(rendered.contains("filter: problems"), "{rendered}");
         assert!(!rendered.contains("zeta"), "{rendered}");
+    }
+
+    #[test]
+    fn quota_bars_show_threshold_colors() {
+        let now = Utc::now();
+        let mut status = AccountStatus::empty("test".parse().expect("id"));
+        for (name, percent) in [("critical", 9), ("low", 24), ("healthy", 25)] {
+            status.windows.push(QuotaWindow {
+                window_name: "weekly".to_owned(),
+                bucket: name.parse().expect("model"),
+                remaining: Some(RemainingPercent::try_from(percent).expect("percent")),
+                resets_at: None,
+            });
+        }
+        let lines = quota_view_lines(Some(&status), now, false, 0);
+        assert_eq!(lines[0].spans[0].style.fg, Some(Color::Red));
+        assert_eq!(lines[1].spans[0].style.fg, Some(Color::Rgb(255, 165, 0)));
+        assert_eq!(lines[2].spans[0].style.fg, Some(Color::Green));
+    }
+
+    #[test]
+    fn quota_windows_show_each_period_and_catalog_is_paged() {
+        let now = Utc::now();
+        let mut status = AccountStatus::empty("test".parse().expect("id"));
+        for (name, pct) in [("weekly", TEST_GEMINI_PCT), ("5h", TEST_CLAUDE_PCT)] {
+            status.windows.push(QuotaWindow {
+                window_name: name.to_owned(),
+                bucket: "gemini".parse().expect("bucket"),
+                remaining: Some(RemainingPercent::try_from(pct).expect("percent")),
+                resets_at: None,
+            });
+        }
+        for i in 0..(QUOTA_PAGE_SIZE * 3) {
+            status.model_buckets.insert(
+                format!("model-{i}").parse().expect("model"),
+                "gemini".parse().expect("scope"),
+            );
+        }
+        let lines = quota_view_lines(Some(&status), now, false, 0);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].to_string().contains("gemini/weekly"));
+        assert!(lines[1].to_string().contains("gemini/5h"));
+        let mut dashboard = DashboardState::default();
+        dashboard.handle_key(KeyCode::Char('m'), KeyModifiers::NONE, 1);
+        assert!(dashboard.show_models);
+        dashboard.handle_key(KeyCode::PageDown, KeyModifiers::NONE, 1);
+        assert_eq!(usize::from(dashboard.detail_scroll), QUOTA_PAGE_SIZE);
+        let account = AccountConfig::new("test".parse().expect("id"), ProviderKind::Agy, "");
+        let mut terminal =
+            Terminal::new(TestBackend::new(TEST_TERM_WIDTH, TEST_TERM_HEIGHT)).expect("terminal");
+        terminal
+            .draw(|frame| dashboard.render(frame, &[account], &[status], now))
+            .expect("draw");
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(rendered.contains("Models: gemini 6–10/15"), "{rendered}");
     }
 
     #[test]

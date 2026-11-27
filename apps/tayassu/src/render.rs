@@ -34,6 +34,47 @@ impl<'a> StatusTable<'a> {
         }
     }
 
+    /// Prints the provider model catalog with each model's applicable quota.
+    pub fn write_models(&self, writer: &mut impl Write, now: DateTime<Utc>) -> io::Result<()> {
+        let mut found = false;
+        for account in self.accounts.iter().filter(|account| {
+            self.provider_filter
+                .is_none_or(|provider| provider == account.provider)
+        }) {
+            let Some(status) = self
+                .statuses
+                .iter()
+                .find(|status| status.account_id == account.id)
+            else {
+                continue;
+            };
+            for (model, scope) in &status.model_buckets {
+                if !found {
+                    writeln!(writer, "ACCOUNT MODEL QUOTA SCOPE")?;
+                    found = true;
+                }
+                let remaining = status
+                    .lowest_remaining_percent(model, now)
+                    .map_or_else(|| "unknown".to_owned(), |value| value.to_string());
+                let tag = if status.last_probe_error.is_some() {
+                    " (stale)"
+                } else if !status.is_available(model, now) {
+                    " (blocked)"
+                } else {
+                    ""
+                };
+                writeln!(writer, "{} {model} {remaining}{tag} {scope}", account.id)?;
+            }
+        }
+        if !found {
+            writeln!(
+                writer,
+                "No model catalog is available. Run tayassu probe first."
+            )?;
+        }
+        Ok(())
+    }
+
     /// Writes the formatted table to `writer` evaluated at `now`.
     ///
     /// # Errors
@@ -96,6 +137,22 @@ impl<'a> StatusTable<'a> {
                 last_probe,
                 account.label
             )?;
+            if let Some(budget) = status.and_then(|st| st.key_budget.as_ref()) {
+                let freshness = if status.is_some_and(|st| st.last_probe_error.is_some()) {
+                    " (stale)"
+                } else {
+                    ""
+                };
+                let interval = budget
+                    .reset_interval
+                    .as_deref()
+                    .map_or_else(String::new, |value| format!(" ({value})"));
+                writeln!(
+                    writer,
+                    "  {}: OpenRouter budget ${} remaining{interval}{freshness}",
+                    account.id, budget.remaining_usd
+                )?;
+            }
             if let Some(failure) = status.and_then(|st| st.last_probe_error.as_ref()) {
                 let id = &account.id;
                 let reason = failure

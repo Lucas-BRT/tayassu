@@ -4,6 +4,7 @@ pub mod adapter;
 pub mod error;
 pub mod isolation;
 pub mod migration;
+mod quota_snapshot;
 
 pub use adapter::{
     AGY_PROBE_TIMEOUT_SECS, AdapterRegistry, AgyAdapter, CLAUDE_CONFIG_DIR_ENV, CODEX_HOME_ENV,
@@ -18,6 +19,7 @@ pub use isolation::{
 pub use migration::{
     DiscoveredAgent, HostDiscovery, MigrationFile, MigrationMode, MigrationSummary,
 };
+pub use quota_snapshot::parse_quota_snapshot;
 
 #[cfg(test)]
 mod tests {

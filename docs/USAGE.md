@@ -61,6 +61,90 @@ tayassu run agy -- --help
 auth files by default; pass `--move-auth` only when you want the host files
 removed after a verified copy.
 
+## Connect two accounts from the same provider
+
+Each account ID gets its own profile, including credentials and local sessions.
+For example, to keep a personal and a work Codex account signed in:
+
+```bash
+tayassu account add codex-personal codex --label "Personal" --priority 10
+tayassu account login codex-personal
+
+tayassu account add codex-work codex --label "Work" --priority 20
+tayassu account login codex-work
+
+tayassu probe --id codex-personal
+tayassu probe --id codex-work
+tayassu status --provider codex
+```
+
+Sign in with the corresponding provider account in each login flow. If the
+browser reuses an existing sign-in, choose the intended account before
+authorizing the CLI. If you already ran `tayassu import --provider codex`,
+you can use the imported `codex-host` profile as one of the two accounts and
+register only the second one.
+
+```bash
+tayassu run codex             # choose an eligible Codex account
+tayassu run --account codex-work  # use the work profile explicitly
+```
+
+The default `priority` policy prefers lower numbers among eligible accounts.
+With the example priorities, new Codex runs normally use `codex-personal`
+first and can use `codex-work` when the personal account is cooling down.
+Use `tayassu run codex --failover` to retry once on another eligible account
+if a new run fails with a recognized rate limit.
+
+## Let Tayassu choose a provider
+
+First register and authenticate accounts for the providers you want to use.
+With Codex and Claude accounts configured, add this entry to the
+`[fallback_chains]` table in `~/.config/tayassu/config.toml` (or
+`$XDG_CONFIG_HOME/tayassu/config.toml`). If the table already exists, add
+only the `auto` line under it.
+
+```toml
+[fallback_chains]
+auto = ["codex:default", "claude:default"]
+```
+
+```bash
+tayassu probe
+tayassu run --chain auto --dry-run
+tayassu run --chain auto --failover
+```
+
+Tayassu checks the chain in order. It chooses an eligible Codex account first
+and checks Claude when no Codex account qualifies. The account selection
+policy ranks accounts within each target. Eligibility uses the recorded
+login and quota information and active cooldowns. Some provider probes only
+check login, so a provider with unknown quota can still be selected.
+`--failover` can retry once on another eligible account after a recognized
+rate limit, including an account later in the chain.
+
+To refresh quota before launch and select only accounts with measured quota
+remaining for the target, use:
+
+```bash
+tayassu run --chain auto --require-quota --failover
+```
+
+With `--dry-run`, this flag uses the last saved probe results. Run
+`tayassu probe` first if you want an up-to-date preview.
+
+To type just `tayassu run` inside a project, add this top-level setting to
+`.tayassu.toml` in the project directory:
+
+```toml
+fallback_chain = "auto"
+```
+
+Now `tayassu run` uses the chain in that directory and its subdirectories.
+For a one-off run elsewhere, use `tayassu run --chain auto`. An explicit
+provider such as `tayassu run codex` selects within that provider. Arguments
+after `--` go directly to the selected CLI, so use arguments supported by
+every provider in the chain or open the selected CLI interactively.
+
 ## Commands
 
 ### `tayassu import` (alias `discover`)
@@ -106,7 +190,7 @@ Selects an available account and invokes its CLI inside the isolated profile.
 ```bash
 tayassu run claude -- "explain this repository"
 tayassu run --account codex-work -- --version
-tayassu run --chain claude --model claude --failover -- "fix the tests"
+tayassu run --chain auto --failover -- --help
 tayassu run agy --dry-run -- --help
 ```
 
@@ -116,9 +200,10 @@ Options:
 | --------------- | ------------------------------------------------------------------- |
 | `--account ID`  | Force a specific account instead of routing automatically.          |
 | `--chain NAME`  | Use a named cross-provider fallback chain from `config.toml`.       |
-| `--model NAME`  | Model bucket to evaluate cooldowns against (default `default`).     |
+| `--model NAME`  | Model bucket for a provider or explicit account (default `default`). Chains use the bucket on each target. |
 | `--policy NAME` | Override the selection policy (`priority`, `most-quota`, `soonest-reset`). |
 | `--dry-run`     | Explain the selection and print the environment without modifying profiles or state.        |
+| `--require-quota` | Refresh usage and require measured quota before launch. Dry runs use the last saved probe. |
 | `--failover`    | Retry once on a different account after a rate limit. Requires automatic routing.        |
 
 Arguments after `--` are passed verbatim to the underlying CLI. Resuming a
@@ -153,6 +238,68 @@ tayassu probe --notify
 
 Runs each provider's non-interactive usage check and records cooldowns. With
 `--notify`, `notify-send` is used when a previously active cooldown clears.
+
+Quota is displayed as percentage remaining. AGY reports remaining quota for
+model groups. Codex reports used percentages for account windows and any
+additional limit IDs returned by its App Server. Copilot reports remaining
+premium-interaction entitlement for the account, or chat entitlement when the
+plan has no premium-interaction allowance. A shared account-level
+window is shown under `default` and applies across model buckets. A bucket
+identifies a limit for routing. Use the provider's own model option after
+`--` to choose an actual model when needed.
+
+#### Claude Code
+
+The probe checks authentication first, then opens Claude Code's built-in
+`/usage` panel in a temporary terminal. It captures current session and
+weekly plan limits, including family-specific windows when Claude reports
+them. It converts usage consumed into quota remaining. If the panel is
+unavailable or says the data is cached, quota remains unknown.
+
+```bash
+tayassu probe --id claude-host
+tayassu status --provider claude --model sonnet
+tayassu run claude --model sonnet --require-quota
+```
+
+Strict routing passes `opus`, `sonnet`, or `haiku` to Claude as the launch
+model when selected. With a family-specific limit in the snapshot, specify
+the family so the router can check both the family and shared windows. To let
+a chain try families in order, use targets such as `claude:sonnet` and
+`claude:opus`.
+
+#### OpenCode
+
+Run the probe from the project where you use OpenCode. The model catalog is
+project-specific. Tayassu evaluates each discovered model using the limits
+of its integration.
+
+```bash
+tayassu probe --id opencode-host
+tayassu status --provider opencode --list-models
+tayassu status --provider opencode --model github-copilot/gpt-example
+tayassu run opencode --require-quota --dry-run
+tayassu run opencode --require-quota
+```
+
+Replace `github-copilot/gpt-example` with a model ID from `--list-models`.
+With `--require-quota`, Tayassu forwards the selected model to OpenCode. A
+chain can use `opencode:default` to choose from measured models or a target
+such as `opencode:github-copilot/gpt-example` to pin the model.
+
+- **OpenRouter** uses the active stored API key to read the key budget and
+  shared daily free-model requests. The USD budget is shown separately.
+  Paid models remain of unknown request quota. The daily meter does not
+  predict per-minute throttling or provider capacity.
+- **OpenCode Go** uses the active stored API key to read shared rolling,
+  weekly, and monthly usage windows.
+- **GitHub Copilot** requires an explicit link. In the OpenCode account's
+  existing `[[accounts]]` entry in `config.toml`, set
+  `opencode_copilot_account = "copilot-host"` only if that Tayassu Copilot
+  profile is signed into the same GitHub account as the sole Copilot
+  connection in OpenCode. Rerun the probe after changing either profile.
+- **Other integrations** appear in the model list with unknown quota unless
+  a supported meter applies.
 
 ### `tayassu cooldown`
 
@@ -292,3 +439,21 @@ lock for configuration changes.
   `tayassu run <provider> --dry-run`.
 - **Rate limited during a run**: add `--failover`, or use a chain that includes
   another provider.
+
+### Automatic routing and probing
+
+`tayassu auto run` uses the project fallback chain, or the global `auto`
+chain when no project chain is configured. Without either, it tries enabled
+providers in account priority order. It refreshes quota and selects only
+a target with confirmed quota. Use `--chain NAME` to override the chain or
+`--dry-run` to inspect the last recorded measurements.
+
+`tayassu auto probe` refreshes accounts immediately, then installs (if absent)
+and enables the systemd user timer. Existing unit files are preserved. The
+user systemd manager must be available. In the dashboard, `r` starts a probe
+in the background so navigation remains responsive.
+
+In `tayassu dash`, select an account with `j`/`k` to see its individual
+quota windows. Press `m` to switch between windows and models, `g` to cycle
+model quota scopes, and `Page Up`/`Page Down` to move between pages. Model
+percentages reflect shared limits when the provider reports a shared scope.
