@@ -1660,3 +1660,54 @@ fn run_strips_ambient_host_auth_env_vars() {
     let cld = run_with_host_tokens("claude", "cld");
     assert!(cld.contains("|ANTHROPIC=|"), "{cld}");
 }
+
+#[test]
+fn run_and_where_support_positional_account_and_validate_provider() {
+    let env = TestEnv::new();
+    let echo = env.write_mock_script("echo-args.sh", "#!/bin/sh\nprintf 'args:%s\\n' \"$*\"\n");
+
+    env.run_ok(&[
+        "add",
+        "agy",
+        "agy-marilia",
+        "--no-login",
+        "--shared-keyring",
+        "--binary",
+        &echo,
+    ]);
+    env.run_ok(&["add", "claude", "claude-work", "--no-login"]);
+
+    let by_provider_and_account = env.run_ok(&["run", "agy", "agy-marilia", "--dry-run"]);
+    assert!(by_provider_and_account.contains("account: agy-marilia"));
+    assert!(by_provider_and_account.contains("selection: explicit account"));
+
+    let by_account_only = env.run_ok(&["run", "agy-marilia", "--dry-run"]);
+    assert!(by_account_only.contains("account: agy-marilia"));
+
+    let where_out = env.run_ok(&["where", "agy", "agy-marilia"]);
+    assert!(where_out.contains("account: agy-marilia"));
+    assert!(
+        env.run_ok(&["where", "agy-marilia"])
+            .contains("account: agy-marilia")
+    );
+
+    let forwarded = env.run_ok(&["run", "agy", "agy-marilia", "--", "--flag", "val"]);
+    assert_eq!(forwarded, "args:--flag val\n");
+
+    let mismatch_pos = env.run_cli(&["run", "agy", "claude-work", "--dry-run"]);
+    assert!(!mismatch_pos.status.success());
+    assert!(
+        String::from_utf8_lossy(&mismatch_pos.stderr)
+            .contains("account 'claude-work' belongs to claude, not agy")
+    );
+
+    let mismatch_flag = env.run_cli(&["run", "agy", "--account", "claude-work", "--dry-run"]);
+    assert!(!mismatch_flag.status.success());
+    assert!(
+        String::from_utf8_lossy(&mismatch_flag.stderr)
+            .contains("account 'claude-work' belongs to claude, not agy")
+    );
+
+    let bad_flag_combo = env.run_cli(&["run", "agy-marilia", "--no-failover"]);
+    assert!(!bad_flag_combo.status.success());
+}

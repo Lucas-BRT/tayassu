@@ -371,6 +371,14 @@ impl App {
                 .find_account(forced_id)
                 .with_context(|| format!("account '{forced_id}' not found"))?
                 .clone();
+            if let Some(expected) = req.provider
+                && account.provider != expected
+            {
+                anyhow::bail!(
+                    "account '{forced_id}' belongs to {}, not {expected}",
+                    account.provider
+                );
+            }
             return Ok((
                 account,
                 req.model.clone().unwrap_or_default(),
@@ -471,6 +479,14 @@ impl App {
                 .config
                 .find_account(id)
                 .with_context(|| format!("account '{id}' not found"))?;
+            if let Some(expected) = req.provider
+                && account.provider != expected
+            {
+                anyhow::bail!(
+                    "account '{id}' belongs to {}, not {expected}",
+                    account.provider
+                );
+            }
             return Ok(vec![FallbackTarget::new(account.provider, bucket)]);
         }
         if let Some(name) = Self::chain_name(req, project_cfg) {

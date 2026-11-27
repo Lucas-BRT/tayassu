@@ -114,9 +114,11 @@ Linux, new `agy` accounts enable a private keyring by default (pass
 
 ```bash
 tayassu run claude -- "explain this repository"
+tayassu run agy agy-marilia                      # provider + account shorthand
+tayassu run agy-marilia                          # direct account shorthand
 tayassu run --account codex-work -- --version
 tayassu run --chain claude --model claude -- "fix the tests"
-tayassu where claude
+tayassu where agy agy-marilia
 ```
 
 | Option          | Effect                                                              |
