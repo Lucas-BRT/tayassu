@@ -52,6 +52,7 @@ pub struct Release {
 }
 
 /// Abstraction over release registries so update logic is testable offline.
+#[cfg_attr(test, mockall::automock)]
 pub trait ReleaseSource {
     /// Lists releases sorted or unsorted; callers pick by semver.
     ///
