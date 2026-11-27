@@ -1,5 +1,8 @@
+mod claude_usage;
 mod cli;
 mod doctor;
+mod opencode_usage;
+mod quota_rpc;
 mod render;
 mod routing;
 mod shell;
@@ -126,16 +129,27 @@ impl App {
 
     fn execute(&mut self, command: Command, out: &mut impl Write) -> Result<()> {
         match command {
-            Command::Status { provider, model } => {
+            Command::Status {
+                provider,
+                model,
+                list_models,
+            } => {
                 let table = StatusTable::new(
                     &self.config.accounts,
                     &self.state.statuses,
                     provider,
                     model.as_ref(),
                 );
-                table
-                    .write_to(out, Utc::now())
-                    .context("failed to write status table")
+                let now = Utc::now();
+                if list_models {
+                    table
+                        .write_models(out, now)
+                        .context("failed to write model quota")
+                } else {
+                    table
+                        .write_to(out, now)
+                        .context("failed to write status table")
+                }
             }
             Command::Dash => self.handle_dash(),
             Command::Run {
@@ -145,6 +159,7 @@ impl App {
                 model,
                 policy,
                 dry_run,
+                require_quota,
                 failover,
                 args,
             } => self.run_agent(
@@ -155,6 +170,7 @@ impl App {
                     model,
                     policy,
                     dry_run,
+                    require_quota,
                     failover,
                     args,
                 },
@@ -209,7 +225,8 @@ impl App {
             &accounts,
             &mut self.state,
             |state| {
-                let (ok_count, err_count) = probe_accounts(&accounts, &paths, state, false, None)?;
+                let (ok_count, err_count) =
+                    probe_accounts(&accounts, &accounts, &paths, state, false, None)?;
                 Ok(format!("Probe complete: {ok_count} ok, {err_count} failed"))
             },
             |state, account_id| {
@@ -437,7 +454,14 @@ impl App {
             return Ok(());
         }
 
-        probe_accounts(&targets, &self.paths, &mut self.state, notify, Some(out))?;
+        probe_accounts(
+            &targets,
+            &self.config.accounts,
+            &self.paths,
+            &mut self.state,
+            notify,
+            Some(out),
+        )?;
         Ok(())
     }
 
@@ -684,14 +708,13 @@ impl App {
 
 fn probe_accounts(
     targets: &[AccountConfig],
+    configured_accounts: &[AccountConfig],
     paths: &XdgPaths,
     state: &mut RuntimeState,
     notify: bool,
     mut out: Option<&mut dyn Write>,
 ) -> Result<(usize, usize)> {
     let now = Utc::now();
-    let profiles_dir = &paths.profiles_dir;
-    let home_dir = &paths.home_dir;
 
     let previously_cooling: BTreeSet<(AccountId, ModelBucket)> = state
         .statuses
@@ -708,7 +731,7 @@ fn probe_accounts(
             .iter()
             .map(|account| {
                 let worker =
-                    scope.spawn(move || run_single_probe(account, profiles_dir, home_dir, now));
+                    scope.spawn(move || run_single_probe(account, configured_accounts, paths, now));
                 (account.id.clone(), worker)
             })
             .collect();
@@ -742,6 +765,8 @@ fn probe_accounts(
                     let window_count = parsed.windows.len();
                     let cooldown_count = parsed.cooldowns.len();
                     status.refresh_probe_windows(parsed.windows, parsed.cooldowns, now);
+                    status.model_buckets = parsed.model_buckets;
+                    status.key_budget = parsed.key_budget;
                     status.clear_probe_failure();
                     for (prev_id, prev_bucket) in &previously_cooling {
                         if prev_id == &account_id && status.active_cooldown(prev_bucket, now).is_none()
@@ -946,15 +971,59 @@ fn spawn_capturing_stderr(
 
 fn run_single_probe(
     account: &AccountConfig,
-    profiles_dir: &Path,
-    real_home: &Path,
+    configured_accounts: &[AccountConfig],
+    paths: &XdgPaths,
     now: chrono::DateTime<Utc>,
 ) -> Result<ProbeOutput> {
     let adapter = AdapterRegistry.adapter_for(account.provider);
-    let env_profile = adapter.build_environment(account, profiles_dir);
+    let env_profile = adapter.build_environment(account, &paths.profiles_dir);
     env_profile
-        .prepare(real_home)
+        .prepare(&paths.home_dir)
         .with_context(|| format!("failed to prepare profile for {}", account.id))?;
+
+    let executable = account_executable(account, &paths.home_dir);
+    if account.provider == ProviderKind::Opencode {
+        match opencode_usage::probe(
+            account,
+            &executable,
+            &env_profile,
+            configured_accounts,
+            paths,
+        ) {
+            Ok(probe) if !probe.windows.is_empty() || !probe.model_buckets.is_empty() => {
+                return Ok(probe);
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::debug!(account = %account.id, %error, "structured OpenCode probe unavailable");
+            }
+        }
+    }
+    if matches!(
+        account.provider,
+        ProviderKind::Codex | ProviderKind::Copilot
+    ) {
+        let mut command = ProcessCommand::new(&executable);
+        command.envs(env_profile.env_vars.iter().map(|(key, value)| (key, value)));
+        match quota_rpc::read_quota(command, account.provider) {
+            Ok(snapshot) => {
+                let mut probe =
+                    tayassu_providers::parse_quota_snapshot(account.provider, &snapshot)?;
+                if probe.windows.is_empty() {
+                    probe.windows.push(tayassu_core::QuotaWindow {
+                        window_name: "auth".to_owned(),
+                        bucket: ModelBucket::default_bucket(),
+                        remaining: None,
+                        resets_at: None,
+                    });
+                }
+                return Ok(probe);
+            }
+            Err(error) => {
+                tracing::debug!(account = %account.id, %error, "quota RPC unavailable; checking authentication");
+            }
+        }
+    }
 
     if let Some(local_result) = adapter.probe_local(account, &env_profile, now) {
         return local_result.map_err(Into::into);
@@ -966,7 +1035,6 @@ fn run_single_probe(
             .map_err(Into::into);
     };
 
-    let executable = account_executable(account, real_home);
     let mut cmd = ProcessCommand::new(&executable);
     cmd.args(&spec.args)
         .stdin(Stdio::null())
@@ -1000,7 +1068,16 @@ fn run_single_probe(
             output.status
         );
     }
-    parsed.map_err(Into::into)
+    let mut parsed = parsed?;
+    if account.provider == ProviderKind::Claude {
+        match claude_usage::probe(&executable, &env_profile.env_vars, now) {
+            Ok(windows) => parsed.windows.extend(windows),
+            Err(error) => {
+                tracing::debug!(account = %account.id, %error, "Claude plan usage unavailable");
+            }
+        }
+    }
+    Ok(parsed)
 }
 
 fn main() -> Result<()> {

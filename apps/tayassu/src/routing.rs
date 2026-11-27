@@ -1,6 +1,6 @@
 use crate::{
-    App, SIGNAL_FALLBACK_EXIT_CODE, SessionGuard, account_executable, process_is_alive,
-    spawn_capturing_stderr,
+    App, SIGNAL_FALLBACK_EXIT_CODE, SessionGuard, account_executable, probe_accounts,
+    process_is_alive, spawn_capturing_stderr,
 };
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -29,8 +29,36 @@ pub(super) struct RunRequest {
     pub(super) model: Option<ModelBucket>,
     pub(super) policy: Option<SelectionPolicy>,
     pub(super) dry_run: bool,
+    pub(super) require_quota: bool,
     pub(super) failover: bool,
     pub(super) args: Vec<String>,
+}
+
+impl RunRequest {
+    fn arguments_for(&self, provider: ProviderKind, bucket: &ModelBucket) -> Result<Vec<String>> {
+        let use_model = self.require_quota
+            && match provider {
+                ProviderKind::Opencode => true,
+                ProviderKind::Claude => matches!(bucket.as_str(), "opus" | "sonnet" | "haiku"),
+                _ => false,
+            };
+        if !use_model {
+            return Ok(self.args.clone());
+        }
+        anyhow::ensure!(
+            !self.args.iter().any(|arg| arg == "-m"
+                || arg == "--model"
+                || arg.starts_with("--model=")
+                || arg.starts_with("-m=")),
+            "an explicit agent model conflicts with the model selected by --require-quota"
+        );
+        let mut args = self.args.clone();
+        let index = usize::from(
+            provider == ProviderKind::Opencode && args.first().is_some_and(|arg| arg == "run"),
+        );
+        args.splice(index..index, ["--model".to_owned(), bucket.to_string()]);
+        Ok(args)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,7 +93,7 @@ impl App {
             .policy
             .or_else(|| project_cfg.as_ref().and_then(|cfg| cfg.default_policy))
             .unwrap_or(self.config.default_policy);
-        let router = AccountRouter::new(effective_policy);
+        let router = AccountRouter::new(effective_policy).require_quota(req.require_quota);
         let max_attempts = if req.failover {
             MAX_FAILOVER_ATTEMPTS
         } else {
@@ -74,6 +102,9 @@ impl App {
 
         if req.dry_run {
             return self.preview_run(req, project_cfg.as_ref(), &cwd, out, effective_policy);
+        }
+        if req.require_quota {
+            self.refresh_routing_quota(req, project_cfg.as_ref())?;
         }
         self.prune_stale_sessions()?;
 
@@ -121,8 +152,9 @@ impl App {
 
             let executable = account_executable(&account, &self.paths.home_dir);
             info!(account = %account.id, executable = %executable.display(), "launching agent CLI");
+            let arguments = req.arguments_for(account.provider, &bucket)?;
             let outcome =
-                spawn_capturing_stderr(&account, &executable, &env_profile.env_vars, &req.args)?;
+                spawn_capturing_stderr(&account, &executable, &env_profile.env_vars, &arguments)?;
 
             let exit_code = outcome.status.code().unwrap_or(SIGNAL_FALLBACK_EXIT_CODE);
             // A clean exit never signals a limit; stderr noise must not cool the account down.
@@ -158,6 +190,37 @@ impl App {
     }
 
     /// Drops sessions left behind by `tayassu` processes that were killed before cleanup.
+    fn refresh_routing_quota(
+        &mut self,
+        req: &RunRequest,
+        project_cfg: Option<&ProjectConfig>,
+    ) -> Result<()> {
+        let targets = self.run_targets(req, project_cfg)?;
+        let accounts: Vec<_> = self
+            .config
+            .accounts
+            .iter()
+            .filter(|account| {
+                account.enabled
+                    && targets
+                        .iter()
+                        .any(|target| target.provider == account.provider)
+            })
+            .cloned()
+            .collect();
+        if !accounts.is_empty() {
+            probe_accounts(
+                &accounts,
+                &self.config.accounts,
+                &self.paths,
+                &mut self.state,
+                false,
+                None,
+            )?;
+        }
+        Ok(())
+    }
+
     fn record_rate_limit(&mut self, account: &AccountId, cooldown: CooldownEntry) -> Result<()> {
         let resets_at = cooldown.resets_at;
         let bucket = cooldown.bucket.clone();
@@ -207,7 +270,7 @@ impl App {
             req,
             project_cfg,
             cwd,
-            AccountRouter::new(policy),
+            AccountRouter::new(policy).require_quota(req.require_quota),
             &self.config.accounts,
         )?;
         self.write_routing_explanation(req, out, &account, (policy, reason), project_cfg)?;
@@ -219,8 +282,9 @@ impl App {
         for (key, value) in &profile.env_vars {
             writeln!(out, "env: {key}={value}")?;
         }
-        if !req.args.is_empty() {
-            writeln!(out, "args: {:?}", req.args)?;
+        let arguments = req.arguments_for(account.provider, &bucket)?;
+        if !arguments.is_empty() {
+            writeln!(out, "args: {arguments:?}")?;
         }
         Ok(())
     }
@@ -234,6 +298,9 @@ impl App {
         project_cfg: Option<&ProjectConfig>,
     ) -> Result<()> {
         writeln!(out, "account: {}", account.id)?;
+        if req.require_quota {
+            writeln!(out, "quota: last recorded measurement (dry-run)")?;
+        }
         writeln!(out, "policy: {effective_policy}")?;
         writeln!(out, "selection: {reason}")?;
         if reason == SelectionReason::Chain
@@ -267,7 +334,7 @@ impl App {
             }
             for target in matching {
                 let explanation = self
-                    .routing_status(alternative, &target.bucket, Utc::now())
+                    .routing_status(alternative, &target.bucket, Utc::now(), req.require_quota)
                     .unwrap_or_else(|| {
                         "eligible; selection precedence or policy favored the chosen account"
                             .to_owned()
@@ -308,7 +375,7 @@ impl App {
                 .with_context(|| {
                     format!(
                         "no available account in fallback chain '{name}'; {}",
-                        self.unavailable_summary(accounts, &targets, now)
+                        self.unavailable_summary(accounts, &targets, now, req.require_quota)
                     )
                 })?;
             return Ok((account.clone(), bucket, SelectionReason::Chain));
@@ -330,6 +397,16 @@ impl App {
                     "resuming conversation on account currently in cooldown"
                 );
             }
+            if req.require_quota
+                && (router
+                    .resolve_bucket(provider, self.state.status_for(last_id), &bucket, now)
+                    .as_ref()
+                    != Some(&bucket))
+            {
+                anyhow::bail!(
+                    "account '{last_id}' owns this session but has no confirmed available quota"
+                );
+            }
             if !req.dry_run {
                 let _ = writeln!(io::stderr(), "tayassu: resuming on account '{last_id}'");
             }
@@ -340,18 +417,19 @@ impl App {
             && let Some(account) = accounts.iter().find(|account| &account.id == preferred_id)
             && account.enabled
             && account.provider == provider
-            && self
-                .state
-                .status_for(preferred_id)
-                .is_none_or(|st| st.can_route(&bucket, now))
+            && let Some(bucket) =
+                router.resolve_bucket(provider, self.state.status_for(preferred_id), &bucket, now)
         {
             return Ok((account.clone(), bucket, SelectionReason::ProjectPreference));
         }
 
         let account = router
             .select(accounts, &self.state.statuses, provider, &bucket, now)
-            .with_context(|| self.unavailable_summary(accounts, &targets, now))?
+            .with_context(|| self.unavailable_summary(accounts, &targets, now, req.require_quota))?
             .clone();
+        let bucket = router
+            .resolve_bucket(provider, self.state.status_for(&account.id), &bucket, now)
+            .context("selected model has no confirmed available quota")?;
         Ok((account, bucket, SelectionReason::Policy))
     }
 
@@ -399,11 +477,17 @@ impl App {
         account: &AccountConfig,
         bucket: &ModelBucket,
         now: DateTime<Utc>,
+        require_quota: bool,
     ) -> Option<String> {
         if !account.enabled {
             return Some("disabled".to_owned());
         }
-        let status = self.state.status_for(&account.id)?;
+        let status = self.state.status_for(&account.id);
+        let router = AccountRouter::new(SelectionPolicy::default()).require_quota(require_quota);
+        let unknown = || "available quota could not be confirmed".to_owned();
+        let Some(status) = status else {
+            return require_quota.then(unknown);
+        };
         if status.needs_login() {
             return Some(format!(
                 "login required (tayassu account login {})",
@@ -411,7 +495,10 @@ impl App {
             ));
         }
         if status.is_available(bucket, now) {
-            return None;
+            return router
+                .resolve_bucket(account.provider, Some(status), bucket, now)
+                .is_none()
+                .then(unknown);
         }
         Some(status.next_available_at(bucket, now).map_or_else(
             || "quota exhausted; reset time unknown".to_owned(),
@@ -424,6 +511,7 @@ impl App {
         accounts: &[AccountConfig],
         targets: &[FallbackTarget],
         now: DateTime<Utc>,
+        require_quota: bool,
     ) -> String {
         let mut reasons = Vec::new();
         let mut next_release = None;
@@ -432,7 +520,9 @@ impl App {
                 .iter()
                 .filter(|account| account.provider == target.provider)
             {
-                if let Some(reason) = self.routing_status(account, &target.bucket, now) {
+                if let Some(reason) =
+                    self.routing_status(account, &target.bucket, now, require_quota)
+                {
                     reasons.push(format!("{} ({target}): {reason}", account.id));
                 }
                 if account.enabled

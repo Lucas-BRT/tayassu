@@ -67,6 +67,8 @@ enum AccountState {
     Exhausted,
     /// Account is available on the default bucket but has a sub-bucket cooldown.
     Partial,
+    /// No current quota measurement is available.
+    Unknown,
     /// Account is fully available.
     Ready,
 }
@@ -81,7 +83,8 @@ impl AccountState {
             Self::Exhausted => 3,
             Self::Partial => 4,
             Self::Disabled => 5,
-            Self::Ready => 6,
+            Self::Unknown => 6,
+            Self::Ready => 7,
         }
     }
 }
@@ -155,7 +158,7 @@ impl FilterMode {
     const fn matches(self, state: AccountState) -> bool {
         match self {
             Self::All => true,
-            Self::Problems => !matches!(state, AccountState::Ready),
+            Self::Problems => !matches!(state, AccountState::Ready | AccountState::Unknown),
             Self::Ready => matches!(state, AccountState::Ready),
         }
     }
@@ -351,7 +354,13 @@ impl DashboardState {
         let detail_height = u16::try_from(detail_lines.len())
             .unwrap_or(u16::MAX)
             .saturating_add(2)
-            .clamp(DETAIL_MIN_HEIGHT, DETAIL_MAX_HEIGHT);
+            .clamp(DETAIL_MIN_HEIGHT, DETAIL_MAX_HEIGHT)
+            .min(
+                frame
+                    .area()
+                    .height
+                    .saturating_sub(HEADER_HEIGHT + FOOTER_HEIGHT + 3),
+            );
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -571,6 +580,7 @@ fn render_header(
 ) {
     let default_bucket = ModelBucket::default_bucket();
     let total = accounts.len();
+    let mut unknown = 0u16;
     let mut ready = 0u16;
     let mut partial = 0u16;
     let mut unavailable = 0u16;
@@ -581,6 +591,7 @@ fn render_header(
         let status = statuses.iter().find(|st| st.account_id == account.id);
         match account_state(account, status, &default_bucket, now) {
             AccountState::Ready => ready += 1,
+            AccountState::Unknown => unknown += 1,
             AccountState::Partial => partial += 1,
             AccountState::Cooling(_) | AccountState::Exhausted => unavailable += 1,
             AccountState::AuthRequired | AccountState::ProbeError => failed += 1,
@@ -589,7 +600,7 @@ fn render_header(
     }
 
     let mut summary = format!(
-        "| {total} accounts  •  {ready} ready  •  {partial} partial  •  {unavailable} unavailable  •  {failed} failed"
+        "| {total} accounts  •  {ready} ready  •  {unknown} unknown  •  {partial} partial  •  {unavailable} unavailable  •  {failed} failed"
     );
     if disabled > 0 {
         let _ = write!(summary, "  •  {disabled} disabled");
@@ -636,9 +647,15 @@ fn account_state(
     if status.is_some_and(|st| !st.is_available(bucket, now)) {
         return AccountState::Exhausted;
     }
-    let has_sub_cooldown = status.is_some_and(|st| st.cooldowns.iter().any(|cd| cd.is_active(now)));
+    let has_sub_cooldown = status.is_some_and(|st| {
+        st.cooldowns.iter().any(|cd| cd.is_active(now))
+            || st.windows.iter().any(|window| window.is_exhausted_at(now))
+    });
     if has_sub_cooldown {
         return AccountState::Partial;
+    }
+    if status.is_none_or(|st| st.windows.iter().all(|window| window.remaining.is_none())) {
+        return AccountState::Unknown;
     }
     AccountState::Ready
 }
@@ -662,6 +679,7 @@ fn account_state_cell(
         ),
         AccountState::Exhausted => ("EXHAUSTED".to_owned(), Color::Red),
         AccountState::Partial => ("PARTIAL".to_owned(), Color::Yellow),
+        AccountState::Unknown => ("UNKNOWN".to_owned(), Color::Gray),
         AccountState::Ready => ("READY".to_owned(), Color::Green),
     }
 }
@@ -804,6 +822,18 @@ fn build_detail_lines<'a>(
                     ""
                 },
                 windows_summary.join("  ")
+            )));
+        }
+
+        if let Some(budget) = &st.key_budget {
+            let stale = if st.last_probe_error.is_some() {
+                " (stale)"
+            } else {
+                ""
+            };
+            lines.push(Line::from(format!(
+                "OpenRouter budget: ${} remaining{stale}",
+                budget.remaining_usd
             )));
         }
 

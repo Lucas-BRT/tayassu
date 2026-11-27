@@ -31,6 +31,9 @@ pub enum Command {
         /// Model bucket to evaluate availability against.
         #[arg(long)]
         model: Option<ModelBucket>,
+        /// List discovered `OpenCode` models and their measured quota.
+        #[arg(long, conflicts_with = "model")]
+        list_models: bool,
     },
 
     /// Open an interactive live terminal dashboard for accounts, quotas, and cooldowns.
@@ -59,6 +62,9 @@ pub enum Command {
         /// Print the chosen account and isolated environment without spawning the CLI.
         #[arg(long)]
         dry_run: bool,
+        /// Refresh usage before launch and select only an account with measured quota remaining.
+        #[arg(long, conflicts_with = "account")]
+        require_quota: bool,
         /// Retry once on the next available account if the first run hits a rate limit.
         #[arg(long, conflicts_with = "account")]
         failover: bool,
