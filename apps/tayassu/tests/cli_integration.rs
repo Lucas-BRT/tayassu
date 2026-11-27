@@ -289,7 +289,9 @@ fn probe_supports_claude_codex_copilot_and_opencode_in_parallel() {
     assert!(probe_out.contains("claude-main: ok (1 windows, 0 active cooldowns)"));
     assert!(probe_out.contains("codex-main: ok (1 windows, 0 active cooldowns)"));
     assert!(probe_out.contains("opencode-main: ok (2 windows, 0 active cooldowns)"));
-    assert!(probe_out.contains("copilot-main: ok (1 windows, 0 active cooldowns)"));
+    assert!(
+        probe_out.contains("unable to verify Copilot authentication for account 'copilot-main'")
+    );
 
     let status_out = env.run_ok(&["status"]);
     assert!(status_out.contains("claude-main"));
@@ -634,7 +636,9 @@ fn shell_completion_reads_current_accounts_providers_and_chains() {
     .expect("add chain");
 
     for (index, args, expected) in [
+        ("1", vec!["acc"], "account"),
         ("2", vec!["run", "co"], "codex"),
+        ("4", vec!["auto", "run", "--chain", "wo"], "work-chain"),
         ("3", vec!["run", "--account", "wo"], "work-codex"),
         ("3", vec!["run", "--chain", "wo"], "work-chain"),
         ("2", vec!["run", "--dry"], "--dry-run"),
@@ -653,6 +657,9 @@ fn shell_completion_reads_current_accounts_providers_and_chains() {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
+        if args == ["run", "co"] {
+            assert!(!String::from_utf8_lossy(&output.stdout).contains("copilot"));
+        }
         assert!(
             String::from_utf8_lossy(&output.stdout).contains(expected),
             "{args:?}"
@@ -920,4 +927,26 @@ fn auto_probe_installs_and_enables_timer_without_overwriting_existing_units() {
         fs::read_to_string(timer).expect("read timer"),
         "custom timer"
     );
+}
+
+#[test]
+fn shared_token_does_not_confirm_two_copilot_profiles() {
+    let env = TestEnv::new();
+    let ids = ["copilot-work", "copilot-personal"];
+    for id in ids {
+        env.run_ok(&["account", "add", id, "copilot", "--binary", "/bin/false"]);
+    }
+    let output = env
+        .command()
+        .env("GH_TOKEN", "synthetic")
+        .arg("probe")
+        .output()
+        .expect("probe");
+    assert!(output.status.success());
+    let report = String::from_utf8(output.stdout).expect("text report");
+    for id in ids {
+        assert!(report.contains(&format!(
+            "unable to verify Copilot authentication for account '{id}'"
+        )));
+    }
 }
