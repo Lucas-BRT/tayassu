@@ -140,15 +140,34 @@ impl DiscoveredAgent {
 pub struct HostDiscovery;
 
 impl HostDiscovery {
+    /// Resolves an explicit executable path or searches PATH and known user bin directories.
+    #[must_use]
+    pub fn resolve_executable(
+        self,
+        executable: &str,
+        real_home: &Path,
+        path_env: Option<&OsStr>,
+    ) -> Option<PathBuf> {
+        if executable.contains('/') {
+            let path = Path::new(executable);
+            return is_executable_file(path).then(|| path.to_path_buf());
+        }
+        let found = find_executable(executable, &build_search_dirs(real_home, path_env))?;
+        if found.is_absolute() {
+            Some(found)
+        } else {
+            Some(env::current_dir().ok()?.join(found))
+        }
+    }
+
     /// Scans `path_env` and standard user bin directories under `real_home` for known AI CLIs.
     #[must_use]
     pub fn discover_all(self, real_home: &Path, path_env: Option<&OsStr>) -> Vec<DiscoveredAgent> {
-        let search_dirs = build_search_dirs(real_home, path_env);
-
         DISCOVERABLE_PROVIDERS
             .iter()
             .filter_map(|&provider| {
-                let binary_path = find_executable(provider.default_binary(), &search_dirs)?;
+                let binary_path =
+                    self.resolve_executable(provider.default_binary(), real_home, path_env)?;
                 Some(build_discovered_agent(provider, binary_path, real_home))
             })
             .collect()

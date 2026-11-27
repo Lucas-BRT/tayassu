@@ -165,6 +165,34 @@ Claude and GPT models\tFive Hour Limit Remaining\t0%\t2026-11-27T00:38:57Z
     }
 
     #[test]
+    fn agy_accepts_disabled_windows_without_hiding_malformed_percentages() {
+        let account =
+            AccountConfig::new("agy-host".parse().expect("id"), ProviderKind::Agy, "Host");
+        let now = Utc::now();
+        let disabled = "Claude and GPT models\tFHour Limit Remaining\tdisabled";
+        let measured = "Claude and GPT models\tWeekly Limit Remaining\t35%";
+        let fixture = format!("{measured}\n{disabled}");
+        let parsed = AgyAdapter
+            .parse_usage_output(&account, &fixture, now)
+            .expect("mixed windows");
+        assert_eq!(parsed.windows.len(), 1);
+        assert_eq!(parsed.windows[0].window_name, "weekly");
+        assert_eq!(parsed.cooldowns, []);
+
+        let parsed = AgyAdapter
+            .parse_usage_output(&account, disabled, now)
+            .expect("disabled only");
+        assert_eq!(parsed.windows, []);
+
+        let malformed = "Claude and GPT models\tFHour Limit Remaining\t35%%";
+        assert!(
+            AgyAdapter
+                .parse_usage_output(&account, malformed, now)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn agy_detects_unauthenticated_profile() {
         let account = AccountConfig::new(
             "agy-new".parse().expect("id"),
@@ -246,6 +274,23 @@ Claude and GPT models\tFive Hour Limit Remaining\t0%\t2026-11-27T00:38:57Z
             bare.resets_at.signed_duration_since(now).num_seconds(),
             RETRY_AFTER_SECS
         );
+        let unrelated = detect("operation took 1s\nHTTP status: 429").expect("status");
+        assert_eq!(
+            unrelated.resets_at.signed_duration_since(now).num_seconds(),
+            tayassu_core::DEFAULT_FALLBACK_COOLDOWN_SECS,
+        );
+        for invalid in [
+            "retry-after: -120",
+            "retry-after: 1.5",
+            "try again in 2 weeks",
+        ] {
+            let detected = detect(&format!("429 Too Many Requests, {invalid}")).expect("status");
+            assert_eq!(
+                detected.resets_at.signed_duration_since(now).num_seconds(),
+                tayassu_core::DEFAULT_FALLBACK_COOLDOWN_SECS,
+                "{invalid}",
+            );
+        }
         let days = detect("usage limit reached, resets in 2 days").expect("days");
         assert_eq!(days.resets_at.signed_duration_since(now).num_hours(), 48);
     }
@@ -359,12 +404,14 @@ Claude and GPT models\tFive Hour Limit Remaining\t0%\t2026-11-27T00:38:57Z
             .expect("valid utc");
 
         let fixture = r#"
+diagnostic: {"event":"status requested"}
 {
   "loggedIn": true,
   "authMethod": "claude.ai",
   "loginExpiresAt": "2026-12-06T03:29:58.541Z",
   "planTier": "pro"
 }
+diagnostic: finished {status}
 "#;
         let parsed = ClaudeAdapter
             .parse_usage_output(&account, fixture, now)
@@ -399,6 +446,10 @@ Claude and GPT models\tFive Hour Limit Remaining\t0%\t2026-11-27T00:38:57Z
             .expect("codex logged in should parse");
         assert_eq!(parsed.windows.len(), 1);
         assert_eq!(parsed.windows[0].window_name, "auth");
+
+        let unrelated =
+            CodexAdapter.parse_usage_output(&account, "Checking whether you are logged in", now);
+        assert!(matches!(unrelated, Err(ProviderError::ParseUsage { .. })));
 
         let logged_out = CodexAdapter
             .parse_usage_output(&account, "Not logged in\n", now)

@@ -1,6 +1,6 @@
 use crate::account::{AccountConfig, ModelBucket, ProviderKind};
 use crate::error::CoreError;
-use crate::quota::{AccountStatus, MAX_REMAINING_PERCENT, RemainingPercent};
+use crate::quota::AccountStatus;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
@@ -14,7 +14,7 @@ pub enum SelectionPolicy {
     /// Prefer lowest configured `priority`, breaking ties by fewer active sessions and highest quota.
     #[default]
     Priority,
-    /// Prefer highest remaining quota percentage, breaking ties by `priority` and fewer sessions.
+    /// Prefer highest known remaining quota percentage, then fewer sessions and lower `priority`.
     MostQuota,
     /// Prefer the account whose current quota window resets soonest (use-it-or-lose-it).
     SoonestReset,
@@ -156,16 +156,14 @@ impl AccountRouter {
                     .find(|status| status.account_id == account.id);
                 (account, status)
             })
-            .filter(|(_, status)| status.is_none_or(|st| st.is_available(bucket, now)))
+            .filter(|(_, status)| status.is_none_or(|st| st.can_route(bucket, now)))
             .collect();
 
         match self.policy {
             SelectionPolicy::Priority => {
                 candidates.sort_by_key(|(account, status)| {
                     let active = status.map_or(0, |st| st.active_sessions);
-                    let remaining = status
-                        .and_then(|st| st.lowest_remaining_percent(bucket))
-                        .map_or(MAX_REMAINING_PERCENT, RemainingPercent::value);
+                    let remaining = status.and_then(|st| st.lowest_remaining_percent(bucket, now));
                     (
                         account.priority,
                         active,
@@ -177,9 +175,7 @@ impl AccountRouter {
             SelectionPolicy::MostQuota => {
                 candidates.sort_by_key(|(account, status)| {
                     let active = status.map_or(0, |st| st.active_sessions);
-                    let remaining = status
-                        .and_then(|st| st.lowest_remaining_percent(bucket))
-                        .map_or(MAX_REMAINING_PERCENT, RemainingPercent::value);
+                    let remaining = status.and_then(|st| st.lowest_remaining_percent(bucket, now));
                     (
                         Reverse(remaining),
                         active,
@@ -192,7 +188,7 @@ impl AccountRouter {
                 candidates.sort_by_key(|(account, status)| {
                     let active = status.map_or(0, |st| st.active_sessions);
                     let reset_ts = status
-                        .and_then(|st| st.soonest_reset(bucket))
+                        .and_then(|st| st.soonest_reset(bucket, now))
                         .map_or(i64::MAX, |dt| dt.timestamp());
                     (reset_ts, active, account.priority, account.id.clone())
                 });

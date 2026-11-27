@@ -58,8 +58,8 @@ impl<'a> StatusTable<'a> {
 
         writeln!(
             writer,
-            "{:<18} {:<10} {:<4} {:<18} {:<28} LABEL",
-            "ACCOUNT", "PROVIDER", "PRI", "STATE", "QUOTA"
+            "{:<18} {:<10} {:<4} {:<18} {:<13} {:<28} {:<20} {:<8} LABEL",
+            "ACCOUNT", "PROVIDER", "PRI", "STATE", "LOGIN", "QUOTA", "LAST PROBE (UTC)", "SESSIONS"
         )?;
 
         let default_bucket = ModelBucket::default_bucket();
@@ -72,18 +72,44 @@ impl<'a> StatusTable<'a> {
 
             let eval_bucket = self.bucket_filter.unwrap_or(&default_bucket);
             let state_text = render_state(account, status, eval_bucket, now);
-            let quota_text = render_quota(status, self.bucket_filter, now);
+            let mut quota_text = render_quota(status, self.bucket_filter, now);
+            if status.is_some_and(|st| st.last_probe_error.is_some()) && quota_text.contains('%') {
+                quota_text.push_str(" (stale)");
+            }
+
+            let login = render_login(status);
+            let last_probe = status.and_then(|st| st.last_probed_at).map_or_else(
+                || "never".to_owned(),
+                |time| time.format("%Y-%m-%d %H:%M:%S").to_string(),
+            );
+            let sessions = status.map_or(0, |st| st.active_sessions);
 
             writeln!(
                 writer,
-                "{:<18} {:<10} {:<4} {:<18} {:<28} {}",
+                "{:<18} {:<10} {:<4} {:<18} {:<13} {:<28} {:<20} {sessions:<8} {}",
                 account.id,
                 account.provider,
                 account.priority,
                 state_text,
+                login,
                 quota_text,
+                last_probe,
                 account.label
             )?;
+            if let Some(failure) = status.and_then(|st| st.last_probe_error.as_ref()) {
+                let id = &account.id;
+                let reason = failure
+                    .message
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let action = if failure.is_authentication() {
+                    format!("tayassu account login {id}")
+                } else {
+                    format!("tayassu doctor, then tayassu probe --id {id}")
+                };
+                writeln!(writer, "  {id}: {reason}. Next: {action}")?;
+            }
         }
 
         Ok(())
@@ -118,23 +144,42 @@ fn render_state(
     "READY".to_owned()
 }
 
+pub(crate) fn render_login(status: Option<&AccountStatus>) -> &'static str {
+    match status {
+        Some(st)
+            if st
+                .last_probe_error
+                .as_ref()
+                .is_some_and(tayassu_core::ProbeFailure::is_authentication) =>
+        {
+            "required"
+        }
+        Some(st) if st.last_probe_error.is_none() && st.last_probed_at.is_some() => "ok",
+        _ => "unverified",
+    }
+}
+
 fn render_quota(
     status: Option<&AccountStatus>,
     bucket_filter: Option<&ModelBucket>,
     now: DateTime<Utc>,
 ) -> String {
     let Some(st) = status else {
-        return "-".to_owned();
+        return "unknown".to_owned();
     };
 
     if let Some(bucket) = bucket_filter {
         return st
-            .lowest_remaining_percent(bucket)
-            .map_or_else(|| "-".to_owned(), |pct| pct.to_string());
+            .lowest_remaining_percent(bucket, now)
+            .map_or_else(|| "unknown".to_owned(), |pct| pct.to_string());
     }
 
     let mut buckets = BTreeSet::new();
-    for window in &st.windows {
+    for window in st
+        .windows
+        .iter()
+        .filter(|window| window.remaining.is_some())
+    {
         buckets.insert(window.bucket.clone());
     }
     for cooldown in &st.cooldowns {
@@ -144,15 +189,15 @@ fn render_quota(
     }
 
     if buckets.is_empty() {
-        return "-".to_owned();
+        return "unknown".to_owned();
     }
 
     let parts: Vec<String> = buckets
         .iter()
         .map(|bucket| {
             let pct = st
-                .lowest_remaining_percent(bucket)
-                .map_or_else(|| "ok".to_owned(), |val| val.to_string());
+                .lowest_remaining_percent(bucket, now)
+                .map_or_else(|| "unknown".to_owned(), |val| val.to_string());
             if let Some(cd) = st.active_cooldown(bucket, now) {
                 let rem = cd
                     .remaining(now)
