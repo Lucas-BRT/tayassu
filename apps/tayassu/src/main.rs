@@ -9,6 +9,7 @@ use anyhow::{Context, Result, bail};
 use chrono::{TimeDelta, Utc};
 use clap::Parser;
 use cli::{AccountAction, Cli, Command, CooldownAction};
+use ctrlc;
 use doctor::DoctorReport;
 use render::StatusTable;
 use shell::ShellInit;
@@ -19,7 +20,6 @@ use std::path::{Path, PathBuf};
 use std::process::{self, Command as ProcessCommand, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use ctrlc;
 use systemd::SystemdUnits;
 use tayassu_core::{
     AccountConfig, AccountId, AccountRouter, CooldownEntry, ModelBucket, ProbeFailure,
