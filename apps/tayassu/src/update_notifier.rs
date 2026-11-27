@@ -57,6 +57,7 @@ impl UpdateNotifier {
                     | Command::Update(_)
                     | Command::Uninstall(_)
                     | Command::CheckUpdate
+                    | Command::HasAccount { .. }
             )
         )
     }

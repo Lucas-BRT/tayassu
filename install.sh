@@ -44,7 +44,7 @@ resolve_tag() {
     printf '%s' "$latest"
     return
   fi
-  printf 'v0.3.1'
+  printf 'v0.3.2'
 }
 
 get_installed_version() {
@@ -131,7 +131,8 @@ case ":${PATH}:" in
 esac
 
 # Configure shell activation and completion (non-fatal).
-"${INSTALL_DIR}/${BIN_NAME}" setup --no-systemd || log "Warning: could not configure shell completions."
+"${INSTALL_DIR}/${BIN_NAME}" setup completion || log "Warning: could not configure shell completion; run 'tayassu setup completion' to retry."
+log "Optional: run 'tayassu setup shell' to enable provider wrappers."
 
 # Print final version.
 "${INSTALL_DIR}/${BIN_NAME}" --version

@@ -2,6 +2,8 @@ mod app;
 mod artifacts;
 mod claude_usage;
 mod cli;
+#[cfg(target_os = "linux")]
+mod codex_daemon;
 mod commands;
 mod doctor;
 mod opencode_usage;

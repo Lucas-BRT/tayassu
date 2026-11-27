@@ -58,7 +58,7 @@ impl DoctorReport {
             report.push(
                 CheckLevel::Warn,
                 "config",
-                "no accounts configured; run `tayassu import` or `tayassu account add`",
+                "no accounts configured; run `tayassu import` or `tayassu add`",
             );
             return report;
         }

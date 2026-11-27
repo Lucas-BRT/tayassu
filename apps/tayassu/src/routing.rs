@@ -153,6 +153,12 @@ impl App {
             let executable = account_executable(&account, &self.paths.home_dir);
             info!(account = %account.id, executable = %executable.display(), "launching agent CLI");
             let arguments = req.arguments_for(account.provider, &bucket)?;
+            #[cfg(target_os = "linux")]
+            if account.provider == ProviderKind::Codex
+                && !arguments.iter().any(|arg| arg == "--no-daemon")
+            {
+                crate::codex_daemon::restore_missing_link(&env_profile.profile_dir);
+            }
             let outcome =
                 spawn_capturing_stderr(&account, &executable, &env_profile.env_vars, &arguments)?;
 
@@ -374,7 +380,7 @@ impl App {
                 .select_from_chain(accounts, &self.state.statuses, &targets, now)
                 .with_context(|| {
                     format!(
-                        "no available account in fallback chain '{name}'; {}",
+                        "no available account in fallback chain '{name}'; {}; inspect with `tayassu ls` and `tayassu doctor`",
                         self.unavailable_summary(accounts, &targets, now, req.require_quota)
                     )
                 })?;
@@ -425,7 +431,12 @@ impl App {
 
         let account = router
             .select(accounts, &self.state.statuses, provider, &bucket, now)
-            .with_context(|| self.unavailable_summary(accounts, &targets, now, req.require_quota))?
+            .with_context(|| {
+                format!(
+                    "{}; inspect with `tayassu ls {provider}` and `tayassu doctor`",
+                    self.unavailable_summary(accounts, &targets, now, req.require_quota)
+                )
+            })?
             .clone();
         let bucket = router
             .resolve_bucket(provider, self.state.status_for(&account.id), &bucket, now)
@@ -489,10 +500,7 @@ impl App {
             return require_quota.then(unknown);
         };
         if status.needs_login() {
-            return Some(format!(
-                "login required (tayassu account login {})",
-                account.id
-            ));
+            return Some(format!("login required (tayassu login {})", account.id));
         }
         if status.is_available(bucket, now) {
             return router
