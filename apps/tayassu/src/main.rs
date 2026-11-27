@@ -410,6 +410,9 @@ impl App {
                 } else {
                     label
                 };
+                if self.config.find_account(&id).is_some() {
+                    bail!("account '{id}' already exists; remove it first to re-register");
+                }
                 let mut account = AccountConfig::new(id.clone(), provider, display_label);
                 account.priority = priority;
                 account.binary_override = binary;
@@ -484,10 +487,12 @@ impl App {
                 if self.config.find_account(&id).is_none() {
                     bail!("account '{id}' not found");
                 }
-                let minutes_i64 =
-                    i64::try_from(minutes).context("cooldown duration exceeds supported range")?;
+                let resets_at = i64::try_from(minutes)
+                    .ok()
+                    .and_then(TimeDelta::try_minutes)
+                    .and_then(|delta| Utc::now().checked_add_signed(delta))
+                    .context("cooldown duration exceeds supported range")?;
                 let bucket = model.unwrap_or_else(ModelBucket::default_bucket);
-                let resets_at = Utc::now() + TimeDelta::minutes(minutes_i64);
                 let bucket_for_lock = bucket.clone();
                 let (updated, ()) = RuntimeState::update_locked(&self.paths.state_file, |state| {
                     state.status_for_mut(&id).set_cooldown(CooldownEntry {
