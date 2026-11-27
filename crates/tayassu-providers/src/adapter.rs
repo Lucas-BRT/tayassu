@@ -29,8 +29,23 @@ const RATE_LIMIT_MARKERS: &[&str] = &[
     "too many requests",
     "resource_exhausted",
     "limit reached",
-    "429",
 ];
+
+/// Phrases that introduce the time to wait inside a rate-limit message.
+const RETRY_ANCHORS: &[&[&str]] = &[
+    &["try", "again", "in"],
+    &["retry", "after"],
+    &["retry", "in"],
+    &["resets", "in"],
+    &["reset", "in"],
+    &["wait"],
+];
+
+/// HTTP status text that only counts as a rate-limit marker when it stands alone.
+const HTTP_TOO_MANY_REQUESTS: &str = "429";
+
+/// Seconds per day used when parsing textual retry-after durations.
+const SECS_PER_DAY: i64 = 24 * SECS_PER_HOUR;
 
 /// Seconds per minute used when parsing textual retry-after durations.
 const SECS_PER_MINUTE: i64 = 60;
@@ -39,7 +54,7 @@ const SECS_PER_MINUTE: i64 = 60;
 const SECS_PER_HOUR: i64 = 3600;
 
 /// Maximum retry-after duration (7 days in seconds) accepted from unstructured CLI stderr.
-const MAX_PARSED_COOLDOWN_SECS: i64 = 7 * 24 * SECS_PER_HOUR;
+const MAX_PARSED_COOLDOWN_SECS: i64 = 7 * SECS_PER_DAY;
 
 /// Substring marker emitted by `agy` when a profile has no stored OAuth credentials.
 const AGY_AUTH_REQUIRED_MARKER: &str = "authentication required";
@@ -176,9 +191,10 @@ pub trait ProviderAdapter: Send + Sync {
         now: DateTime<Utc>,
     ) -> Option<CooldownEntry> {
         let lowered = output.to_ascii_lowercase();
-        let matched = RATE_LIMIT_MARKERS
-            .iter()
-            .any(|marker| lowered.contains(marker));
+        let matched = mentions_status_429(&lowered)
+            || RATE_LIMIT_MARKERS
+                .iter()
+                .any(|marker| lowered.contains(marker));
         if !matched {
             return None;
         }
@@ -795,33 +811,61 @@ fn parse_retry_after_secs(lowered: &str) -> Option<i64> {
         .filter(|tok| !tok.is_empty())
         .collect();
 
-    let mut total_secs: i64 = 0;
-    let mut idx = 0;
+    let start = RETRY_ANCHORS
+        .iter()
+        .filter_map(|anchor| {
+            tokens
+                .windows(anchor.len())
+                .position(|window| window == *anchor)
+                .map(|pos| pos + anchor.len())
+        })
+        .min()
+        .unwrap_or(0);
 
+    let mut total_secs: i64 = 0;
+    let mut idx = start;
     while idx < tokens.len() {
         let token = tokens[idx];
         if let Some(secs) = parse_compact_duration_token(token) {
             total_secs = total_secs.saturating_add(secs);
             idx += 1;
-            continue;
-        }
-        if let Ok(value) = token.parse::<i64>()
+        } else if let Ok(value) = token.parse::<i64>()
             && value > 0
-            && let Some(unit) = tokens.get(idx + 1).copied()
-            && let Some(multiplier) = unit_multiplier_secs(unit)
         {
-            total_secs = total_secs.saturating_add(value.saturating_mul(multiplier));
-            idx += 2;
-            continue;
+            let multiplier = tokens.get(idx + 1).copied().and_then(unit_multiplier_secs);
+            match multiplier {
+                Some(multiplier) => {
+                    total_secs = total_secs.saturating_add(value.saturating_mul(multiplier));
+                    idx += 2;
+                }
+                // A bare number right after "retry after" is a count of seconds.
+                None if total_secs == 0 && idx == start && start > 0 => {
+                    total_secs = value;
+                    break;
+                }
+                None => break,
+            }
+        } else if total_secs > 0 && token == "and" {
+            idx += 1;
+        } else if total_secs > 0 {
+            break;
+        } else {
+            idx += 1;
         }
-        idx += 1;
     }
 
-    if total_secs > 0 && total_secs <= MAX_PARSED_COOLDOWN_SECS {
-        Some(total_secs)
-    } else {
-        None
-    }
+    (total_secs > 0 && total_secs <= MAX_PARSED_COOLDOWN_SECS).then_some(total_secs)
+}
+
+/// Returns `true` when `text` mentions HTTP status 429 as a standalone number.
+fn mentions_status_429(text: &str) -> bool {
+    text.match_indices(HTTP_TOO_MANY_REQUESTS)
+        .any(|(pos, found)| {
+            let before = text[..pos].chars().next_back();
+            let after = text[pos + found.len()..].chars().next();
+            !before.is_some_and(|ch| ch.is_ascii_alphanumeric())
+                && !after.is_some_and(|ch| ch.is_ascii_alphanumeric())
+        })
 }
 
 fn parse_compact_duration_token(token: &str) -> Option<i64> {
@@ -837,6 +881,7 @@ fn parse_compact_duration_token(token: &str) -> Option<i64> {
         "h" => Some(value.saturating_mul(SECS_PER_HOUR)),
         "m" => Some(value.saturating_mul(SECS_PER_MINUTE)),
         "s" => Some(value),
+        "d" => Some(value.saturating_mul(SECS_PER_DAY)),
         _ => None,
     }
 }
@@ -846,6 +891,7 @@ fn unit_multiplier_secs(unit: &str) -> Option<i64> {
         "h" | "hr" | "hrs" | "hour" | "hours" => Some(SECS_PER_HOUR),
         "m" | "min" | "mins" | "minute" | "minutes" => Some(SECS_PER_MINUTE),
         "s" | "sec" | "secs" | "second" | "seconds" => Some(1),
+        "d" | "day" | "days" => Some(SECS_PER_DAY),
         _ => None,
     }
 }
