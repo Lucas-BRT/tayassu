@@ -8,6 +8,12 @@ pub const FAKE_HOME_SUBDIR: &str = "home";
 /// Default dotfile entries symlinked from the real `$HOME` into a fake `HOME` profile.
 pub const DEFAULT_SHARED_HOME_LINKS: &[&str] = &[".gitconfig", ".ssh"];
 
+/// Config file (relative to the fake `HOME`) where `opencode` stores its managed-service port.
+pub const OPENCODE_SERVICE_CONFIG: &str = ".config/opencode/service.json";
+
+/// JSON key holding the managed-service port inside [`OPENCODE_SERVICE_CONFIG`].
+const SERVICE_PORT_KEY: &str = "port";
+
 /// Environment variable name for the user home directory.
 pub const ENV_HOME: &str = "HOME";
 
@@ -47,6 +53,8 @@ pub struct ProfileEnvironment {
     pub strategy: IsolationStrategy,
     /// Environment key/value overrides injected into the spawned CLI process.
     pub env_vars: Vec<(String, String)>,
+    /// Dedicated managed-service port written into the fake `HOME` when the CLI binds a fixed port.
+    pub service_port: Option<u16>,
 }
 
 impl ProfileEnvironment {
@@ -85,7 +93,15 @@ impl ProfileEnvironment {
             profile_dir,
             strategy,
             env_vars,
+            service_port: None,
         }
+    }
+
+    /// Sets the managed-service port persisted into the fake `HOME` by [`Self::prepare`].
+    #[must_use]
+    pub fn with_service_port(mut self, port: u16) -> Self {
+        self.service_port = Some(port);
+        self
     }
 
     /// Ensures the profile directory exists and creates any configured symlinks for fake `HOME`.
@@ -123,10 +139,39 @@ impl ProfileEnvironment {
                 }
                 create_symlink(&source_path, &link_path)?;
             }
+
+            if let Some(port) = self.service_port {
+                write_service_port(&fake_home.join(OPENCODE_SERVICE_CONFIG), port)?;
+            }
         }
 
         Ok(())
     }
+}
+
+/// Writes `port` into the service config at `path`, keeping any existing port or other keys.
+fn write_service_port(path: &Path, port: u16) -> Result<(), ProviderError> {
+    let io_err = |source| ProviderError::Io {
+        path: path.to_path_buf(),
+        source,
+    };
+    let mut config = fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|value| match value {
+            serde_json::Value::Object(map) => Some(map),
+            _ => None,
+        })
+        .unwrap_or_default();
+    if config.contains_key(SERVICE_PORT_KEY) {
+        return Ok(());
+    }
+    config.insert(SERVICE_PORT_KEY.to_owned(), port.into());
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(io_err)?;
+    }
+    let body = serde_json::to_string_pretty(&config).map_err(|e| io_err(e.into()))?;
+    fs::write(path, body).map_err(io_err)
 }
 
 #[cfg(unix)]

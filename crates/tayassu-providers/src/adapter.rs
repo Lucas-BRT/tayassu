@@ -70,6 +70,18 @@ const AGY_EXTRA_SHARED_LINKS: &[&str] = &[
     ".gemini/GEMINI.md",
 ];
 
+/// First port of the range used for per-account `opencode` managed services (host default is 49374).
+const OPENCODE_SERVICE_PORT_BASE: u16 = 50_000;
+
+/// Number of ports in the per-account `opencode` managed-service range.
+const OPENCODE_SERVICE_PORT_SPAN: u32 = 10_000;
+
+/// FNV-1a 32-bit offset basis.
+const FNV_OFFSET_BASIS: u32 = 0x811c_9dc5;
+
+/// FNV-1a 32-bit prime.
+const FNV_PRIME: u32 = 0x0100_0193;
+
 /// Shared links added for `opencode` fake `HOME` so `opencode upgrade`, skills, and plugins stay unified.
 const OPENCODE_EXTRA_SHARED_LINKS: &[&str] = &[
     ".opencode/bin",
@@ -557,6 +569,18 @@ impl ProviderAdapter for OpencodeAdapter {
         }
     }
 
+    fn build_environment(
+        &self,
+        account: &AccountConfig,
+        profiles_root: &Path,
+    ) -> ProfileEnvironment {
+        let profile_dir = profiles_root
+            .join(self.kind().as_str())
+            .join(account.id.as_str());
+        ProfileEnvironment::new(profile_dir, self.isolation(account))
+            .with_service_port(opencode_service_port(account.id.as_str()))
+    }
+
     fn login_args(&self) -> Vec<String> {
         vec!["auth".to_owned(), "login".to_owned()]
     }
@@ -618,6 +642,15 @@ impl ProviderAdapter for OpencodeAdapter {
             cooldowns: Vec::new(),
         })
     }
+}
+
+/// Derives a stable per-account managed-service port so isolated `opencode` homes never share one.
+fn opencode_service_port(account_id: &str) -> u16 {
+    let hash = account_id.bytes().fold(FNV_OFFSET_BASIS, |acc, byte| {
+        (acc ^ u32::from(byte)).wrapping_mul(FNV_PRIME)
+    });
+    let offset = u16::try_from(hash % OPENCODE_SERVICE_PORT_SPAN).unwrap_or_default();
+    OPENCODE_SERVICE_PORT_BASE + offset
 }
 
 /// Generic adapter for custom subscription-authenticated CLIs.
