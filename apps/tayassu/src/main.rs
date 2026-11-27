@@ -1,16 +1,19 @@
 mod cli;
 mod doctor;
 mod render;
+mod routing;
 mod shell;
 mod systemd;
 mod tui;
 
 use anyhow::{Context, Result, bail};
 use chrono::{TimeDelta, Utc};
-use clap::Parser;
-use cli::{AccountAction, Cli, Command, CooldownAction};
+use clap::{CommandFactory, Parser};
+use clap_complete::CompleteEnv;
+use cli::{AccountAction, Cli, Command, CooldownAction, ImportArgs};
 use doctor::DoctorReport;
 use render::StatusTable;
+use routing::RunRequest;
 use shell::ShellInit;
 use std::collections::BTreeSet;
 use std::env;
@@ -21,14 +24,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use systemd::SystemdUnits;
 use tayassu_core::{
-    AccountConfig, AccountId, AccountRouter, CooldownEntry, ModelBucket, ProbeFailure,
-    ProviderKind, SelectionPolicy,
+    AccountConfig, AccountId, CooldownEntry, ModelBucket, ProbeFailure, ProviderKind,
 };
 use tayassu_providers::{
     AdapterRegistry, HostDiscovery, MigrationMode, ProbeOutput, ProviderError,
 };
-use tayassu_store::{AppConfig, ProjectConfig, RuntimeState, XdgPaths};
-use tracing::{info, warn};
+use tayassu_store::{AppConfig, RuntimeState, XdgPaths};
+use tracing::warn;
 use tracing_subscriber::EnvFilter;
 
 /// Default tracing filter when `RUST_LOG` is unset.
@@ -54,12 +56,6 @@ const MAX_CAPTURED_STDERR_BYTES: usize = 64 * 1024;
 /// Chunk size in bytes used when forwarding child stderr to the user's terminal.
 const STDERR_READ_CHUNK_BYTES: usize = 4096;
 
-/// Maximum attempts allowed when `--failover` is enabled (primary + 1 fallback account).
-const MAX_FAILOVER_ATTEMPTS: usize = 2;
-
-/// CLI flags indicating the user is resuming an existing conversation in the current directory.
-const RESUME_FLAGS: &[&str] = &["-c", "--continue", "-r", "--resume", "--conversation"];
-
 /// Arguments for dumping the host `opencode` credentials as JSON on stdout.
 const OPENCODE_AUTH_EXPORT_ARGS: &[&str] = &["auth", "export"];
 
@@ -68,17 +64,6 @@ const OPENCODE_AUTH_IMPORT_ARGS: &[&str] = &["auth", "import"];
 
 /// Relative path under `$XDG_CONFIG_HOME` where `systemd --user` units live.
 const SYSTEMD_USER_REL_DIR: &str = "systemd/user";
-
-struct RunRequest {
-    account: Option<AccountId>,
-    provider: Option<ProviderKind>,
-    chain: Option<String>,
-    model: Option<ModelBucket>,
-    policy: Option<SelectionPolicy>,
-    dry_run: bool,
-    failover: bool,
-    args: Vec<String>,
-}
 
 struct RunOutcome {
     status: ExitStatus,
@@ -175,16 +160,20 @@ impl App {
                 },
                 out,
             ),
-            Command::Account { action } => self.handle_account(action, out),
+            Command::Account { action } => {
+                if matches!(
+                    action,
+                    AccountAction::Env { .. } | AccountAction::Login { .. }
+                ) {
+                    self.handle_account(action, out)
+                } else {
+                    self.with_current_config(|app| app.handle_account(action, out))
+                }
+            }
             Command::Cooldown { action } => self.handle_cooldown(action, out),
             Command::Probe { id, notify } => self.handle_probe(id.as_ref(), notify, out),
-            Command::Import {
-                include,
-                exclude,
-                dry_run,
-                move_auth,
-                priority,
-            } => self.handle_import(&include, &exclude, dry_run, move_auth, priority, out),
+            Command::Import(args) if args.dry_run => self.handle_import(&args, out),
+            Command::Import(args) => self.with_current_config(|app| app.handle_import(&args, out)),
             Command::ShellInit {
                 shell,
                 providers,
@@ -200,6 +189,16 @@ impl App {
             Command::Doctor { strict } => self.handle_doctor(strict, out),
             Command::Update { provider, dry_run } => self.handle_update(provider, dry_run, out),
         }
+    }
+
+    fn with_current_config(
+        &mut self,
+        operation: impl FnOnce(&mut Self) -> Result<()>,
+    ) -> Result<()> {
+        AppConfig::with_current_locked(&self.paths.config_file.clone(), |config| {
+            self.config = config;
+            operation(self)
+        })
     }
 
     fn handle_dash(&mut self) -> Result<()> {
@@ -225,215 +224,6 @@ impl App {
                 Ok(format!("Cleared {cleared} cooldown(s) for '{account_id}'"))
             },
         )
-    }
-
-    fn run_agent(&mut self, req: &RunRequest, out: &mut impl Write) -> Result<()> {
-        let cwd = env::current_dir().context("failed to resolve current directory")?;
-        let project_cfg = ProjectConfig::discover(&cwd)
-            .context("failed to load .tayassu.toml")?
-            .map(|(_, cfg)| cfg);
-
-        let effective_policy = req
-            .policy
-            .or_else(|| project_cfg.as_ref().and_then(|cfg| cfg.default_policy))
-            .unwrap_or(self.config.default_policy);
-        let router = AccountRouter::new(effective_policy);
-        let max_attempts = if req.failover {
-            MAX_FAILOVER_ATTEMPTS
-        } else {
-            1
-        };
-
-        self.prune_stale_sessions()?;
-
-        for attempt in 1..=max_attempts {
-            let (account, bucket) =
-                self.resolve_run_target(req, project_cfg.as_ref(), &cwd, router)?;
-
-            let adapter = AdapterRegistry.adapter_for(account.provider);
-            let env_profile = adapter.build_environment(&account, &self.paths.profiles_dir);
-            env_profile
-                .prepare(&self.paths.home_dir)
-                .with_context(|| format!("failed to prepare profile for {}", account.id))?;
-
-            if req.dry_run {
-                writeln!(out, "account: {}", account.id)?;
-                writeln!(out, "executable: {}", account.executable())?;
-                for (key, value) in &env_profile.env_vars {
-                    writeln!(out, "env: {key}={value}")?;
-                }
-                if !req.args.is_empty() {
-                    writeln!(out, "args: {}", req.args.join(" "))?;
-                }
-                return Ok(());
-            }
-
-            let (updated_state, ()) =
-                RuntimeState::update_locked(&self.paths.state_file, |state| {
-                    state.record_cwd_account(&cwd, account.provider, account.id.clone());
-                })
-                .with_context(|| format!("failed to save {}", self.paths.state_file.display()))?;
-            self.state = updated_state;
-
-            let session_guard =
-                SessionGuard::acquire(self.paths.state_file.clone(), account.id.clone())?;
-
-            info!(account = %account.id, executable = account.executable(), "launching agent CLI");
-            let outcome = spawn_capturing_stderr(&account, &env_profile.env_vars, &req.args)?;
-
-            // A clean exit never signals a limit; stderr noise must not cool the account down.
-            let rate_limit_hit = if outcome.status.success() {
-                None
-            } else {
-                adapter.detect_rate_limit(&account, &bucket, &outcome.captured_stderr, Utc::now())
-            };
-
-            if let Some(cooldown) = rate_limit_hit {
-                let resets_at = cooldown.resets_at;
-                let account_id = account.id.clone();
-                let (updated, ()) = RuntimeState::update_locked(&self.paths.state_file, |state| {
-                    state.status_for_mut(&account_id).set_cooldown(cooldown);
-                })
-                .with_context(|| format!("failed to save {}", self.paths.state_file.display()))?;
-                self.state = updated;
-
-                warn!(
-                    account = %account.id,
-                    bucket = %bucket,
-                    resets_at = %resets_at.to_rfc3339(),
-                    "rate limit detected; cooldown recorded"
-                );
-                let _ = writeln!(
-                    io::stderr(),
-                    "tayassu: rate limit detected on '{}' (bucket '{}'); cooldown set until {}",
-                    account.id,
-                    bucket,
-                    resets_at.to_rfc3339()
-                );
-
-                if req.failover && attempt < max_attempts && !outcome.status.success() {
-                    let _ = writeln!(
-                        io::stderr(),
-                        "tayassu: failing over to next available account..."
-                    );
-                    continue;
-                }
-            }
-
-            if !outcome.status.success() {
-                let code = outcome.status.code().unwrap_or(SIGNAL_FALLBACK_EXIT_CODE);
-                // Release the session counter first: `exit` skips destructors.
-                drop(session_guard);
-                // Propagate the agent's own status so shell wrappers and scripts see it.
-                process::exit(code);
-            }
-            return Ok(());
-        }
-
-        Ok(())
-    }
-
-    /// Drops sessions left behind by `tayassu` processes that were killed before cleanup.
-    fn prune_stale_sessions(&mut self) -> Result<()> {
-        if !self
-            .state
-            .statuses
-            .iter()
-            .any(|status| status.sessions_stale(process_is_alive))
-        {
-            return Ok(());
-        }
-        let (updated, ()) = RuntimeState::update_locked(&self.paths.state_file, |state| {
-            for status in &mut state.statuses {
-                status.prune_sessions(process_is_alive);
-            }
-        })
-        .with_context(|| format!("failed to save {}", self.paths.state_file.display()))?;
-        self.state = updated;
-        Ok(())
-    }
-
-    fn resolve_run_target(
-        &self,
-        req: &RunRequest,
-        project_cfg: Option<&ProjectConfig>,
-        cwd: &Path,
-        router: AccountRouter,
-    ) -> Result<(AccountConfig, ModelBucket)> {
-        let now = Utc::now();
-
-        if let Some(ref forced_id) = req.account {
-            let account = self
-                .config
-                .find_account(forced_id)
-                .with_context(|| format!("account '{forced_id}' not found"))?
-                .clone();
-            return Ok((account, req.model.clone().unwrap_or_default()));
-        }
-
-        let chain_name = req.chain.as_deref().or_else(|| {
-            if req.provider.is_none() {
-                project_cfg.and_then(|cfg| cfg.fallback_chain.as_deref())
-            } else {
-                None
-            }
-        });
-
-        if let Some(name) = chain_name {
-            let chain = self
-                .config
-                .fallback_chains
-                .get(name)
-                .with_context(|| format!("fallback chain '{name}' not found in config.toml"))?;
-            let (account, bucket) = router
-                .select_from_chain(&self.config.accounts, &self.state.statuses, chain, now)
-                .with_context(|| format!("no available account in fallback chain '{name}'"))?;
-            return Ok((account.clone(), bucket));
-        }
-
-        let provider = req
-            .provider
-            .context("specify a provider, `--account <id>`, or `--chain <name>`")?;
-        let bucket = req.model.clone().unwrap_or_default();
-
-        if is_resume_invocation(&req.args)
-            && let Some(last_id) = self.state.last_cwd_account(cwd, provider)
-            && let Some(account) = self.config.find_account(last_id)
-        {
-            if let Some(status) = self.state.status_for(last_id)
-                && !status.is_available(&bucket, now)
-            {
-                warn!(
-                    account = %last_id,
-                    "resuming conversation on account currently in cooldown"
-                );
-            }
-            return Ok((account.clone(), bucket));
-        }
-
-        if let Some(preferred_id) = project_cfg.and_then(|cfg| cfg.preferred_account_for(provider))
-            && let Some(account) = self.config.find_account(preferred_id)
-            && account.enabled
-            && account.provider == provider
-            && self
-                .state
-                .status_for(preferred_id)
-                .is_none_or(|st| st.is_available(&bucket, now))
-        {
-            return Ok((account.clone(), bucket));
-        }
-
-        let account = router
-            .select(
-                &self.config.accounts,
-                &self.state.statuses,
-                provider,
-                &bucket,
-                now,
-            )
-            .context("cannot select an account for this run")?
-            .clone();
-        Ok((account, bucket))
     }
 
     fn handle_account(&mut self, action: AccountAction, out: &mut impl Write) -> Result<()> {
@@ -471,6 +261,26 @@ impl App {
                     env_profile.profile_dir.display()
                 )?;
             }
+            AccountAction::Edit {
+                id,
+                label,
+                priority,
+            } => {
+                let account = self
+                    .config
+                    .find_account_mut(&id)
+                    .with_context(|| format!("account '{id}' not found"))?;
+                if let Some(label) = label {
+                    account.label = label;
+                }
+                if let Some(priority) = priority {
+                    account.priority = priority;
+                }
+                self.save_config()?;
+                writeln!(out, "Updated account '{id}'")?;
+            }
+            AccountAction::Enable { id } => self.set_account_enabled(&id, true, out)?,
+            AccountAction::Disable { id } => self.set_account_enabled(&id, false, out)?,
             AccountAction::Remove { id } => {
                 if !self.config.remove_account(&id) {
                     bail!("account '{id}' not found");
@@ -490,29 +300,65 @@ impl App {
                     writeln!(out, "export {key}={value}")?;
                 }
             }
-            AccountAction::Login { id } => {
-                let account = self
-                    .config
-                    .find_account(&id)
-                    .with_context(|| format!("account '{id}' not found"))?
-                    .clone();
-                let adapter = AdapterRegistry.adapter_for(account.provider);
-                let env_profile = adapter.build_environment(&account, &self.paths.profiles_dir);
-                env_profile
-                    .prepare(&self.paths.home_dir)
-                    .with_context(|| format!("failed to prepare profile for {id}"))?;
-
-                writeln!(
-                    out,
-                    "Logging in '{id}' ({}) using isolated profile {}",
-                    account.provider,
-                    env_profile.profile_dir.display()
-                )?;
-                out.flush()?;
-                let login_args = adapter.login_args();
-                spawn_interactive(&account, &env_profile.env_vars, &login_args)?;
-            }
+            AccountAction::Login { id } => self.login_account(&id, out)?,
         }
+        Ok(())
+    }
+
+    fn login_account(&mut self, id: &AccountId, out: &mut impl Write) -> Result<()> {
+        let account = self
+            .config
+            .find_account(id)
+            .with_context(|| format!("account '{id}' not found"))?
+            .clone();
+        let adapter = AdapterRegistry.adapter_for(account.provider);
+        let env_profile = adapter.build_environment(&account, &self.paths.profiles_dir);
+        env_profile
+            .prepare(&self.paths.home_dir)
+            .with_context(|| format!("failed to prepare profile for {id}"))?;
+
+        writeln!(
+            out,
+            "Logging in '{id}' ({}) using isolated profile {}",
+            account.provider,
+            env_profile.profile_dir.display()
+        )?;
+        out.flush()?;
+        let login_args = adapter.login_args();
+        let executable = account_executable(&account, &self.paths.home_dir);
+        spawn_interactive(&account, &executable, &env_profile.env_vars, &login_args)?;
+        if self
+            .state
+            .status_for(id)
+            .is_some_and(tayassu_core::AccountStatus::needs_login)
+        {
+            let (updated, ()) = RuntimeState::update_locked(&self.paths.state_file, |state| {
+                let status = state.status_for_mut(id);
+                if status.needs_login() {
+                    status.clear_probe_failure();
+                    status.last_probed_at = None;
+                    status.windows.clear();
+                }
+            })
+            .context("failed to reset probe status after login")?;
+            self.state = updated;
+        }
+        Ok(())
+    }
+
+    fn set_account_enabled(
+        &mut self,
+        id: &AccountId,
+        enabled: bool,
+        out: &mut impl Write,
+    ) -> Result<()> {
+        self.config
+            .find_account_mut(id)
+            .with_context(|| format!("account '{id}' not found"))?
+            .enabled = enabled;
+        self.save_config()?;
+        let state = if enabled { "Enabled" } else { "Disabled" };
+        writeln!(out, "{state} account '{id}'")?;
         Ok(())
     }
 
@@ -595,20 +441,12 @@ impl App {
         Ok(())
     }
 
-    fn handle_import(
-        &mut self,
-        include: &[ProviderKind],
-        exclude: &[ProviderKind],
-        dry_run: bool,
-        move_auth: bool,
-        priority: u8,
-        out: &mut impl Write,
-    ) -> Result<()> {
+    fn handle_import(&mut self, args: &ImportArgs, out: &mut impl Write) -> Result<()> {
         let discovered: Vec<_> = HostDiscovery
             .discover_all(&self.paths.home_dir, env::var_os("PATH").as_deref())
             .into_iter()
-            .filter(|agent| include.is_empty() || include.contains(&agent.provider))
-            .filter(|agent| !exclude.contains(&agent.provider))
+            .filter(|agent| args.include.is_empty() || args.include.contains(&agent.provider))
+            .filter(|agent| !args.exclude.contains(&agent.provider))
             .collect();
 
         if discovered.is_empty() {
@@ -616,41 +454,47 @@ impl App {
             return Ok(());
         }
 
-        let mode = if move_auth {
+        let mode = if args.move_auth {
             MigrationMode::MoveAuth
         } else {
             MigrationMode::Copy
         };
 
-        let mut imported_any = false;
         for agent in &discovered {
-            let mut account = AccountConfig::new(
-                agent.default_account_id.clone(),
-                agent.provider,
-                format!("{} (imported)", agent.provider),
-            );
-            account.priority = priority;
+            let existing = self.config.find_account(&agent.default_account_id);
+            if let Some(existing) = existing {
+                if existing.provider != agent.provider {
+                    writeln!(
+                        out,
+                        "Skipping '{}': ID already belongs to {}",
+                        existing.id, existing.provider
+                    )?;
+                    continue;
+                }
+                if !args.refresh {
+                    writeln!(
+                        out,
+                        "Skipping '{}': already configured (use --refresh to copy credentials again)",
+                        existing.id
+                    )?;
+                    continue;
+                }
+            }
+            let account = existing.cloned().unwrap_or_else(|| {
+                let mut account = AccountConfig::new(
+                    agent.default_account_id.clone(),
+                    agent.provider,
+                    format!("{} (imported)", agent.provider),
+                );
+                account.priority = args.priority;
+                account
+            });
 
             let adapter = AdapterRegistry.adapter_for(agent.provider);
             let profile_env = adapter.build_environment(&account, &self.paths.profiles_dir);
 
-            if dry_run {
-                writeln!(
-                    out,
-                    "[dry-run] {} -> account '{}' (binary: {}, {} credential/config file(s) found)",
-                    agent.provider,
-                    agent.default_account_id,
-                    agent.binary_path.display(),
-                    agent.existing_file_count()
-                )?;
-                writeln!(out, "  update-safety: {}", agent.update_safety_note)?;
-                if agent.requires_relogin {
-                    writeln!(
-                        out,
-                        "  note: run `tayassu account login {}` after import",
-                        agent.default_account_id
-                    )?;
-                }
+            if args.dry_run {
+                Self::write_import_preview(agent, out)?;
                 continue;
             }
 
@@ -658,8 +502,10 @@ impl App {
                 .apply(&profile_env, &self.paths.home_dir, mode)
                 .with_context(|| format!("failed to import {}", agent.provider))?;
 
-            self.config.upsert_account(account);
-            imported_any = true;
+            if existing.is_none() {
+                self.config.upsert_account(account);
+                self.save_config()?;
+            }
 
             writeln!(
                 out,
@@ -691,10 +537,29 @@ impl App {
             }
         }
 
-        if imported_any {
-            self.save_config()?;
-        }
+        Ok(())
+    }
 
+    fn write_import_preview(
+        agent: &tayassu_providers::DiscoveredAgent,
+        out: &mut impl Write,
+    ) -> Result<()> {
+        writeln!(
+            out,
+            "[dry-run] {} -> account '{}' (binary: {}, {} credential/config file(s) found)",
+            agent.provider,
+            agent.default_account_id,
+            agent.binary_path.display(),
+            agent.existing_file_count()
+        )?;
+        writeln!(out, "  update-safety: {}", agent.update_safety_note)?;
+        if agent.requires_relogin {
+            writeln!(
+                out,
+                "  note: run `tayassu account login {}` after import",
+                agent.default_account_id
+            )?;
+        }
         Ok(())
     }
 
@@ -817,14 +682,6 @@ impl App {
     }
 }
 
-fn is_resume_invocation(args: &[String]) -> bool {
-    args.iter().any(|arg| {
-        RESUME_FLAGS
-            .iter()
-            .any(|flag| arg == flag || arg.starts_with(&format!("{flag}=")))
-    })
-}
-
 fn probe_accounts(
     targets: &[AccountConfig],
     paths: &XdgPaths,
@@ -850,16 +707,22 @@ fn probe_accounts(
         let handles: Vec<_> = targets
             .iter()
             .map(|account| {
-                scope.spawn(move || {
-                    let res = run_single_probe(account, profiles_dir, home_dir, now);
-                    (account.id.clone(), res)
-                })
+                let worker =
+                    scope.spawn(move || run_single_probe(account, profiles_dir, home_dir, now));
+                (account.id.clone(), worker)
             })
             .collect();
 
         handles
             .into_iter()
-            .map(|handle| handle.join().unwrap_or_else(|_| bail_unknown_probe_panic()))
+            .map(|(id, worker)| {
+                (
+                    id,
+                    worker
+                        .join()
+                        .unwrap_or_else(|_| Err(anyhow::anyhow!("probe worker panicked"))),
+                )
+            })
             .collect()
     });
 
@@ -869,18 +732,17 @@ fn probe_accounts(
 
     let (updated_state, ()) = RuntimeState::update_locked(&paths.state_file, |locked_state| {
         for (account_id, outcome) in results {
+            let status = locked_state.status_for_mut(&account_id);
+            if status.last_probed_at.is_some_and(|last| last > now) {
+                continue;
+            }
+            status.last_probed_at = Some(now);
             match outcome {
                 Ok(parsed) => {
                     let window_count = parsed.windows.len();
                     let cooldown_count = parsed.cooldowns.len();
-                    let status = locked_state.status_for_mut(&account_id);
-                    status.last_probed_at = Some(now);
-                    status.windows = parsed.windows;
-                    status.prune_expired(now);
+                    status.refresh_probe_windows(parsed.windows, parsed.cooldowns, now);
                     status.clear_probe_failure();
-                    for cooldown in parsed.cooldowns {
-                        status.set_cooldown(cooldown);
-                    }
                     for (prev_id, prev_bucket) in &previously_cooling {
                         if prev_id == &account_id && status.active_cooldown(prev_bucket, now).is_none()
                         {
@@ -903,14 +765,12 @@ fn probe_accounts(
                     ) {
                         ProbeFailure::authentication(err.to_string())
                     } else {
-                        ProbeFailure::other(err.to_string())
+                        ProbeFailure::other(format!("{err:#}"))
                     };
-                    locked_state
-                        .status_for_mut(&account_id)
-                        .set_probe_failure(failure);
-                    warn!(account = %account_id, error = %err, "probe failed");
+                    status.set_probe_failure(failure);
+                    warn!(account = %account_id, error = %format_args!("{err:#}"), "probe failed");
                     if let Some(writer) = out.as_deref_mut() {
-                        let _ = writeln!(writer, "{account_id}: {err}");
+                        let _ = writeln!(writer, "{account_id}: {err:#}");
                     }
                 }
             }
@@ -981,12 +841,20 @@ fn transfer_opencode_auth(binary: &Path, profile_env: &[(String, String)]) -> Re
     Ok(())
 }
 
+fn account_executable(account: &AccountConfig, home_dir: &Path) -> PathBuf {
+    let executable = account.executable();
+    HostDiscovery
+        .resolve_executable(executable, home_dir, env::var_os("PATH").as_deref())
+        .unwrap_or_else(|| PathBuf::from(executable))
+}
+
 fn spawn_interactive(
     account: &AccountConfig,
+    executable: &Path,
     env_vars: &[(String, String)],
     args: &[String],
 ) -> Result<()> {
-    let mut cmd = ProcessCommand::new(account.executable());
+    let mut cmd = ProcessCommand::new(executable);
     cmd.args(args);
     for (key, value) in env_vars {
         cmd.env(key, value);
@@ -995,7 +863,7 @@ fn spawn_interactive(
     let exit_status = cmd.status().with_context(|| {
         format!(
             "failed to spawn '{}' for account '{}'",
-            account.executable(),
+            executable.display(),
             account.id
         )
     })?;
@@ -1004,7 +872,7 @@ fn spawn_interactive(
         let code = exit_status.code().unwrap_or(SIGNAL_FALLBACK_EXIT_CODE);
         bail!(
             "'{}' (account '{}') exited with status {code}",
-            account.executable(),
+            executable.display(),
             account.id
         );
     }
@@ -1014,10 +882,11 @@ fn spawn_interactive(
 /// Spawns the agent CLI with inherited stdin/stdout and teed stderr for rate-limit detection.
 fn spawn_capturing_stderr(
     account: &AccountConfig,
+    executable: &Path,
     env_vars: &[(String, String)],
     args: &[String],
 ) -> Result<RunOutcome> {
-    let mut cmd = ProcessCommand::new(account.executable());
+    let mut cmd = ProcessCommand::new(executable);
     cmd.args(args)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
@@ -1029,7 +898,7 @@ fn spawn_capturing_stderr(
     let mut child = cmd.spawn().with_context(|| {
         format!(
             "failed to spawn '{}' for account '{}'",
-            account.executable(),
+            executable.display(),
             account.id
         )
     })?;
@@ -1060,7 +929,7 @@ fn spawn_capturing_stderr(
     let status = child.wait().with_context(|| {
         format!(
             "failed waiting on '{}' for account '{}'",
-            account.executable(),
+            executable.display(),
             account.id
         )
     })?;
@@ -1097,7 +966,8 @@ fn run_single_probe(
             .map_err(Into::into);
     };
 
-    let mut cmd = ProcessCommand::new(account.executable());
+    let executable = account_executable(account, real_home);
+    let mut cmd = ProcessCommand::new(&executable);
     cmd.args(&spec.args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1109,7 +979,7 @@ fn run_single_probe(
     let output = cmd.output().with_context(|| {
         format!(
             "failed to run probe '{}' for account '{}'",
-            account.executable(),
+            executable.display(),
             account.id
         )
     })?;
@@ -1120,19 +990,25 @@ fn run_single_probe(
         combined.push_str(&String::from_utf8_lossy(&output.stderr));
     }
 
-    adapter
-        .parse_usage_output(account, &combined, now)
-        .map_err(Into::into)
-}
-
-fn bail_unknown_probe_panic() -> (AccountId, Result<ProbeOutput>) {
-    let fallback_id: AccountId = "unknown".parse().unwrap_or_else(|_| unreachable!());
-    (fallback_id, Err(anyhow::anyhow!("probe worker panicked")))
+    let parsed = adapter.parse_usage_output(account, &combined, now);
+    let reported_auth_failure = account.provider != ProviderKind::Opencode
+        && matches!(parsed, Err(ProviderError::AuthenticationRequired { .. }));
+    if !output.status.success() && !reported_auth_failure {
+        bail!(
+            "probe '{}' exited with {}",
+            executable.display(),
+            output.status
+        );
+    }
+    parsed.map_err(Into::into)
 }
 
 fn main() -> Result<()> {
     init_tracing();
     install_ctrlc_handler();
+    CompleteEnv::with_factory(Cli::command)
+        .var(shell::COMPLETION_ENV)
+        .complete();
     let cli = Cli::parse();
     let mut app = App::load()?;
     let mut stdout = io::stdout().lock();

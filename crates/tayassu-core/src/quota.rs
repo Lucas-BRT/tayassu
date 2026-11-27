@@ -62,6 +62,9 @@ impl fmt::Display for RemainingPercent {
 /// Reason prefix marking cooldowns inferred from CLI output rather than reported by a provider.
 pub const PASSIVE_COOLDOWN_REASON_PREFIX: &str = "detected-rate-limit";
 
+/// Reason prefix for cooldowns derived from AGY quota probes.
+pub const AGY_PROBE_COOLDOWN_REASON_PREFIX: &str = "agy-probe:";
+
 /// Snapshot of a single rolling or weekly quota window reported by a provider.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QuotaWindow {
@@ -246,6 +249,20 @@ impl AccountStatus {
         self.last_probe_error = None;
     }
 
+    /// Returns whether the last probe explicitly reported missing or expired credentials.
+    #[must_use]
+    pub fn needs_login(&self) -> bool {
+        self.last_probe_error
+            .as_ref()
+            .is_some_and(ProbeFailure::is_authentication)
+    }
+
+    /// Returns whether automatic routing can use this account and model.
+    #[must_use]
+    pub fn can_route(&self, bucket: &ModelBucket, now: DateTime<Utc>) -> bool {
+        !self.needs_login() && self.is_available(bucket, now)
+    }
+
     /// Returns the active cooldown blocking `bucket` (or the default bucket) at `now`.
     #[must_use]
     pub fn active_cooldown(
@@ -257,7 +274,8 @@ impl AccountStatus {
         self.cooldowns
             .iter()
             .filter(|entry| entry.is_active(now))
-            .find(|entry| &entry.bucket == bucket || entry.bucket == default_bucket)
+            .filter(|entry| &entry.bucket == bucket || entry.bucket == default_bucket)
+            .max_by_key(|entry| entry.resets_at)
     }
 
     /// Returns `true` if no active cooldown or exhausted window blocks `bucket` at `now`.
@@ -273,25 +291,53 @@ impl AccountStatus {
         })
     }
 
+    /// Returns the time at which all currently blocking limits will have lifted, if known.
+    #[must_use]
+    pub fn next_available_at(
+        &self,
+        bucket: &ModelBucket,
+        now: DateTime<Utc>,
+    ) -> Option<DateTime<Utc>> {
+        let default_bucket = ModelBucket::default_bucket();
+        let mut latest = self
+            .active_cooldown(bucket, now)
+            .map(|entry| entry.resets_at);
+        for window in self.windows.iter().filter(|window| {
+            (&window.bucket == bucket || window.bucket == default_bucket)
+                && window.is_exhausted_at(now)
+        }) {
+            let reset = window.resets_at?;
+            latest = Some(latest.map_or(reset, |known| known.max(reset)));
+        }
+        latest
+    }
+
     /// Returns the minimum known remaining percentage across windows covering `bucket`.
     #[must_use]
-    pub fn lowest_remaining_percent(&self, bucket: &ModelBucket) -> Option<RemainingPercent> {
+    pub fn lowest_remaining_percent(
+        &self,
+        bucket: &ModelBucket,
+        now: DateTime<Utc>,
+    ) -> Option<RemainingPercent> {
         let default_bucket = ModelBucket::default_bucket();
         self.windows
             .iter()
             .filter(|window| &window.bucket == bucket || window.bucket == default_bucket)
+            .filter(|window| window.resets_at.is_none_or(|reset| reset > now))
             .filter_map(|window| window.remaining)
             .min()
     }
 
     /// Returns the earliest known reset timestamp among windows covering `bucket`.
     #[must_use]
-    pub fn soonest_reset(&self, bucket: &ModelBucket) -> Option<DateTime<Utc>> {
+    pub fn soonest_reset(&self, bucket: &ModelBucket, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
         let default_bucket = ModelBucket::default_bucket();
         self.windows
             .iter()
             .filter(|window| &window.bucket == bucket || window.bucket == default_bucket)
+            .filter(|window| window.remaining.is_some())
             .filter_map(|window| window.resets_at)
+            .filter(|reset| *reset > now)
             .min()
     }
 
@@ -307,6 +353,36 @@ impl AccountStatus {
         let before = self.cooldowns.len();
         self.cooldowns.retain(|entry| &entry.bucket != bucket);
         self.cooldowns.len() < before
+    }
+
+    /// Reconciles probe-derived cooldowns with a new successful provider snapshot.
+    pub fn refresh_probe_windows(
+        &mut self,
+        windows: Vec<QuotaWindow>,
+        cooldowns: Vec<CooldownEntry>,
+        now: DateTime<Utc>,
+    ) {
+        self.windows = windows;
+        self.prune_expired(now);
+        self.cooldowns
+            .retain(|entry| !entry.reason.starts_with(AGY_PROBE_COOLDOWN_REASON_PREFIX));
+        self.clear_contradicted_passive_cooldowns();
+        for cooldown in cooldowns {
+            match self
+                .cooldowns
+                .iter_mut()
+                .find(|entry| entry.bucket == cooldown.bucket)
+            {
+                None => self.cooldowns.push(cooldown),
+                Some(entry)
+                    if entry.reason.starts_with(AGY_PROBE_COOLDOWN_REASON_PREFIX)
+                        && entry.resets_at < cooldown.resets_at =>
+                {
+                    *entry = cooldown;
+                }
+                Some(_) => {}
+            }
+        }
     }
 
     /// Removes passively detected cooldowns contradicted by fresh windows that still show quota.

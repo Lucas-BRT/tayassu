@@ -3,7 +3,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
 use tayassu_core::AccountConfig;
-use tayassu_providers::{AdapterRegistry, FAKE_HOME_SUBDIR, IsolationStrategy};
+use tayassu_providers::{AdapterRegistry, FAKE_HOME_SUBDIR, HostDiscovery, IsolationStrategy};
 use tayassu_store::XdgPaths;
 
 /// Sensitive credential filenames checked for overly permissive Unix file modes.
@@ -66,13 +66,19 @@ impl DoctorReport {
         for account in accounts {
             let subject = account.id.to_string();
             let exe = account.executable();
-            if executable_available(exe, &paths.home_dir, path_env.as_deref()) {
-                report.push(CheckLevel::Ok, &subject, format!("binary '{exe}' found"));
+            if let Some(path) =
+                HostDiscovery.resolve_executable(exe, &paths.home_dir, path_env.as_deref())
+            {
+                report.push(
+                    CheckLevel::Ok,
+                    &subject,
+                    format!("binary '{exe}' found at {}", path.display()),
+                );
             } else {
                 report.push(
                     CheckLevel::Error,
                     &subject,
-                    format!("binary '{exe}' not found in PATH"),
+                    format!("binary '{exe}' not found or not executable"),
                 );
             }
 
@@ -149,22 +155,6 @@ impl DoctorReport {
             message: message.into(),
         });
     }
-}
-
-fn executable_available(exe: &str, home_dir: &Path, path_env: Option<&std::ffi::OsStr>) -> bool {
-    let as_path = Path::new(exe);
-    if as_path.components().count() > 1 {
-        return as_path.is_file();
-    }
-    if let Some(raw_path) = path_env {
-        for dir in env::split_paths(raw_path) {
-            if dir.join(exe).is_file() {
-                return true;
-            }
-        }
-    }
-    home_dir.join(".local/bin").join(exe).is_file()
-        || home_dir.join(".opencode/bin").join(exe).is_file()
 }
 
 #[cfg(unix)]

@@ -1,4 +1,4 @@
-use crate::render::format_countdown;
+use crate::render::{format_countdown, render_login};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -701,10 +701,14 @@ fn quota_column_width(
 
 fn summarize_buckets(status: Option<&AccountStatus>, now: DateTime<Utc>) -> Vec<String> {
     let Some(st) = status else {
-        return vec!["-".to_owned()];
+        return vec!["unknown".to_owned()];
     };
     let mut buckets = BTreeSet::new();
-    for win in &st.windows {
+    for win in st
+        .windows
+        .iter()
+        .filter(|window| window.remaining.is_some())
+    {
         buckets.insert(win.bucket.clone());
     }
     for cd in &st.cooldowns {
@@ -713,14 +717,22 @@ fn summarize_buckets(status: Option<&AccountStatus>, now: DateTime<Utc>) -> Vec<
         }
     }
     if buckets.is_empty() {
-        return vec!["-".to_owned()];
+        return vec!["unknown".to_owned()];
     }
     buckets
         .iter()
         .map(|bucket| {
-            let pct = st
-                .lowest_remaining_percent(bucket)
-                .map_or_else(|| "ok".to_owned(), |val| val.to_string());
+            let pct = st.lowest_remaining_percent(bucket, now).map_or_else(
+                || "unknown".to_owned(),
+                |val| {
+                    let stale = if st.last_probe_error.is_some() {
+                        " stale"
+                    } else {
+                        ""
+                    };
+                    format!("{val}{stale}")
+                },
+            );
             if let Some(cd) = st.active_cooldown(bucket, now) {
                 let rem = cd
                     .remaining(now)
@@ -745,10 +757,11 @@ fn build_detail_lines<'a>(
     );
 
     lines.push(Line::from(format!(
-        "Account: {} ({})  |  Executable: {}  |  Last probe: {}",
+        "Account: {} ({})  |  Executable: {}  |  Login: {}  |  Last probe: {}",
         account.id,
         account.provider,
         account.executable(),
+        render_login(status),
         probed
     )));
 
@@ -770,14 +783,26 @@ fn build_detail_lines<'a>(
                 .windows
                 .iter()
                 .map(|win| {
-                    let pct = win
-                        .remaining
-                        .map_or_else(|| "ok".to_owned(), |val| val.to_string());
+                    let pct = win.remaining.map_or_else(
+                        || "unknown quota".to_owned(),
+                        |val| {
+                            if win.resets_at.is_some_and(|reset| reset <= now) {
+                                format!("{val} (expired)")
+                            } else {
+                                val.to_string()
+                            }
+                        },
+                    );
                     format!("{}/{}={}", win.bucket, win.window_name, pct)
                 })
                 .collect();
             lines.push(Line::from(format!(
-                "Windows: {}",
+                "Windows{}: {}",
+                if st.last_probe_error.is_some() {
+                    " (last successful probe)"
+                } else {
+                    ""
+                },
                 windows_summary.join("  ")
             )));
         }
@@ -877,7 +902,7 @@ mod tests {
         assert!(rendered.contains("agy-student"));
         assert!(rendered.contains("PARTIAL"));
         assert!(rendered.contains("gemini:47%"));
-        assert!(rendered.contains("claude:ok(1h30m)"));
+        assert!(rendered.contains("claude:unknown(1h30m)"));
     }
 
     #[test]

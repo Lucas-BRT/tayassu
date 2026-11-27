@@ -1,9 +1,9 @@
-use crate::atomic::write_atomic;
+use crate::atomic::{FileLock, write_atomic};
 use crate::error::StoreError;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::fs::{self, File, OpenOptions};
-use std::path::{Path, PathBuf};
+use std::fs;
+use std::path::Path;
 use tayassu_core::{AccountId, AccountStatus, ProviderKind};
 
 /// Current schema version written to `state.json`.
@@ -80,7 +80,7 @@ impl RuntimeState {
     where
         F: FnOnce(&mut Self) -> T,
     {
-        let _lock = StateLock::acquire(path)?;
+        let _lock = FileLock::acquire(path.with_file_name(STATE_LOCK_FILE_NAME))?;
         let mut state = Self::load(path)?;
         let result = mutate(&mut state);
         state.save_atomic(path)?;
@@ -126,42 +126,6 @@ impl RuntimeState {
         let key = cwd_provider_key(cwd, provider);
         self.last_account_by_cwd.get(&key)
     }
-}
-
-/// Exclusive advisory file lock guarding concurrent `state.json` mutations.
-struct StateLock {
-    _file: File,
-}
-
-impl StateLock {
-    fn acquire(state_path: &Path) -> Result<Self, StoreError> {
-        let lock_path = state_lock_path(state_path);
-        if let Some(parent) = lock_path.parent() {
-            fs::create_dir_all(parent).map_err(|source| StoreError::Io {
-                path: parent.to_path_buf(),
-                source,
-            })?;
-        }
-        let file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(&lock_path)
-            .map_err(|source| StoreError::Io {
-                path: lock_path.clone(),
-                source,
-            })?;
-        file.lock().map_err(|source| StoreError::Io {
-            path: lock_path,
-            source,
-        })?;
-        Ok(Self { _file: file })
-    }
-}
-
-fn state_lock_path(state_path: &Path) -> PathBuf {
-    state_path.with_file_name(STATE_LOCK_FILE_NAME)
 }
 
 fn cwd_provider_key(cwd: &Path, provider: ProviderKind) -> String {

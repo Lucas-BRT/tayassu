@@ -20,7 +20,8 @@ curl -fsSL https://raw.githubusercontent.com/Lucas-BRT/tayassu/main/install.sh |
 
 The script downloads the latest release binary for your architecture into
 `${TAYASSU_INSTALL_DIR:-$HOME/.local/bin}`. When no prebuilt asset matches the
-current platform, it falls back to `cargo install --git`.
+current platform, it falls back to `cargo install --git` using the same release
+tag. Downloaded archives are verified against their published SHA-256 checksum.
 
 Environment overrides:
 
@@ -45,10 +46,11 @@ cargo install --locked --path apps/tayassu
 # 1. Discover installed CLIs and copy their credentials into isolated profiles.
 tayassu import
 
-# 2. Authenticate any account that needs a fresh login.
-tayassu account login agy
+# 2. If import requests a fresh login, use the account ID it prints.
+tayassu account login agy-host
 
-# 3. Inspect quota and cooldown state.
+# 3. Check configured accounts and inspect their status.
+tayassu probe
 tayassu status
 
 # 4. Run an agent through the account router.
@@ -72,7 +74,10 @@ tayassu import --exclude copilot --priority 10
 ```
 
 Options: `--provider` (repeatable include filter), `--exclude` (repeatable),
-`--dry-run`, `--move-auth`, `--priority`.
+`--dry-run`, `--refresh`, `--move-auth`, `--priority`.
+
+Repeat imports skip registered accounts by default. Use `--refresh` to copy
+credentials again while retaining the existing label, priority and enabled state.
 
 ### `tayassu account`
 
@@ -81,12 +86,17 @@ tayassu account add agy-student agy --label "Student plan" --priority 10
 tayassu account add work-claude claude --binary /opt/claude/bin/claude
 tayassu account env agy-student
 tayassu account login agy-student
+tayassu account edit agy-student --label "Personal" --priority 20
+tayassu account disable agy-student
+tayassu account enable agy-student
 tayassu account remove agy-student
 ```
 
 - `add` creates the isolated profile directory and writes the account to `config.toml`.
 - `env` prints the profile directory and `export` lines for manual use.
 - `login` launches the provider CLI inside the isolated profile.
+- `edit` updates the label or priority.
+- `disable` pauses automatic selection for new sessions. `enable` restores it.
 - `remove` drops the account from `config.toml` but leaves profile data on disk.
 
 ### `tayassu run`
@@ -108,10 +118,11 @@ Options:
 | `--chain NAME`  | Use a named cross-provider fallback chain from `config.toml`.       |
 | `--model NAME`  | Model bucket to evaluate cooldowns against (default `default`).     |
 | `--policy NAME` | Override the selection policy (`priority`, `most-quota`, `soonest-reset`). |
-| `--dry-run`     | Print the selected account and environment without spawning.        |
-| `--failover`    | Retry once on the next available account after a rate limit.        |
+| `--dry-run`     | Explain the selection and print the environment without modifying profiles or state.        |
+| `--failover`    | Retry once on a different account after a rate limit. Requires automatic routing.        |
 
-Arguments after `--` are passed verbatim to the underlying CLI.
+Arguments after `--` are passed verbatim to the underlying CLI. Resuming a
+conversation on its previous account keeps the session on that account.
 
 ### `tayassu status`
 
@@ -121,13 +132,16 @@ tayassu status --provider claude
 tayassu status --model claude
 ```
 
-Prints remaining quota, cooldown windows, and active sessions per account.
+Shows login status, measured quota, cooldowns, last probe time and active sessions per account.
+Providers that only report authentication show `unknown` quota. Probe failures include the cause and a recovery command.
 
 ### `tayassu dash`
 
 Interactive terminal dashboard. `r` probes every account, `c` clears cooldowns
 for the selected account, and `q` quits. Quota is shown per model bucket, one
-line per bucket, with active cooldown countdowns.
+line per bucket, with active cooldown countdowns. The details show login status
+and the last probe attempt. If the probe fails, earlier quota readings appear
+as stale. Windows marked `disabled` by AGY are omitted from the quota display.
 
 ### `tayassu probe`
 
@@ -177,6 +191,10 @@ eval "$(tayassu shell-init bash)"
 eval "$(tayassu shell-init zsh --failover)"
 tayassu shell-init fish | source
 ```
+
+Enables autocompletion for Tayassu commands, flags, providers, account IDs and
+fallback chains. In Zsh, initialize completion with `compinit` before evaluating
+the snippet.
 
 Generates wrapper functions that route `agy`, `claude`, `codex`, `copilot`, and
 `opencode` through `tayassu run`. Bypass a wrapper with `command <cli> ...`.
@@ -257,7 +275,8 @@ agy = "agy-student"
 | `$XDG_DATA_HOME/tayassu/profiles/<account>/` | Isolated per-account profiles.            |
 
 `config.toml` and `state.json` are written atomically; `state.json` updates take
-an exclusive file lock, so concurrent runs and background probes are safe.
+an exclusive file lock, and account management and imports use a separate
+lock for configuration changes.
 
 ## Troubleshooting
 
