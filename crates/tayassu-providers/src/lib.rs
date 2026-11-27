@@ -513,11 +513,10 @@ OpenRouter      OpenRouter                  stored
         env.prepare(real_home.path()).expect("prepare");
 
         fs::write(env.profile_dir.join("config.json"), "{}").expect("write config");
-        let parsed = CopilotAdapter
-            .probe_local(&account, &env, Utc::now())
-            .expect("local probe should be supported")
-            .expect("config.json should authenticate profile");
-        assert_eq!(parsed.windows.len(), 1);
+        assert!(matches!(
+            CopilotAdapter.probe_local(&account, &env, Utc::now()),
+            Some(Err(ProviderError::AuthenticationUnverified { .. }))
+        ));
     }
 
     #[cfg(unix)]

@@ -63,7 +63,15 @@ removed after a verified copy.
 
 ## Connect two accounts from the same provider
 
-Each account ID gets its own profile, including credentials and local sessions.
+Each account ID gets its own profile directory. Credential isolation depends on
+where the provider stores its login.
+
+**Antigravity CLI 1.5.18 on Pop!_OS 24.04:** Two Tayassu profiles under the
+same desktop login can use the same Google account. Both query the desktop
+Secret Service for the same OAuth entry. Signing in through the second profile
+can therefore change the identity used by the first, even with
+`tayassu run --account <id>`. Use one managed agy identity per desktop login
+until private keyring support is available.
 For example, to keep a personal and a work Codex account signed in:
 
 ```bash
@@ -340,7 +348,9 @@ tayassu shell-init fish | source
 ```
 
 Enables autocompletion for Tayassu commands, flags, providers, account IDs and
-fallback chains. In Zsh, initialize completion with `compinit` before evaluating
+fallback chains. After `tayassu run `, Tab suggests providers with enabled accounts
+in the current configuration. Use `--account` to complete an account ID.
+Account registration offers every supported provider. In Zsh, initialize completion with `compinit` before evaluating
 the snippet.
 
 Generates wrapper functions that route `agy`, `claude`, `codex`, `copilot`, and
