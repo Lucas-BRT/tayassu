@@ -1,6 +1,20 @@
 use anyhow::{Result, bail};
+use std::fmt;
 use tayassu_core::AccountConfig;
 use tayassu_providers::ProfileEnvironment;
+
+/// Typed error returned when an account's private keyring is locked or uninitialized
+/// during a non-interactive operation.
+#[derive(Debug)]
+pub(crate) struct KeyringLockedError(pub(crate) String);
+
+impl fmt::Display for KeyringLockedError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for KeyringLockedError {}
 
 #[derive(Clone, Copy)]
 pub(crate) enum Operation {
@@ -200,10 +214,12 @@ mod linux {
                 Operation::Run => collection != "/" && std::io::stdin().is_terminal(),
                 Operation::Probe => false,
             };
-            ensure!(
-                can_unlock,
-                "keyring is locked or uninitialized; run 'tayassu login {account}' in a terminal"
-            );
+            if !can_unlock {
+                return Err(super::KeyringLockedError(format!(
+                    "keyring is locked or uninitialized; run 'tayassu login {account}' in a terminal"
+                ))
+                .into());
+            }
             unlock(profile, &runtime, &address, account)?;
             ensure!(
                 !collection_locked(&address, LOGIN_COLLECTION)?,

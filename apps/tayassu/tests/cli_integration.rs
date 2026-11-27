@@ -1802,3 +1802,63 @@ fn shell_completion_filters_by_provider_state_and_models() {
         "{probe_out}"
     );
 }
+
+#[test]
+fn rm_purge_deletes_profile_and_doctor_warns_on_orphans() {
+    let env = TestEnv::new();
+    let mock = env.write_mock_script("mock-claude.sh", "#!/bin/sh\nexit 0\n");
+
+    env.run_ok(&["add", "claude", "keep-me", "--no-login", "--binary", &mock]);
+    env.run_ok(&["add", "claude", "purge-me", "--no-login", "--binary", &mock]);
+    env.run_ok(&["add", "claude", "active", "--no-login", "--binary", &mock]);
+
+    let kept_profile = env.dir.path().join("data/tayassu/profiles/claude/keep-me");
+    let purged_profile = env.dir.path().join("data/tayassu/profiles/claude/purge-me");
+    assert!(kept_profile.is_dir());
+    assert!(purged_profile.is_dir());
+
+    let rm_keep = env.run_ok(&["rm", "keep-me"]);
+    assert!(rm_keep.contains("pass --purge to delete"), "{rm_keep}");
+    assert!(kept_profile.is_dir());
+
+    let rm_purge = env.run_ok(&["rm", "purge-me", "--purge"]);
+    assert!(rm_purge.contains("deleted"), "{rm_purge}");
+    assert!(!purged_profile.exists());
+
+    let doctor = env.run_ok(&["doctor"]);
+    assert!(doctor.contains("orphaned profile directory"), "{doctor}");
+    assert!(doctor.contains("keep-me"), "{doctor}");
+    assert!(!doctor.contains("purge-me"), "{doctor}");
+}
+
+#[test]
+fn ls_renders_locked_state_separately_from_auth_and_error() {
+    let env = TestEnv::new();
+    env.run_ok(&["add", "agy", "agy-locked", "--no-login"]);
+
+    let state_dir = env.dir.path().join("state/tayassu");
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::write(
+        state_dir.join("state.json"),
+        r#"{
+  "statuses": [
+    {
+      "account_id": "agy-locked",
+      "last_probed_at": null,
+      "windows": [],
+      "cooldowns": [],
+      "last_probe_error": {
+        "kind": "locked",
+        "message": "keyring is locked or uninitialized; run 'tayassu login agy-locked' in a terminal"
+      }
+    }
+  ]
+}"#,
+    )
+    .unwrap();
+
+    let table = env.run_ok(&["ls"]);
+    assert!(table.contains("LOCKED"), "{table}");
+    assert!(table.contains("locked"), "{table}");
+    assert!(table.contains("tayassu run agy-locked"), "{table}");
+}

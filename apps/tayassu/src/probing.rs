@@ -158,7 +158,7 @@ pub fn probe_accounts(
                 Err(err) => {
                     err_count += 1;
                     let failure = classify_failure(&err);
-                    if failure.is_authentication() {
+                    if failure.is_authentication() || failure.is_locked() {
                         auth_failures += 1;
                     }
                     status.set_probe_failure(failure);
@@ -198,6 +198,11 @@ fn classify_failure(err: &anyhow::Error) -> ProbeFailure {
         Some(ProviderError::AuthenticationRequired { .. })
     ) {
         ProbeFailure::authentication(err.to_string())
+    } else if err
+        .downcast_ref::<crate::agy_keyring::KeyringLockedError>()
+        .is_some()
+    {
+        ProbeFailure::locked(format!("{err:#}"))
     } else {
         ProbeFailure::other(format!("{err:#}"))
     }

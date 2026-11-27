@@ -178,6 +178,8 @@ impl CooldownEntry {
 pub enum ProbeFailureKind {
     /// The isolated profile has no valid credentials.
     Authentication,
+    /// The profile's private keyring is locked or uninitialized.
+    Locked,
     /// Any other probe failure.
     Other,
 }
@@ -201,6 +203,15 @@ impl ProbeFailure {
         }
     }
 
+    /// Creates a locked-keyring failure.
+    #[must_use]
+    pub fn locked(message: impl Into<String>) -> Self {
+        Self {
+            kind: ProbeFailureKind::Locked,
+            message: message.into(),
+        }
+    }
+
     /// Creates a non-authentication failure.
     #[must_use]
     pub fn other(message: impl Into<String>) -> Self {
@@ -214,6 +225,12 @@ impl ProbeFailure {
     #[must_use]
     pub const fn is_authentication(&self) -> bool {
         matches!(self.kind, ProbeFailureKind::Authentication)
+    }
+
+    /// Returns `true` when the profile's private keyring is locked or uninitialized.
+    #[must_use]
+    pub const fn is_locked(&self) -> bool {
+        matches!(self.kind, ProbeFailureKind::Locked)
     }
 }
 

@@ -68,7 +68,7 @@ provider. An error during removal can still leave some originals already moved.
 | ------- | ----- | ------- |
 | `ls [provider]` | (bare `tayassu`) | Quota, cooldowns and sessions per account; `--json`. |
 | `add <provider> [id]` | | Register an account and log in (`--no-login` to skip). |
-| `rm <id>` | | Remove an account from `config.toml`. |
+| `rm <id>` | | Remove an account from `config.toml` (`--purge` also deletes profile files). |
 | `login <id>` | | Re-authenticate inside the isolated profile. |
 | `import` | | Discover installed CLIs and import credentials. |
 | `use [account]` | | Pin account, `--chain` or `--policy` for this project (`.tayassu.toml`); `--global` for the policy. |
@@ -150,6 +150,7 @@ for the selected account, and `q` quits.
 
 ```bash
 tayassu probe
+tayassu probe agy             # probe every account for a provider
 tayassu probe agy-student
 tayassu probe --notify
 ```
