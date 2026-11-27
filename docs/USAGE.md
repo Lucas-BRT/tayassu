@@ -20,7 +20,8 @@ curl -fsSL https://raw.githubusercontent.com/Lucas-BRT/tayassu/main/install.sh |
 
 The script downloads the latest release binary for your architecture into
 `${TAYASSU_INSTALL_DIR:-$HOME/.local/bin}`. When no prebuilt asset matches the
-current platform, it falls back to `cargo install --git`.
+current platform, it falls back to `cargo install --git` using the same release
+tag. Downloaded archives are verified against their published SHA-256 checksum.
 
 Environment overrides:
 

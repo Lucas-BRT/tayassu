@@ -48,3 +48,12 @@ git config core.hooksPath .githooks
 cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo nextest run --locked --workspace
 ```
+
+
+## Releases
+
+After promoting `develop` to `main` through a pull request, tag the release commit.
+The tag must match the workspace version in `Cargo.toml` and the lockfile must be
+up to date. The tag workflow reruns CI, builds and smoke-tests Linux binaries on
+x86_64 and ARM64, then publishes both archives and their SHA-256 checksums to
+GitHub Releases.
