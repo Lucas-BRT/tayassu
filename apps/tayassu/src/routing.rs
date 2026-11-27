@@ -153,6 +153,12 @@ impl App {
             let executable = account_executable(&account, &self.paths.home_dir);
             info!(account = %account.id, executable = %executable.display(), "launching agent CLI");
             let arguments = req.arguments_for(account.provider, &bucket)?;
+            #[cfg(target_os = "linux")]
+            if account.provider == ProviderKind::Codex
+                && !arguments.iter().any(|arg| arg == "--no-daemon")
+            {
+                crate::codex_daemon::restore_missing_link(&env_profile.profile_dir);
+            }
             let outcome =
                 spawn_capturing_stderr(&account, &executable, &env_profile.env_vars, &arguments)?;
 

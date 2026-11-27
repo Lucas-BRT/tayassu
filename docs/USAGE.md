@@ -269,6 +269,10 @@ an exclusive file lock, so concurrent runs and background probes are safe.
 - **Login required**: run `tayassu login <id>`; some providers require a
   fresh OAuth flow after credentials are copied.
 - **Broken profile links**: run `tayassu doctor --strict`.
+- **Codex app-server does not become ready**: on Linux, tayassu can restore a
+  missing control link when the selected profile's daemon is still listening.
+  If the daemon is unavailable, try `tayassu run codex -- --no-daemon`.
+  Refer to the Codex error for resume and fork arguments.
 - **A provider stopped working after an upgrade**: run `tayassu providers update`, then
   `tayassu doctor`.
 - **Wrapper loops or wrong account**: call the CLI directly with

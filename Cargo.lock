@@ -1877,6 +1877,7 @@ dependencies = [
  "mockall",
  "portable-pty",
  "ratatui",
+ "rustix",
  "semver",
  "serde",
  "serde_json",

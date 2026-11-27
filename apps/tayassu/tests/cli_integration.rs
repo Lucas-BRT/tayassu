@@ -768,6 +768,19 @@ fn bash_wrapper_routes_configured_accounts_and_does_not_bypass_disabled_accounts
 
 #[cfg(unix)]
 #[test]
+fn codex_run_forwards_no_daemon_to_the_configured_provider() {
+    let env = TestEnv::new();
+    let mock = env.write_mock_script(
+        "codex-mock",
+        "#!/bin/sh\nprintf 'codex args: %s\\n' \"$*\"\n",
+    );
+    env.run_ok(&["add", "codex", "work", "--no-login", "--binary", &mock]);
+    let output = env.run_ok(&["run", "codex", "--", "--no-daemon"]);
+    assert!(output.contains("codex args: --no-daemon"), "{output}");
+}
+
+#[cfg(unix)]
+#[test]
 fn project_policy_resume_memory_and_fallback_chain() {
     let env = TestEnv::new();
     let repo_dir = env.dir.path().join("my-work-repo");
