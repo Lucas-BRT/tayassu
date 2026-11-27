@@ -258,7 +258,7 @@ fn host_files_for(provider: ProviderKind, real_home: &Path) -> Vec<MigrationFile
                 real_home,
                 ".config/opencode/service.json",
                 ".config/opencode/service.json",
-                true,
+                false,
             ),
             mig_file(
                 real_home,
