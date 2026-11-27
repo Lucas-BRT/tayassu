@@ -118,5 +118,8 @@ case ":${PATH}:" in
   *) log "Add ${INSTALL_DIR} to PATH to run ${BIN_NAME} directly." ;;
 esac
 
+# Configure tab completion for bash/zsh/fish (non-fatal).
+"${INSTALL_DIR}/${BIN_NAME}" install-completions || log "Warning: could not configure shell completions."
+
 # Print final version.
 "${INSTALL_DIR}/${BIN_NAME}" --version

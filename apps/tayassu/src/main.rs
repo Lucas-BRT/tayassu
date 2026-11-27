@@ -1,4 +1,5 @@
 mod cli;
+mod completion;
 mod doctor;
 mod render;
 mod shell;
@@ -7,8 +8,10 @@ mod tui;
 
 use anyhow::{Context, Result, bail};
 use chrono::{TimeDelta, Utc};
-use clap::Parser;
+use clap::{CommandFactory, Parser};
+use clap_complete::CompleteEnv;
 use cli::{AccountAction, Cli, Command, CooldownAction};
+use completion::CompletionInstaller;
 use doctor::DoctorReport;
 use render::StatusTable;
 use shell::ShellInit;
@@ -192,6 +195,21 @@ impl App {
             } => {
                 let snippet = ShellInit::new(shell, providers, failover).render();
                 write!(out, "{snippet}").context("failed to write shell-init snippet")
+            }
+            Command::InstallCompletions => {
+                let home = env::var_os("HOME")
+                    .map(PathBuf::from)
+                    .context("HOME is not set")?;
+                let report = CompletionInstaller::new(home)
+                    .install()
+                    .context("failed to install shell completions")?;
+                if report.is_empty() {
+                    writeln!(out, "shell completions already configured")?;
+                }
+                for line in report {
+                    writeln!(out, "{line}")?;
+                }
+                Ok(())
             }
             Command::SystemdUnit {
                 interval_minutes,
@@ -1131,6 +1149,7 @@ fn bail_unknown_probe_panic() -> (AccountId, Result<ProbeOutput>) {
 }
 
 fn main() -> Result<()> {
+    CompleteEnv::with_factory(Cli::command).complete();
     init_tracing();
     install_ctrlc_handler();
     let cli = Cli::parse();

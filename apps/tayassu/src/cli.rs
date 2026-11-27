@@ -1,6 +1,8 @@
+use crate::completion;
 use crate::shell::ShellKind;
 use crate::systemd::DEFAULT_PROBE_INTERVAL_MINUTES;
 use clap::{Parser, Subcommand};
+use clap_complete::engine::ArgValueCandidates;
 use tayassu_core::{
     AccountId, DEFAULT_ACCOUNT_PRIORITY, ModelBucket, ProviderKind, SelectionPolicy,
 };
@@ -23,7 +25,7 @@ pub enum Command {
     /// Display a compact status table for all configured accounts and cooldowns.
     Status {
         /// Filter output to a single provider.
-        #[arg(long)]
+        #[arg(long, add = ArgValueCandidates::new(completion::configured_providers))]
         provider: Option<ProviderKind>,
         /// Model bucket to evaluate availability against.
         #[arg(long)]
@@ -37,18 +39,19 @@ pub enum Command {
     Run {
         /// Provider to invoke (`agy`, `claude`, `codex`, `copilot`, `opencode`, `custom`).
         /// Optional when `--account` or `--chain` (or `.tayassu.toml` `fallback_chain`) is used.
+        #[arg(add = ArgValueCandidates::new(completion::configured_providers))]
         provider: Option<ProviderKind>,
         /// Force a specific account id instead of routing automatically.
-        #[arg(long)]
+        #[arg(long, add = ArgValueCandidates::new(completion::account_ids))]
         account: Option<AccountId>,
         /// Use a named cross-provider fallback chain from `config.toml`.
-        #[arg(long)]
+        #[arg(long, add = ArgValueCandidates::new(completion::chain_names))]
         chain: Option<String>,
         /// Model bucket to check cooldowns against (defaults to `default`).
         #[arg(long)]
         model: Option<ModelBucket>,
         /// Override the configured account selection policy.
-        #[arg(long)]
+        #[arg(long, add = ArgValueCandidates::new(completion::policies))]
         policy: Option<SelectionPolicy>,
         /// Print the chosen account and isolated environment without spawning the CLI.
         #[arg(long)]
@@ -78,7 +81,7 @@ pub enum Command {
     /// Probe usage/cooldown state across configured accounts.
     Probe {
         /// Limit probing to a single account id.
-        #[arg(long)]
+        #[arg(long, add = ArgValueCandidates::new(completion::account_ids))]
         id: Option<AccountId>,
         /// Send a desktop notification (`notify-send`) when a previously active cooldown clears.
         #[arg(long)]
@@ -117,6 +120,9 @@ pub enum Command {
         failover: bool,
     },
 
+    /// Configure tab completion for bash, zsh and fish (idempotent; run by `install.sh`).
+    InstallCompletions,
+
     /// Generate or install `systemd --user` service and timer units for background probing.
     SystemdUnit {
         /// Background probe interval in minutes.
@@ -137,7 +143,7 @@ pub enum Command {
     /// Run each installed CLI's native self-updater using the real host `$HOME`.
     Update {
         /// Restrict updates to a single provider.
-        #[arg(long)]
+        #[arg(long, add = ArgValueCandidates::new(completion::configured_providers))]
         provider: Option<ProviderKind>,
         /// Print updater commands without executing them.
         #[arg(long)]
@@ -168,18 +174,21 @@ pub enum AccountAction {
     /// Remove an account from `config.toml` (leaves profile data on disk untouched).
     Remove {
         /// Account identifier to remove.
+        #[arg(add = ArgValueCandidates::new(completion::account_ids))]
         id: AccountId,
     },
 
     /// Print the isolated profile directory and environment overrides for an account.
     Env {
         /// Account identifier to inspect.
+        #[arg(add = ArgValueCandidates::new(completion::account_ids))]
         id: AccountId,
     },
 
     /// Launch the provider CLI interactively inside the account's isolated profile to log in.
     Login {
         /// Account identifier to authenticate.
+        #[arg(add = ArgValueCandidates::new(completion::account_ids))]
         id: AccountId,
     },
 }
@@ -190,6 +199,7 @@ pub enum CooldownAction {
     /// Mark an account (and optional model bucket) as cooling down.
     Set {
         /// Account identifier.
+        #[arg(add = ArgValueCandidates::new(completion::account_ids))]
         id: AccountId,
         /// Cooldown duration in minutes.
         #[arg(long, default_value_t = DEFAULT_MANUAL_COOLDOWN_MINUTES)]
@@ -205,6 +215,7 @@ pub enum CooldownAction {
     /// Clear a recorded cooldown for an account.
     Clear {
         /// Account identifier.
+        #[arg(add = ArgValueCandidates::new(completion::account_ids))]
         id: AccountId,
         /// Model bucket to clear (defaults to `default`).
         #[arg(long)]
