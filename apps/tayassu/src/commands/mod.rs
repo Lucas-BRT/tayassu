@@ -11,9 +11,9 @@ mod probe;
 mod providers;
 mod rm;
 mod run;
-mod self_update;
 mod setup;
 mod uninstall;
+mod update;
 mod use_;
 
 use crate::app::{App, Execute};
@@ -54,7 +54,7 @@ pub enum Command {
     /// Read or write global settings.
     Config(config::Config),
     /// Update tayassu itself.
-    SelfUpdate(self_update::SelfUpdate),
+    Update(update::Update),
     /// Manage installed provider CLIs.
     Providers(providers::Providers),
     /// Remove tayassu hooks, timer, and binary.
@@ -62,6 +62,9 @@ pub enum Command {
     /// Manage cooldowns by hand.
     #[command(hide = true)]
     Cooldown(cooldown::Cooldown),
+    /// Internal background release check spawned by the update notifier.
+    #[command(name = "__check-update", hide = true)]
+    CheckUpdate,
 }
 
 impl Default for Command {
@@ -87,10 +90,15 @@ impl Execute for Command {
             Self::Activate(c) => c.execute(app, out),
             Self::Setup(c) => c.execute(app, out),
             Self::Config(c) => c.execute(app, out),
-            Self::SelfUpdate(c) => c.execute(app, out),
+            Self::Update(c) => c.execute(app, out),
             Self::Providers(c) => c.execute(app, out),
             Self::Uninstall(c) => c.execute(app, out),
             Self::Cooldown(c) => c.execute(app, out),
+            Self::CheckUpdate => crate::update_notifier::UpdateNotifier::refresh_cache(
+                &crate::release::GitHubReleases::new(),
+                &app.paths.state_file,
+                chrono::Utc::now(),
+            ),
         }
     }
 }

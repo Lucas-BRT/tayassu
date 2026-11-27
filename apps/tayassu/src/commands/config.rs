@@ -1,5 +1,5 @@
 use crate::app::{App, Execute};
-use anyhow::Result;
+use anyhow::{Result, bail};
 use clap::{Args, Subcommand, ValueEnum};
 use std::io::Write;
 use tayassu_store::AppConfig;
@@ -19,28 +19,39 @@ trait ConfigSetting {
 enum Setting {
     /// Default account selection policy.
     DefaultPolicy,
+    /// Background release check and terminal update notice (`on`/`off`).
+    UpdateCheck,
 }
 
 impl Setting {
-    const ALL: [Self; 1] = [Self::DefaultPolicy];
+    const ALL: [Self; 2] = [Self::DefaultPolicy, Self::UpdateCheck];
 }
 
 impl ConfigSetting for Setting {
     fn key(&self) -> &'static str {
         match self {
             Self::DefaultPolicy => "default-policy",
+            Self::UpdateCheck => "update-check",
         }
     }
 
     fn get(&self, config: &AppConfig) -> String {
         match self {
             Self::DefaultPolicy => config.default_policy.to_string(),
+            Self::UpdateCheck => if config.update_check { "on" } else { "off" }.to_owned(),
         }
     }
 
     fn set(&self, config: &mut AppConfig, raw: &str) -> Result<()> {
         match self {
             Self::DefaultPolicy => config.default_policy = raw.parse()?,
+            Self::UpdateCheck => {
+                config.update_check = match raw.trim().to_ascii_lowercase().as_str() {
+                    "on" | "true" | "yes" | "1" => true,
+                    "off" | "false" | "no" | "0" => false,
+                    _ => bail!("invalid boolean '{raw}'; expected on/off"),
+                };
+            }
         }
         Ok(())
     }

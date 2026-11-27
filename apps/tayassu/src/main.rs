@@ -5,23 +5,27 @@ mod commands;
 mod completion;
 mod doctor;
 mod probing;
+mod release;
 mod render;
 mod session;
 mod shell;
 mod spawn;
 mod systemd;
 mod tui;
+mod update_notifier;
 
 use anyhow::Result;
 use app::{App, Execute};
+use chrono::Utc;
 use clap::{CommandFactory, Parser};
 use clap_complete::CompleteEnv;
 use cli::Cli;
 use session::{RECEIVED_INT, install_ctrlc_handler, process_is_alive};
-use std::io;
+use std::io::{self, IsTerminal};
 use std::sync::atomic::Ordering;
 use tayassu_store::RuntimeState;
 use tracing_subscriber::EnvFilter;
+use update_notifier::UpdateNotifier;
 
 /// Default tracing filter when `RUST_LOG` is unset.
 const DEFAULT_LOG_FILTER: &str = "warn";
@@ -34,6 +38,11 @@ fn main() -> Result<()> {
     let mut app = App::load()?;
     let mut stdout = io::stdout().lock();
 
+    let skip_update_check = UpdateNotifier::should_skip(cli.command.as_ref(), &app.config);
+    if !skip_update_check {
+        UpdateNotifier::maybe_spawn_background(&app.paths.state_file, Utc::now());
+    }
+
     // Run the CLI; if SIGINT was received, perform explicit session cleanup before exiting.
     let result = cli
         .command
@@ -45,6 +54,11 @@ fn main() -> Result<()> {
                 status.prune_sessions(process_is_alive);
             }
         });
+    }
+    if !skip_update_check && result.is_ok() {
+        let mut stderr = io::stderr().lock();
+        let is_tty = stderr.is_terminal();
+        UpdateNotifier::maybe_notify(&app.paths.state_file, Utc::now(), is_tty, &mut stderr);
     }
     result
 }
