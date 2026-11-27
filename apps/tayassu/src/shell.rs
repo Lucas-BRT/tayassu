@@ -54,6 +54,24 @@ pub fn chain_candidates() -> Vec<CompletionCandidate> {
     })
 }
 
+/// Providers with at least one enabled account, listed once per provider.
+pub fn runnable_provider_candidates() -> Vec<CompletionCandidate> {
+    load_completion_config().map_or_else(Vec::new, |config| {
+        DEFAULT_SHELL_PROVIDERS
+            .iter()
+            .copied()
+            .chain([ProviderKind::Custom])
+            .filter(|provider| {
+                config
+                    .accounts
+                    .iter()
+                    .any(|a| a.enabled && a.provider == *provider)
+            })
+            .map(|provider| CompletionCandidate::new(provider.as_str()))
+            .collect()
+    })
+}
+
 pub fn provider_candidates() -> Vec<CompletionCandidate> {
     DEFAULT_SHELL_PROVIDERS
         .iter()

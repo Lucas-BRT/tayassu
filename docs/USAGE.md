@@ -348,7 +348,9 @@ tayassu shell-init fish | source
 ```
 
 Enables autocompletion for Tayassu commands, flags, providers, account IDs and
-fallback chains. In Zsh, initialize completion with `compinit` before evaluating
+fallback chains. After `tayassu run `, Tab suggests providers with enabled accounts
+in the current configuration. Use `--account` to complete an account ID.
+Account registration offers every supported provider. In Zsh, initialize completion with `compinit` before evaluating
 the snippet.
 
 Generates wrapper functions that route `agy`, `claude`, `codex`, `copilot`, and

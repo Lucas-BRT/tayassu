@@ -636,7 +636,9 @@ fn shell_completion_reads_current_accounts_providers_and_chains() {
     .expect("add chain");
 
     for (index, args, expected) in [
+        ("1", vec!["acc"], "account"),
         ("2", vec!["run", "co"], "codex"),
+        ("4", vec!["auto", "run", "--chain", "wo"], "work-chain"),
         ("3", vec!["run", "--account", "wo"], "work-codex"),
         ("3", vec!["run", "--chain", "wo"], "work-chain"),
         ("2", vec!["run", "--dry"], "--dry-run"),
@@ -655,6 +657,9 @@ fn shell_completion_reads_current_accounts_providers_and_chains() {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
+        if args == ["run", "co"] {
+            assert!(!String::from_utf8_lossy(&output.stdout).contains("copilot"));
+        }
         assert!(
             String::from_utf8_lossy(&output.stdout).contains(expected),
             "{args:?}"

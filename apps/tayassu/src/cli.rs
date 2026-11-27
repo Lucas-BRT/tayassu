@@ -1,5 +1,7 @@
 use crate::shell::ShellKind;
-use crate::shell::{account_candidates, chain_candidates, provider_candidates};
+use crate::shell::{
+    account_candidates, chain_candidates, provider_candidates, runnable_provider_candidates,
+};
 use crate::systemd::DEFAULT_PROBE_INTERVAL_MINUTES;
 use clap::{Args, Parser, Subcommand};
 use clap_complete::ArgValueCandidates;
@@ -50,7 +52,7 @@ pub enum Command {
     Run {
         /// Provider to invoke (`agy`, `claude`, `codex`, `copilot`, `opencode`, `custom`).
         /// Optional when `--account` or `--chain` (or `.tayassu.toml` `fallback_chain`) is used.
-        #[arg(add = ArgValueCandidates::new(provider_candidates))]
+        #[arg(add = ArgValueCandidates::new(runnable_provider_candidates))]
         provider: Option<ProviderKind>,
         /// Force a specific account id instead of routing automatically.
         #[arg(long)]
@@ -157,7 +159,7 @@ pub enum AutoAction {
     /// Select a configured fallback target with confirmed quota and launch it.
     Run {
         /// Override the configured fallback chain.
-        #[arg(long)]
+        #[arg(long, add = ArgValueCandidates::new(chain_candidates))]
         chain: Option<String>,
         /// Show the selected target using the last recorded quota.
         #[arg(long)]
