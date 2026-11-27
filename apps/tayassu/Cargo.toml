@@ -12,26 +12,27 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 chrono.workspace = true
-clap.workspace = true
-clap_complete.workspace = true
 flate2.workspace = true
 semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 tar.workspace = true
+clap.workspace = true
+clap_complete.workspace = true
 crossterm.workspace = true
 ratatui.workspace = true
-ctrlc = "3.2"
+portable-pty.workspace = true
+vt100.workspace = true
+ureq.workspace = true
+tempfile.workspace = true
+ctrlc.workspace = true
 tayassu-core.workspace = true
 tayassu-providers.workspace = true
 tayassu-store.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-ureq.workspace = true
 
-[dev-dependencies]
-tempfile.workspace = true
 
 [lints]
 workspace = true

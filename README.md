@@ -12,7 +12,7 @@ When you hold multiple legitimately paid or granted subscription accounts across
 curl -fsSL https://raw.githubusercontent.com/Lucas-BRT/tayassu/main/install.sh | bash
 ```
 
-The script downloads the latest release binary into `${TAYASSU_INSTALL_DIR:-$HOME/.local/bin}` and falls back to `cargo install` when no prebuilt asset matches your platform. The script also runs `tayassu setup --no-systemd` to configure shell wrappers and tab completion for bash, zsh and fish. You can also build from source (then run `tayassu setup` yourself):
+The script downloads the latest release binary into `${TAYASSU_INSTALL_DIR:-$HOME/.local/bin}` and falls back to `cargo install` when no prebuilt asset matches your platform. It also runs `tayassu setup --no-systemd` to configure shell wrappers and tab completion for bash, zsh, and fish. You can also build from source (then run `tayassu setup` yourself):
 
 ```bash
 cargo install --locked --path apps/tayassu
@@ -22,10 +22,17 @@ cargo install --locked --path apps/tayassu
 
 ```bash
 tayassu import          # discover installed CLIs and copy credentials into isolated profiles
-tayassu add agy
-tayassu            # list accounts, quota and cooldowns
-tayassu run claude -- "explain this repository"
+tayassu status
+# If import requests a login, use the reported account ID, for example:
+# tayassu account login agy-host
+tayassu probe
+tayassu run claude --dry-run -- --help
+tayassu run claude -- --help
 ```
+
+For more setup options, see how to
+[connect two accounts from the same provider](docs/USAGE.md#connect-two-accounts-from-the-same-provider)
+or [let Tayassu choose a provider](docs/USAGE.md#let-tayassu-choose-a-provider).
 
 ## Documentation
 
@@ -45,3 +52,12 @@ git config core.hooksPath .githooks
 cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo nextest run --locked --workspace
 ```
+
+
+## Releases
+
+After promoting `develop` to `main` through a pull request, tag the release commit.
+The tag must match the workspace version in `Cargo.toml` and the lockfile must be
+up to date. The tag workflow reruns CI, builds and smoke-tests Linux binaries on
+x86_64 and ARM64, then publishes both archives and their SHA-256 checksums to
+GitHub Releases.

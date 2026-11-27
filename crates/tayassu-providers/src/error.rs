@@ -33,6 +33,13 @@ pub enum ProviderError {
         account_id: AccountId,
     },
 
+    /// Local configuration cannot establish which account the CLI authenticated.
+    #[error("unable to verify Copilot authentication for account '{account_id}'")]
+    AuthenticationUnverified {
+        /// Profile whose authentication could not be verified.
+        account_id: AccountId,
+    },
+
     /// Provider usage output could not be parsed.
     #[error("failed to parse usage output for provider '{provider}': {reason}")]
     ParseUsage {

@@ -1,4 +1,3 @@
-use crate::session::process_is_alive;
 use anyhow::{Context, Result};
 use std::io::Write;
 use tayassu_core::{AccountConfig, AccountId};
@@ -35,26 +34,6 @@ impl App {
         })
     }
 
-    /// Drops sessions left behind by `tayassu` processes that were killed before cleanup.
-    pub fn prune_stale_sessions(&mut self) -> Result<()> {
-        if !self
-            .state
-            .statuses
-            .iter()
-            .any(|status| status.sessions_stale(process_is_alive))
-        {
-            return Ok(());
-        }
-        let (updated, ()) = RuntimeState::update_locked(&self.paths.state_file, |state| {
-            for status in &mut state.statuses {
-                status.prune_sessions(process_is_alive);
-            }
-        })
-        .with_context(|| format!("failed to save {}", self.paths.state_file.display()))?;
-        self.state = updated;
-        Ok(())
-    }
-
     /// Atomically persists `config.toml`.
     pub fn save_config(&self) -> Result<()> {
         self.config
@@ -67,5 +46,16 @@ impl App {
         self.config
             .find_account(id)
             .with_context(|| format!("account '{id}' not found"))
+    }
+
+    /// Runs `operation` against the latest `config.toml` loaded under an exclusive lock.
+    pub fn with_current_config(
+        &mut self,
+        operation: impl FnOnce(&mut Self) -> Result<()>,
+    ) -> Result<()> {
+        AppConfig::with_current_locked(&self.paths.config_file.clone(), |config| {
+            self.config = config;
+            operation(self)
+        })
     }
 }

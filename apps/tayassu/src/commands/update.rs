@@ -2,8 +2,8 @@ use crate::app::{App, Execute};
 use crate::artifacts::{ManagedArtifact, ShellActivation, SystemdTimer};
 use crate::release::{
     BIN_NAME, CHECKSUMS_ASSET_NAME, GitHubReleases, Release, ReleaseSource, archive_name,
-    current_target, current_version, extract_binary, is_cargo_install, replace_binary_atomically,
-    verify_sha256,
+    asset_checksum_name, current_target, current_version, extract_binary, is_cargo_install,
+    replace_binary_atomically, verify_sha256,
 };
 use crate::systemd::{DEFAULT_PROBE_INTERVAL_MINUTES, SystemdUnits};
 use anyhow::{Context, Result, bail};
@@ -80,13 +80,14 @@ impl Update {
             .iter()
             .find(|a| a.name == asset_name)
             .with_context(|| format!("release {} has no asset '{asset_name}'", release.tag))?;
+        let per_asset_sums = asset_checksum_name(&asset_name);
         let sums_asset = release
             .assets
             .iter()
-            .find(|a| a.name == CHECKSUMS_ASSET_NAME)
+            .find(|a| a.name == per_asset_sums || a.name == CHECKSUMS_ASSET_NAME)
             .with_context(|| {
                 format!(
-                    "release {} is missing '{CHECKSUMS_ASSET_NAME}'; refusing unverified update",
+                    "release {} is missing '{per_asset_sums}' / '{CHECKSUMS_ASSET_NAME}'; refusing unverified update",
                     release.tag
                 )
             })?;

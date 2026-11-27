@@ -1,8 +1,8 @@
 use crate::app::{App, Execute};
-use crate::completion;
+use crate::shell::account_candidates;
 use anyhow::{Result, bail};
 use clap::Args;
-use clap_complete::engine::ArgValueCandidates;
+use clap_complete::ArgValueCandidates;
 use std::io::Write;
 use tayassu_core::AccountId;
 
@@ -10,7 +10,7 @@ use tayassu_core::AccountId;
 #[derive(Debug, Args)]
 pub struct Rm {
     /// Account identifier to remove.
-    #[arg(add = ArgValueCandidates::new(completion::account_ids))]
+    #[arg(add = ArgValueCandidates::new(account_candidates))]
     id: AccountId,
 }
 

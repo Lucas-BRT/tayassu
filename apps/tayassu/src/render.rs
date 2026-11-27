@@ -34,6 +34,47 @@ impl<'a> StatusTable<'a> {
         }
     }
 
+    /// Prints the provider model catalog with each model's applicable quota.
+    pub fn write_models(&self, writer: &mut impl Write, now: DateTime<Utc>) -> io::Result<()> {
+        let mut found = false;
+        for account in self.accounts.iter().filter(|account| {
+            self.provider_filter
+                .is_none_or(|provider| provider == account.provider)
+        }) {
+            let Some(status) = self
+                .statuses
+                .iter()
+                .find(|status| status.account_id == account.id)
+            else {
+                continue;
+            };
+            for (model, scope) in &status.model_buckets {
+                if !found {
+                    writeln!(writer, "ACCOUNT MODEL QUOTA SCOPE")?;
+                    found = true;
+                }
+                let remaining = status
+                    .lowest_remaining_percent(model, now)
+                    .map_or_else(|| "unknown".to_owned(), |value| value.to_string());
+                let tag = if status.last_probe_error.is_some() {
+                    " (stale)"
+                } else if !status.is_available(model, now) {
+                    " (blocked)"
+                } else {
+                    ""
+                };
+                writeln!(writer, "{} {model} {remaining}{tag} {scope}", account.id)?;
+            }
+        }
+        if !found {
+            writeln!(
+                writer,
+                "No model catalog is available. Run tayassu probe first."
+            )?;
+        }
+        Ok(())
+    }
+
     /// Writes the formatted table to `writer` evaluated at `now`.
     ///
     /// # Errors
@@ -52,14 +93,14 @@ impl<'a> StatusTable<'a> {
         if filtered.is_empty() {
             return writeln!(
                 writer,
-                "No accounts configured. Add one with: tayassu add <provider>"
+                "No accounts configured. Add one with: tayassu account add <id> <provider>"
             );
         }
 
         writeln!(
             writer,
-            "{:<18} {:<10} {:<4} {:<18} {:<28} {:<10} LABEL",
-            "ACCOUNT", "PROVIDER", "PRI", "STATE", "QUOTA", "CHECKED"
+            "{:<18} {:<10} {:<4} {:<18} {:<13} {:<28} {:<20} {:<8} LABEL",
+            "ACCOUNT", "PROVIDER", "PRI", "STATE", "LOGIN", "QUOTA", "LAST PROBE (UTC)", "SESSIONS"
         )?;
 
         let default_bucket = ModelBucket::default_bucket();
@@ -72,19 +113,60 @@ impl<'a> StatusTable<'a> {
 
             let eval_bucket = self.bucket_filter.unwrap_or(&default_bucket);
             let state_text = render_state(account, status, eval_bucket, now);
-            let quota_text = render_quota(status, self.bucket_filter, now);
+            let mut quota_text = render_quota(status, self.bucket_filter, now);
+            if status.is_some_and(|st| st.last_probe_error.is_some()) && quota_text.contains('%') {
+                quota_text.push_str(" (stale)");
+            }
+
+            let login = render_login(status);
+            let last_probe = status.and_then(|st| st.last_probed_at).map_or_else(
+                || "never".to_owned(),
+                |time| time.format("%Y-%m-%d %H:%M:%S").to_string(),
+            );
+            let sessions = status.map_or(0, |st| st.active_sessions);
 
             writeln!(
                 writer,
-                "{:<18} {:<10} {:<4} {:<18} {:<28} {:<10} {}",
+                "{:<18} {:<10} {:<4} {:<18} {:<13} {:<28} {:<20} {sessions:<8} {}",
                 account.id,
                 account.provider,
                 account.priority,
                 state_text,
+                login,
                 quota_text,
-                render_checked(status, now),
+                last_probe,
                 account.label
             )?;
+            if let Some(budget) = status.and_then(|st| st.key_budget.as_ref()) {
+                let freshness = if status.is_some_and(|st| st.last_probe_error.is_some()) {
+                    " (stale)"
+                } else {
+                    ""
+                };
+                let interval = budget
+                    .reset_interval
+                    .as_deref()
+                    .map_or_else(String::new, |value| format!(" ({value})"));
+                writeln!(
+                    writer,
+                    "  {}: OpenRouter budget ${} remaining{interval}{freshness}",
+                    account.id, budget.remaining_usd
+                )?;
+            }
+            if let Some(failure) = status.and_then(|st| st.last_probe_error.as_ref()) {
+                let id = &account.id;
+                let reason = failure
+                    .message
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let action = if failure.is_authentication() {
+                    format!("tayassu login {id}")
+                } else {
+                    format!("tayassu doctor, then tayassu probe --id {id}")
+                };
+                writeln!(writer, "  {id}: {reason}. Next: {action}")?;
+            }
         }
 
         Ok(())
@@ -119,23 +201,42 @@ fn render_state(
     "READY".to_owned()
 }
 
+pub(crate) fn render_login(status: Option<&AccountStatus>) -> &'static str {
+    match status {
+        Some(st)
+            if st
+                .last_probe_error
+                .as_ref()
+                .is_some_and(tayassu_core::ProbeFailure::is_authentication) =>
+        {
+            "required"
+        }
+        Some(st) if st.last_probe_error.is_none() && st.last_probed_at.is_some() => "ok",
+        _ => "unverified",
+    }
+}
+
 fn render_quota(
     status: Option<&AccountStatus>,
     bucket_filter: Option<&ModelBucket>,
     now: DateTime<Utc>,
 ) -> String {
     let Some(st) = status else {
-        return "-".to_owned();
+        return "unknown".to_owned();
     };
 
     if let Some(bucket) = bucket_filter {
         return st
-            .bucket_state(bucket, now)
-            .map_or_else(|| "-".to_owned(), |_| st.quota_label(bucket, now));
+            .lowest_remaining_percent(bucket, now)
+            .map_or_else(|| "unknown".to_owned(), |pct| pct.to_string());
     }
 
     let mut buckets = BTreeSet::new();
-    for window in &st.windows {
+    for window in st
+        .windows
+        .iter()
+        .filter(|window| window.remaining.is_some())
+    {
         buckets.insert(window.bucket.clone());
     }
     for cooldown in &st.cooldowns {
@@ -145,7 +246,7 @@ fn render_quota(
     }
 
     if buckets.is_empty() {
-        return "-".to_owned();
+        return "unknown".to_owned();
     }
 
     let parts: Vec<String> = buckets
@@ -164,19 +265,6 @@ fn render_quota(
         .collect();
 
     parts.join(" ")
-}
-
-/// Age of the last probe (`never`, `3m ago`, `2h05m ago`).
-fn render_checked(status: Option<&AccountStatus>, now: DateTime<Utc>) -> String {
-    status.and_then(|st| st.last_probed_at).map_or_else(
-        || "never".to_owned(),
-        |at| {
-            format!(
-                "{} ago",
-                format_countdown(now.signed_duration_since(at).max(TimeDelta::zero()))
-            )
-        },
-    )
 }
 
 /// Formats a positive duration into a compact `XhYYm` or `Ym` countdown.

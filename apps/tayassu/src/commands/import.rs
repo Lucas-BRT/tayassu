@@ -1,25 +1,31 @@
 use crate::app::{App, Execute};
+use crate::shell::provider_candidates;
 use crate::spawn::transfer_opencode_auth;
 use anyhow::{Context, Result};
 use clap::Args;
+use clap_complete::ArgValueCandidates;
 use std::env;
 use std::io::Write;
 use tayassu_core::{AccountConfig, DEFAULT_ACCOUNT_PRIORITY, ProviderKind};
-use tayassu_providers::{AdapterRegistry, HostDiscovery, MigrationMode};
+use tayassu_providers::{AdapterRegistry, DiscoveredAgent, HostDiscovery, MigrationMode};
 use tracing::warn;
 
-/// Discover installed AI CLIs and copy their credentials into isolated profiles.
+/// Auto-discover installed AI CLIs and safely import their host credentials into isolated profiles.
 #[derive(Debug, Args)]
+#[command(alias = "discover")]
 pub struct Import {
     /// Include only specific provider(s) (repeatable). Defaults to all discovered providers.
-    #[arg(long = "provider")]
+    #[arg(long = "provider", add = ArgValueCandidates::new(provider_candidates))]
     include: Vec<ProviderKind>,
     /// Exclude specific provider(s) from discovery/import (repeatable).
-    #[arg(long = "exclude")]
+    #[arg(long = "exclude", add = ArgValueCandidates::new(provider_candidates))]
     exclude: Vec<ProviderKind>,
-    /// Show what would be imported without writing anything.
+    /// Preview discovered agents, files, and update-safety notes without modifying disk.
     #[arg(long)]
     dry_run: bool,
+    /// Refresh credentials in profiles that are already registered.
+    #[arg(long)]
+    refresh: bool,
     /// Remove original host auth files after verified copy (never removes binaries or updater dirs).
     #[arg(long)]
     move_auth: bool,
@@ -30,13 +36,20 @@ pub struct Import {
 
 impl Execute for Import {
     fn execute(self, app: &mut App, out: &mut dyn Write) -> Result<()> {
-        let (include, exclude) = (&self.include, &self.exclude);
-        let (dry_run, move_auth, priority) = (self.dry_run, self.move_auth, self.priority);
+        if self.dry_run {
+            return self.run_with(app, out);
+        }
+        app.with_current_config(|locked| self.run_with(locked, out))
+    }
+}
+
+impl Import {
+    fn run_with(&self, app: &mut App, out: &mut dyn Write) -> Result<()> {
         let discovered: Vec<_> = HostDiscovery
             .discover_all(&app.paths.home_dir, env::var_os("PATH").as_deref())
             .into_iter()
-            .filter(|agent| include.is_empty() || include.contains(&agent.provider))
-            .filter(|agent| !exclude.contains(&agent.provider))
+            .filter(|agent| self.include.is_empty() || self.include.contains(&agent.provider))
+            .filter(|agent| !self.exclude.contains(&agent.provider))
             .collect();
 
         if discovered.is_empty() {
@@ -44,41 +57,47 @@ impl Execute for Import {
             return Ok(());
         }
 
-        let mode = if move_auth {
+        let mode = if self.move_auth {
             MigrationMode::MoveAuth
         } else {
             MigrationMode::Copy
         };
 
-        let mut imported_any = false;
         for agent in &discovered {
-            let mut account = AccountConfig::new(
-                agent.default_account_id.clone(),
-                agent.provider,
-                format!("{} (imported)", agent.provider),
-            );
-            account.priority = priority;
+            let existing = app.config.find_account(&agent.default_account_id);
+            if let Some(existing) = existing {
+                if existing.provider != agent.provider {
+                    writeln!(
+                        out,
+                        "Skipping '{}': ID already belongs to {}",
+                        existing.id, existing.provider
+                    )?;
+                    continue;
+                }
+                if !self.refresh {
+                    writeln!(
+                        out,
+                        "Skipping '{}': already configured (use --refresh to copy credentials again)",
+                        existing.id
+                    )?;
+                    continue;
+                }
+            }
+            let account = existing.cloned().unwrap_or_else(|| {
+                let mut account = AccountConfig::new(
+                    agent.default_account_id.clone(),
+                    agent.provider,
+                    format!("{} (imported)", agent.provider),
+                );
+                account.priority = self.priority;
+                account
+            });
 
             let adapter = AdapterRegistry.adapter_for(agent.provider);
             let profile_env = adapter.build_environment(&account, &app.paths.profiles_dir);
 
-            if dry_run {
-                writeln!(
-                    out,
-                    "[dry-run] {} -> account '{}' (binary: {}, {} credential/config file(s) found)",
-                    agent.provider,
-                    agent.default_account_id,
-                    agent.binary_path.display(),
-                    agent.existing_file_count()
-                )?;
-                writeln!(out, "  update-safety: {}", agent.update_safety_note)?;
-                if agent.requires_relogin {
-                    writeln!(
-                        out,
-                        "  note: run `tayassu login {}` after import",
-                        agent.default_account_id
-                    )?;
-                }
+            if self.dry_run {
+                write_preview(agent, out)?;
                 continue;
             }
 
@@ -86,8 +105,10 @@ impl Execute for Import {
                 .apply(&profile_env, &app.paths.home_dir, mode)
                 .with_context(|| format!("failed to import {}", agent.provider))?;
 
-            app.config.upsert_account(account);
-            imported_any = true;
+            if existing.is_none() {
+                app.config.upsert_account(account);
+                app.save_config()?;
+            }
 
             writeln!(
                 out,
@@ -118,11 +139,26 @@ impl Execute for Import {
                 )?;
             }
         }
-
-        if imported_any {
-            app.save_config()?;
-        }
-
         Ok(())
     }
+}
+
+fn write_preview(agent: &DiscoveredAgent, out: &mut dyn Write) -> Result<()> {
+    writeln!(
+        out,
+        "[dry-run] {} -> account '{}' (binary: {}, {} credential/config file(s) found)",
+        agent.provider,
+        agent.default_account_id,
+        agent.binary_path.display(),
+        agent.existing_file_count()
+    )?;
+    writeln!(out, "  update-safety: {}", agent.update_safety_note)?;
+    if agent.requires_relogin {
+        writeln!(
+            out,
+            "  note: run `tayassu login {}` after import",
+            agent.default_account_id
+        )?;
+    }
+    Ok(())
 }

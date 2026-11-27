@@ -1,5 +1,7 @@
+mod account_ops;
 mod activate;
 mod add;
+mod auto;
 mod config;
 mod cooldown;
 mod dash;
@@ -26,10 +28,18 @@ use std::io::Write;
 pub enum Command {
     /// List accounts with remaining quota and cooldowns (default).
     Ls(ls::Ls),
+    /// Automatic routing and background probing.
+    Auto(auto::Auto),
     /// Open an interactive live dashboard.
     Dash(dash::Dash),
     /// Register an account and log in.
     Add(add::Add),
+    /// Edit an account's label or selection priority.
+    Edit(account_ops::Edit),
+    /// Include an account in automatic routing.
+    Enable(account_ops::Enable),
+    /// Pause automatic routing to an account while keeping its profile.
+    Disable(account_ops::Disable),
     /// Remove an account.
     Rm(rm::Rm),
     /// Authenticate an existing account.
@@ -77,8 +87,12 @@ impl Execute for Command {
     fn execute(self, app: &mut App, out: &mut dyn Write) -> Result<()> {
         match self {
             Self::Ls(c) => c.execute(app, out),
+            Self::Auto(c) => c.execute(app, out),
             Self::Dash(c) => c.execute(app, out),
             Self::Add(c) => c.execute(app, out),
+            Self::Edit(c) => c.execute(app, out),
+            Self::Enable(c) => c.execute(app, out),
+            Self::Disable(c) => c.execute(app, out),
             Self::Rm(c) => c.execute(app, out),
             Self::Login(c) => c.execute(app, out),
             Self::Import(c) => c.execute(app, out),

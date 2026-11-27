@@ -1,18 +1,17 @@
 use crate::app::{App, Execute};
-use crate::completion;
 use crate::probing::probe_accounts;
-use anyhow::{Context, Result};
+use crate::shell::account_candidates;
+use anyhow::Result;
 use clap::Args;
-use clap_complete::engine::ArgValueCandidates;
+use clap_complete::ArgValueCandidates;
 use std::io::Write;
-use tayassu_core::AccountConfig;
-use tayassu_core::AccountId;
+use tayassu_core::{AccountConfig, AccountId};
 
 /// Refresh quota windows and cooldowns by probing each provider CLI.
 #[derive(Debug, Args)]
 pub struct Probe {
     /// Limit probing to a single account id.
-    #[arg(add = ArgValueCandidates::new(completion::account_ids))]
+    #[arg(add = ArgValueCandidates::new(account_candidates))]
     id: Option<AccountId>,
     /// Send a desktop notification (`notify-send`) when a previously active cooldown clears.
     #[arg(long)]
@@ -21,15 +20,8 @@ pub struct Probe {
 
 impl Execute for Probe {
     fn execute(self, app: &mut App, out: &mut dyn Write) -> Result<()> {
-        let id = self.id.as_ref();
-        let notify = self.notify;
-        let targets: Vec<AccountConfig> = match id {
-            Some(target_id) => vec![
-                app.config
-                    .find_account(target_id)
-                    .with_context(|| format!("account '{target_id}' not found"))?
-                    .clone(),
-            ],
+        let targets: Vec<AccountConfig> = match self.id.as_ref() {
+            Some(target_id) => vec![app.account(target_id)?.clone()],
             None => app.config.accounts.clone(),
         };
 
@@ -38,7 +30,14 @@ impl Execute for Probe {
             return Ok(());
         }
 
-        probe_accounts(&targets, &app.paths, &mut app.state, notify, Some(out))?;
+        probe_accounts(
+            &targets,
+            &app.config.accounts,
+            &app.paths,
+            &mut app.state,
+            self.notify,
+            Some(out),
+        )?;
         Ok(())
     }
 }

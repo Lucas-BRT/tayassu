@@ -1,12 +1,15 @@
 mod app;
 mod artifacts;
+mod claude_usage;
 mod cli;
 mod commands;
-mod completion;
 mod doctor;
+mod opencode_usage;
 mod probing;
+mod quota_rpc;
 mod release;
 mod render;
+mod routing;
 mod session;
 mod shell;
 mod spawn;
@@ -21,6 +24,7 @@ use clap::{CommandFactory, Parser};
 use clap_complete::CompleteEnv;
 use cli::Cli;
 use session::{RECEIVED_INT, install_ctrlc_handler, process_is_alive};
+use shell::COMPLETION_ENV;
 use std::io::{self, IsTerminal};
 use std::sync::atomic::Ordering;
 use tayassu_store::RuntimeState;
@@ -31,9 +35,11 @@ use update_notifier::UpdateNotifier;
 const DEFAULT_LOG_FILTER: &str = "warn";
 
 fn main() -> Result<()> {
-    CompleteEnv::with_factory(Cli::command).complete();
     init_tracing();
     install_ctrlc_handler();
+    CompleteEnv::with_factory(Cli::command)
+        .var(COMPLETION_ENV)
+        .complete();
     let cli = Cli::parse();
     let mut app = App::load()?;
     let mut stdout = io::stdout().lock();

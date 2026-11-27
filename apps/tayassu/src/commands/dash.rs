@@ -13,12 +13,22 @@ impl Execute for Dash {
     fn execute(self, app: &mut App, _out: &mut dyn Write) -> Result<()> {
         let paths = app.paths.clone();
         let accounts = app.config.accounts.clone();
+        let probe_accounts_list = accounts.clone();
+        let probe_paths = paths.clone();
 
         tui::run_dashboard(
             &accounts,
             &mut app.state,
-            |state| {
-                let (ok_count, err_count) = probe_accounts(&accounts, &paths, state, false, None)?;
+            &paths.state_file,
+            move |state| {
+                let (ok_count, err_count) = probe_accounts(
+                    &probe_accounts_list,
+                    &probe_accounts_list,
+                    &probe_paths,
+                    state,
+                    false,
+                    None,
+                )?;
                 Ok(format!("Probe complete: {ok_count} ok, {err_count} failed"))
             },
             |state, account_id| {

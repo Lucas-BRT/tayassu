@@ -1,9 +1,9 @@
 use crate::app::{App, Execute};
-use crate::completion;
+use crate::shell::account_candidates;
 use anyhow::{Context, Result, bail};
 use chrono::{TimeDelta, Utc};
 use clap::{Args, Subcommand};
-use clap_complete::engine::ArgValueCandidates;
+use clap_complete::ArgValueCandidates;
 use std::io::Write;
 use tayassu_core::{AccountId, CooldownEntry, ModelBucket};
 use tayassu_store::RuntimeState;
@@ -26,7 +26,7 @@ enum CooldownAction {
     /// Mark an account (and optional model bucket) as cooling down.
     Set {
         /// Account identifier.
-        #[arg(add = ArgValueCandidates::new(completion::account_ids))]
+        #[arg(add = ArgValueCandidates::new(account_candidates))]
         id: AccountId,
         /// Cooldown duration in minutes.
         #[arg(long, default_value_t = DEFAULT_MANUAL_COOLDOWN_MINUTES)]
@@ -41,7 +41,7 @@ enum CooldownAction {
     /// Clear a recorded cooldown for an account.
     Clear {
         /// Account identifier.
-        #[arg(add = ArgValueCandidates::new(completion::account_ids))]
+        #[arg(add = ArgValueCandidates::new(account_candidates))]
         id: AccountId,
         /// Model bucket to clear (defaults to `default`).
         #[arg(long)]

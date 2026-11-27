@@ -155,14 +155,11 @@ fn write_service_port(path: &Path, port: u16) -> Result<(), ProviderError> {
         path: path.to_path_buf(),
         source,
     };
-    let mut config = fs::read_to_string(path)
-        .ok()
-        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
-        .and_then(|value| match value {
-            serde_json::Value::Object(map) => Some(map),
-            _ => None,
-        })
-        .unwrap_or_default();
+    let mut config: serde_json::Map<String, serde_json::Value> = match fs::read_to_string(path) {
+        Ok(raw) => serde_json::from_str(&raw).map_err(|err| io_err(err.into()))?,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => serde_json::Map::new(),
+        Err(err) => return Err(io_err(err)),
+    };
     if config.contains_key(SERVICE_PORT_KEY) {
         return Ok(());
     }
@@ -185,4 +182,37 @@ fn create_symlink(source: &Path, link: &Path) -> Result<(), ProviderError> {
 #[cfg(not(unix))]
 fn create_symlink(_source: &Path, _link: &Path) -> Result<(), ProviderError> {
     Ok(())
+}
+
+#[cfg(test)]
+mod service_config_tests {
+    use super::*;
+
+    /// Managed port used in configuration fixtures.
+    const TEST_PORT: u16 = 50_000;
+
+    #[test]
+    fn invalid_service_config_is_preserved() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("service.json");
+        for invalid in ["{", "[]", "null"] {
+            fs::write(&path, invalid).unwrap();
+            assert!(write_service_port(&path, TEST_PORT).is_err());
+            assert_eq!(fs::read_to_string(&path).unwrap(), invalid);
+        }
+    }
+
+    #[test]
+    fn adding_port_preserves_existing_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("service.json");
+        fs::write(&path, r#"{"enabled":false}"#).unwrap();
+        write_service_port(&path, TEST_PORT).unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(
+            saved,
+            serde_json::json!({"enabled": false, "port": TEST_PORT})
+        );
+    }
 }

@@ -1,10 +1,10 @@
 use crate::app::{App, Execute};
-use crate::completion;
 use crate::render::StatusTable;
+use crate::shell::provider_candidates;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use clap::Args;
-use clap_complete::engine::ArgValueCandidates;
+use clap_complete::ArgValueCandidates;
 use std::io::Write;
 use tayassu_core::{ModelBucket, ProviderKind};
 
@@ -12,11 +12,14 @@ use tayassu_core::{ModelBucket, ProviderKind};
 #[derive(Debug, Default, Args)]
 pub struct Ls {
     /// Show only this provider.
-    #[arg(add = ArgValueCandidates::new(completion::configured_providers))]
+    #[arg(add = ArgValueCandidates::new(provider_candidates))]
     provider: Option<ProviderKind>,
     /// Model bucket to evaluate availability against.
     #[arg(long)]
     model: Option<ModelBucket>,
+    /// List discovered `OpenCode` models and their measured quota.
+    #[arg(long, conflicts_with = "model")]
+    list_models: bool,
     /// Print machine-readable JSON instead of a table.
     #[arg(long)]
     json: bool,
@@ -24,6 +27,7 @@ pub struct Ls {
 
 impl Execute for Ls {
     fn execute(self, app: &mut App, mut out: &mut dyn Write) -> Result<()> {
+        let now = Utc::now();
         if self.json {
             let accounts: Vec<_> = app
                 .config
@@ -31,7 +35,6 @@ impl Execute for Ls {
                 .iter()
                 .filter(|account| self.provider.is_none_or(|p| account.provider == p))
                 .collect();
-            let now = Utc::now();
             let quota: Vec<_> = app
                 .state
                 .statuses
@@ -57,13 +60,20 @@ impl Execute for Ls {
             });
             return writeln!(out, "{json:#}").context("failed to write JSON");
         }
-        StatusTable::new(
+        let table = StatusTable::new(
             &app.config.accounts,
             &app.state.statuses,
             self.provider,
             self.model.as_ref(),
-        )
-        .write_to(&mut out, Utc::now())
-        .context("failed to write status table")
+        );
+        if self.list_models {
+            table
+                .write_models(&mut out, now)
+                .context("failed to write model quota")
+        } else {
+            table
+                .write_to(&mut out, now)
+                .context("failed to write status table")
+        }
     }
 }

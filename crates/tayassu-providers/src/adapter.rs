@@ -5,8 +5,8 @@ use serde::Deserialize;
 use std::env;
 use std::path::Path;
 use tayassu_core::{
-    AccountConfig, CooldownEntry, DEFAULT_FALLBACK_COOLDOWN_SECS, ModelBucket, ProviderKind,
-    QuotaWindow, RemainingPercent,
+    AGY_PROBE_COOLDOWN_REASON_PREFIX, AccountConfig, CooldownEntry, DEFAULT_FALLBACK_COOLDOWN_SECS,
+    ModelBucket, ProviderKind, QuotaWindow, RemainingPercent,
 };
 
 /// Native config directory env var supported by Claude Code CLI.
@@ -61,6 +61,9 @@ const AGY_AUTH_REQUIRED_MARKER: &str = "authentication required";
 
 /// Minimum number of whitespace-separated columns in an `agy /usage` quota row.
 const AGY_MIN_ROW_COLUMNS: usize = 3;
+
+/// AGY marker for a quota window that does not apply to the current account.
+const AGY_DISABLED_WINDOW: &str = "disabled";
 
 /// Expected length of a short timezone offset like `-03` or `+05`.
 const SHORT_TZ_OFFSET_LEN: usize = 3;
@@ -119,6 +122,10 @@ pub struct ProbeOutput {
     pub windows: Vec<QuotaWindow>,
     /// Cooldown entries derived from the probe output.
     pub cooldowns: Vec<CooldownEntry>,
+    /// Discovered model IDs and their shared quota buckets.
+    pub model_buckets: std::collections::BTreeMap<ModelBucket, ModelBucket>,
+    /// Current `OpenRouter` key budget if provided.
+    pub key_budget: Option<tayassu_core::KeyBudget>,
 }
 
 /// Contract implemented by each AI CLI provider adapter.
@@ -208,14 +215,10 @@ pub trait ProviderAdapter: Send + Sync {
             return None;
         }
 
-        // Only parse retry-after if we actually found a clear rate-limit signal.
-        let duration_secs = if has_status_429 {
-            // For 429, use a moderate default; some providers specify a retry-after.
-            parse_retry_after_secs(&lowered).unwrap_or(DEFAULT_FALLBACK_COOLDOWN_SECS)
-        } else {
-            // For textual markers, try to parse a retry-after duration; fall back gracefully.
-            parse_retry_after_secs(&lowered).unwrap_or(DEFAULT_FALLBACK_COOLDOWN_SECS)
-        };
+        let duration_secs = lowered
+            .lines()
+            .find_map(parse_retry_after_secs)
+            .unwrap_or(DEFAULT_FALLBACK_COOLDOWN_SECS);
         Some(CooldownEntry {
             bucket: bucket.clone(),
             resets_at: now + TimeDelta::seconds(duration_secs),
@@ -247,7 +250,11 @@ impl AgyAdapter {
 
     fn normalize_window_name(raw_label: &str) -> String {
         let lowered = raw_label.trim().to_ascii_lowercase();
-        if lowered.contains("five hour") || lowered.contains("5 hour") || lowered.contains("5h") {
+        if lowered.contains("five hour")
+            || lowered.contains("5 hour")
+            || lowered.contains("5h")
+            || lowered.starts_with("fhour ")
+        {
             "5h".to_owned()
         } else if lowered.contains("weekly") || lowered.contains("week") {
             "weekly".to_owned()
@@ -323,6 +330,7 @@ impl ProviderAdapter for AgyAdapter {
         }
 
         let mut output = ProbeOutput::default();
+        let mut saw_disabled_window = false;
 
         for line in raw_output.lines() {
             let trimmed = line.trim();
@@ -338,7 +346,12 @@ impl ProviderAdapter for AgyAdapter {
             let bucket = Self::normalize_bucket(columns[0])?;
             let window_name = Self::normalize_window_name(columns[1]);
 
-            let pct_raw = columns[2].trim_end_matches('%');
+            if columns[2].eq_ignore_ascii_case(AGY_DISABLED_WINDOW) {
+                saw_disabled_window = true;
+                continue;
+            }
+
+            let pct_raw = columns[2].strip_suffix('%').unwrap_or(columns[2]);
             let pct_value: u8 = pct_raw.parse().map_err(|err| ProviderError::ParseUsage {
                 provider: ProviderKind::Agy,
                 reason: format!(
@@ -364,7 +377,7 @@ impl ProviderAdapter for AgyAdapter {
                 output.cooldowns.push(CooldownEntry {
                     bucket: bucket.clone(),
                     resets_at: reset_instant,
-                    reason: format!("agy-probe:{window_name}"),
+                    reason: format!("{AGY_PROBE_COOLDOWN_REASON_PREFIX}{window_name}"),
                 });
             }
 
@@ -376,7 +389,7 @@ impl ProviderAdapter for AgyAdapter {
             });
         }
 
-        if output.windows.is_empty() {
+        if output.windows.is_empty() && !saw_disabled_window {
             return Err(ProviderError::ParseUsage {
                 provider: ProviderKind::Agy,
                 reason: "no quota rows found in /usage output".to_owned(),
@@ -433,16 +446,17 @@ impl ProviderAdapter for ClaudeAdapter {
         raw_output: &str,
         now: DateTime<Utc>,
     ) -> Result<ProbeOutput, ProviderError> {
-        let json_slice =
-            extract_json_object(raw_output).ok_or_else(|| ProviderError::ParseUsage {
+        let status = raw_output
+            .match_indices('{')
+            .find_map(|(offset, _)| {
+                serde_json::Deserializer::from_str(&raw_output[offset..])
+                    .into_iter::<ClaudeAuthStatus>()
+                    .next()
+                    .and_then(Result::ok)
+            })
+            .ok_or_else(|| ProviderError::ParseUsage {
                 provider: ProviderKind::Claude,
-                reason: "no JSON object found in `claude auth status` output".to_owned(),
-            })?;
-
-        let status: ClaudeAuthStatus =
-            serde_json::from_str(json_slice).map_err(|err| ProviderError::ParseUsage {
-                provider: ProviderKind::Claude,
-                reason: format!("invalid `claude auth status` JSON: {err}"),
+                reason: "no auth status JSON found in `claude auth status` output".to_owned(),
             })?;
 
         if !status.logged_in || status.login_expires_at.is_some_and(|exp| exp <= now) {
@@ -468,7 +482,7 @@ impl ProviderAdapter for ClaudeAdapter {
                 remaining: None,
                 resets_at: status.login_expires_at,
             }],
-            cooldowns: Vec::new(),
+            ..ProbeOutput::default()
         })
     }
 }
@@ -512,7 +526,11 @@ impl ProviderAdapter for CodexAdapter {
             });
         }
 
-        if lowered.contains("logged in") {
+        if lowered
+            .lines()
+            .map(str::trim)
+            .any(|line| line == "logged in" || line.starts_with("logged in "))
+        {
             return Ok(ProbeOutput {
                 windows: vec![QuotaWindow {
                     window_name: "auth".to_owned(),
@@ -520,7 +538,7 @@ impl ProviderAdapter for CodexAdapter {
                     remaining: None,
                     resets_at: None,
                 }],
-                cooldowns: Vec::new(),
+                ..ProbeOutput::default()
             });
         }
 
@@ -568,14 +586,8 @@ impl ProviderAdapter for CopilotAdapter {
             .any(|var| env::var_os(var).is_some_and(|val| !val.is_empty()));
 
         if has_profile_cred || has_env_token {
-            Some(Ok(ProbeOutput {
-                windows: vec![QuotaWindow {
-                    window_name: "auth".to_owned(),
-                    bucket: ModelBucket::default_bucket(),
-                    remaining: None,
-                    resets_at: None,
-                }],
-                cooldowns: Vec::new(),
+            Some(Err(ProviderError::AuthenticationUnverified {
+                account_id: account.id.clone(),
             }))
         } else {
             Some(Err(ProviderError::AuthenticationRequired {
@@ -671,7 +683,7 @@ impl ProviderAdapter for OpencodeAdapter {
 
         Ok(ProbeOutput {
             windows,
-            cooldowns: Vec::new(),
+            ..ProbeOutput::default()
         })
     }
 }
@@ -747,16 +759,6 @@ fn slugify(raw: &str) -> String {
     result.trim_end_matches('-').to_owned()
 }
 
-fn extract_json_object(raw: &str) -> Option<&str> {
-    let start = raw.find('{')?;
-    let end = raw.rfind('}')?;
-    if end >= start {
-        Some(&raw[start..=end])
-    } else {
-        None
-    }
-}
-
 /// Splits a whitespace-aligned table row on runs of two or more ASCII spaces.
 fn split_table_columns(line: &str) -> Vec<&str> {
     if line.contains('\t') {
@@ -822,21 +824,22 @@ fn normalize_offset_suffix(raw: &str) -> String {
 /// Extracts an approximate cooldown duration in seconds from rate-limit stderr messages
 /// such as `"try again in 45 minutes"`, `"resets in 2h 30m"`, or `"retry-after: 120s"`.
 fn parse_retry_after_secs(lowered: &str) -> Option<i64> {
-    let tokens: Vec<&str> = lowered
-        .split(|ch: char| !ch.is_ascii_alphanumeric())
-        .filter(|tok| !tok.is_empty())
+    let normalized = lowered.replace("retry-after", "retry after");
+    let tokens: Vec<&str> = normalized
+        .split(|ch: char| !ch.is_ascii_alphanumeric() && !matches!(ch, '-' | '+' | '.'))
+        .map(|token| token.trim_end_matches('.'))
+        .filter(|token| !token.is_empty())
         .collect();
 
-    let start = RETRY_ANCHORS
+    let (start, anchor) = RETRY_ANCHORS
         .iter()
         .filter_map(|anchor| {
             tokens
                 .windows(anchor.len())
                 .position(|window| window == *anchor)
-                .map(|pos| pos + anchor.len())
+                .map(|position| (position + anchor.len(), *anchor))
         })
-        .min()
-        .unwrap_or(0);
+        .min_by_key(|(start, _)| *start)?;
 
     let mut total_secs: i64 = 0;
     let mut idx = start;
@@ -855,7 +858,10 @@ fn parse_retry_after_secs(lowered: &str) -> Option<i64> {
                     idx += 2;
                 }
                 // A bare number right after "retry after" is a count of seconds.
-                None if total_secs == 0 && idx == start && start > 0 => {
+                None if idx == start
+                    && anchor == ["retry", "after"]
+                    && tokens.get(idx + 1).is_none() =>
+                {
                     total_secs = value;
                     break;
                 }
@@ -863,10 +869,8 @@ fn parse_retry_after_secs(lowered: &str) -> Option<i64> {
             }
         } else if total_secs > 0 && token == "and" {
             idx += 1;
-        } else if total_secs > 0 {
-            break;
         } else {
-            idx += 1;
+            break;
         }
     }
 

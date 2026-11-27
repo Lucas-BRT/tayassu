@@ -46,7 +46,7 @@ impl UpdateNotifier {
         if env::var_os(NO_UPDATE_CHECK_ENV).is_some_and(|v| v == "1" || v == "true") {
             return true;
         }
-        if env::var_os("COMPLETE").is_some() {
+        if env::var_os(crate::shell::COMPLETION_ENV).is_some() {
             return true;
         }
         matches!(

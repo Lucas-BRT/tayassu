@@ -1,8 +1,8 @@
 use crate::app::{App, Execute};
-use crate::completion;
+use crate::shell::{account_candidates, chain_candidates};
 use anyhow::{Context, Result, bail};
 use clap::Args;
-use clap_complete::engine::ArgValueCandidates;
+use clap_complete::ArgValueCandidates;
 use std::env;
 use std::io::Write;
 use tayassu_core::{AccountId, SelectionPolicy};
@@ -12,13 +12,13 @@ use tayassu_store::{PROJECT_CONFIG_FILE_NAME, ProjectConfig};
 #[derive(Debug, Args)]
 pub struct Use {
     /// Prefer this account for its provider in the current project.
-    #[arg(add = ArgValueCandidates::new(completion::account_ids))]
+    #[arg(add = ArgValueCandidates::new(account_candidates))]
     account: Option<AccountId>,
     /// Default fallback chain for the current project.
-    #[arg(long, add = ArgValueCandidates::new(completion::chain_names))]
+    #[arg(long, add = ArgValueCandidates::new(chain_candidates))]
     chain: Option<String>,
     /// Default selection policy.
-    #[arg(long, add = ArgValueCandidates::new(completion::policies))]
+    #[arg(long)]
     policy: Option<SelectionPolicy>,
     /// Write the policy to the global `config.toml` instead of the project file.
     #[arg(long)]

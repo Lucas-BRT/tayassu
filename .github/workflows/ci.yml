@@ -1,6 +1,8 @@
 name: CI
 
 on:
+  workflow_call:
+  workflow_dispatch:
   push:
     branches: [develop, main]
   pull_request:
@@ -22,14 +24,16 @@ jobs:
   check:
     name: Format, clippy, and tests
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - name: Checkout
         # v4.2.2
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
 
-      - name: Install Rust toolchain
-        # master (reads rust-toolchain.toml)
-        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9
+      - name: Activate pinned Rust toolchain
+        run: cargo --version
 
       - name: Cache Cargo artifacts
         # v2.7.8
@@ -38,16 +42,21 @@ jobs:
           shared-key: tayassu
 
       - name: Install cargo-nextest
-        # v2.49.49
-        uses: taiki-e/install-action@69f61f612767f6e62b5aa73784621899a279a533
+        # v2.90.11
+        uses: taiki-e/install-action@073e1fd0bc889c9aee68dbaaa927cde1b5653a83
         with:
-          tool: nextest@0.9.95
+          tool: nextest@0.9.149
 
       - name: Check formatting
-        run: cargo fmt --check
+        run: cargo fmt --all --check
 
       - name: Run clippy
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
       - name: Run tests
         run: cargo nextest run --locked --workspace
+
+      - name: Test installer and packaging
+        run: |
+          shellcheck install.sh tools/package-release.sh tools/test-install.sh
+          bash tools/test-install.sh

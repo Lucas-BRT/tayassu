@@ -1,9 +1,9 @@
 use crate::app::{App, Execute};
-use crate::completion;
-use crate::spawn::spawn_interactive;
+use crate::shell::account_candidates;
+use crate::spawn::{account_executable, spawn_interactive};
 use anyhow::{Context, Result};
 use clap::Args;
-use clap_complete::engine::ArgValueCandidates;
+use clap_complete::ArgValueCandidates;
 use std::io::Write;
 use tayassu_core::{AccountConfig, AccountId};
 use tayassu_providers::AdapterRegistry;
@@ -12,7 +12,7 @@ use tayassu_providers::AdapterRegistry;
 #[derive(Debug, Args)]
 pub struct Login {
     /// Account identifier to authenticate.
-    #[arg(add = ArgValueCandidates::new(completion::account_ids))]
+    #[arg(add = ArgValueCandidates::new(account_candidates))]
     id: AccountId,
 }
 
@@ -32,7 +32,13 @@ impl Login {
             env_profile.profile_dir.display()
         )?;
         out.flush()?;
-        spawn_interactive(account, &env_profile.env_vars, &adapter.login_args())
+        let executable = account_executable(account, &app.paths.home_dir);
+        spawn_interactive(
+            account,
+            &executable,
+            &env_profile.env_vars,
+            &adapter.login_args(),
+        )
     }
 }
 

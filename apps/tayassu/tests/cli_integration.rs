@@ -22,27 +22,27 @@ impl TestEnv {
         Self { dir }
     }
 
-    fn run_cli(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_tayassu"))
-            .args(args)
+    fn command(&self) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_tayassu"));
+        command
+            .current_dir(self.dir.path())
             .env("PATH", "/usr/bin:/bin")
             .env("HOME", self.dir.path().join("home"))
             .env("XDG_CONFIG_HOME", self.dir.path().join("config"))
             .env("XDG_STATE_HOME", self.dir.path().join("state"))
             .env("XDG_DATA_HOME", self.dir.path().join("data"))
-            .output()
-            .expect("spawn tayassu")
+            .env_remove("TAYASSU_COMPLETE");
+        command
+    }
+
+    fn run_cli(&self, args: &[&str]) -> Output {
+        self.command().args(args).output().expect("spawn tayassu")
     }
 
     fn run_cli_in(&self, cwd: &Path, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_tayassu"))
+        self.command()
             .current_dir(cwd)
             .args(args)
-            .env("PATH", "/usr/bin:/bin")
-            .env("HOME", self.dir.path().join("home"))
-            .env("XDG_CONFIG_HOME", self.dir.path().join("config"))
-            .env("XDG_STATE_HOME", self.dir.path().join("state"))
-            .env("XDG_DATA_HOME", self.dir.path().join("data"))
             .output()
             .expect("spawn tayassu")
     }
@@ -181,7 +181,7 @@ fn live_probe_updates_buckets_and_routes_per_model_cooldown() {
     assert!(status_out.contains("gemini:43%"));
     assert!(status_out.contains("claude:0%("));
 
-    // Explicit priority policy keeps the higher-priority agy-student.
+    // Explicit priority policy keeps higher-priority agy-student.
     let gemini_run = env.run_ok(&[
         "run",
         "agy",
@@ -301,12 +301,15 @@ fn probe_supports_claude_codex_copilot_and_opencode_in_parallel() {
     assert!(probe_out.contains("claude-main: ok (1 windows, 0 active cooldowns)"));
     assert!(probe_out.contains("codex-main: ok (1 windows, 0 active cooldowns)"));
     assert!(probe_out.contains("opencode-main: ok (2 windows, 0 active cooldowns)"));
-    assert!(probe_out.contains("copilot-main: ok (1 windows, 0 active cooldowns)"));
+    assert!(
+        probe_out.contains("unable to verify Copilot authentication for account 'copilot-main'")
+    );
 
     let status_out = env.run_ok(&["ls"]);
     assert!(status_out.contains("claude-main"));
-    assert!(status_out.contains("default:ok"));
-    assert!(status_out.contains("github-copilot:ok google:ok"));
+    assert!(status_out.contains("LOGIN"));
+    assert!(status_out.contains("ok            unknown"));
+    assert!(status_out.contains("LAST PROBE (UTC)"));
 }
 
 #[cfg(unix)]
@@ -316,7 +319,7 @@ fn run_captures_stderr_rate_limit_and_failover_switches_account() {
 
     let rate_limited_script = env.write_mock_script(
         "mock-rate-limited.sh",
-        "#!/usr/bin/env bash\necho 'Error 429: usage limit reached, try again in 45 minutes' >&2\nexit 1\n",
+        "#!/usr/bin/env bash\necho 'Error 429: usage limit reached, try again in 45 minutes' >&2\nexit 7\n",
     );
     let healthy_script = env.write_mock_script(
         "mock-healthy.sh",
@@ -344,7 +347,7 @@ fn run_captures_stderr_rate_limit_and_failover_switches_account() {
         &healthy_script,
     ]);
 
-    // With --no-failover: command exits non-zero, but cooldown is recorded automatically.
+    // Without --failover: command exits non-zero, but cooldown is recorded automatically.
     let first_run = env.run_cli(&["run", "claude", "--no-failover"]);
     assert!(!first_run.status.success());
     let first_stderr = String::from_utf8_lossy(&first_run.stderr);
@@ -354,7 +357,14 @@ fn run_captures_stderr_rate_limit_and_failover_switches_account() {
     assert!(status_after.contains("claude-primary"));
     assert!(status_after.contains("COOLDOWN (45m)"));
 
-    // Clear cooldown and verify default failover automatically retries on claude-backup.
+    env.run_ok(&["disable", "claude-backup"]);
+    env.run_ok(&["cooldown", "clear", "claude-primary"]);
+    let no_fallback = env.run_cli(&["run", "claude"]);
+    assert_eq!(no_fallback.status.code(), Some(7));
+    assert!(String::from_utf8_lossy(&no_fallback.stderr).contains("no fallback account"));
+    env.run_ok(&["enable", "claude-backup"]);
+
+    // Clear cooldown and verify --failover automatically retries on claude-backup.
     env.run_ok(&["cooldown", "clear", "claude-primary"]);
     let failover_out = env.run_ok(&["run", "claude"]);
     assert!(failover_out.contains("served-by-fallback"));
@@ -401,6 +411,33 @@ fn import_discovers_filters_and_migrates_update_safely() {
             .join("data/tayassu/profiles/claude/claude-host/.credentials.json")
             .is_file()
     );
+    let profile_auth = env
+        .dir
+        .path()
+        .join("data/tayassu/profiles/claude/claude-host/.credentials.json");
+    env.run_ok(&["edit", "claude-host", "--priority", "20", "--label", "Work"]);
+    env.run_ok(&["disable", "claude-host"]);
+    fs::write(home.join(".claude/.credentials.json"), "updated").expect("new host credentials");
+    assert!(
+        env.run_ok(&["import", "--provider", "claude"])
+            .contains("already configured")
+    );
+    assert_eq!(
+        fs::read_to_string(&profile_auth).expect("original auth"),
+        "{}"
+    );
+    env.run_ok(&["import", "--provider", "claude", "--refresh"]);
+    assert_eq!(
+        fs::read_to_string(&profile_auth).expect("refreshed auth"),
+        "updated"
+    );
+    let status = env.run_ok(&["ls"]);
+    assert!(status.contains("claude     20"));
+    assert!(status.contains("DISABLED"));
+    assert!(status.contains("Work"));
+    env.run_ok(&["enable", "claude-host"]);
+    assert!(env.run_ok(&["ls"]).contains("READY"));
+    fs::remove_file(home.join(".claude/.credentials.json")).expect("remove test credentials");
     // Host binary and codex auth (excluded) remain untouched.
     assert!(local_bin.join("claude").is_file());
     assert!(home.join(".codex/auth.json").is_file());
@@ -413,7 +450,7 @@ fn activate_emits_valid_wrappers_for_bash_and_fish() {
     let bash_out = env.run_ok(&["activate", "bash"]);
     assert!(bash_out.contains("agy() { tayassu run agy -- \"$@\"; }"));
     assert!(bash_out.contains("claude() { tayassu run claude -- \"$@\"; }"));
-    assert!(bash_out.contains("source <(COMPLETE=bash tayassu)"));
+    assert!(bash_out.contains("TAYASSU_COMPLETE=bash"));
 
     let no_failover = env.run_ok(&["activate", "bash", "--no-failover"]);
     assert!(no_failover.contains("codex() { tayassu run codex --no-failover -- \"$@\"; }"));
@@ -508,10 +545,6 @@ fn systemd_unit_install_and_doctor_diagnostics() {
     let unit_out = env.run_ok(&["setup", "--interval-minutes", "10"]);
     assert!(unit_out.contains("tayassu-probe.timer"));
     assert!(
-        env.run_ok(&["setup", "--no-systemd"])
-            .contains("already configured")
-    );
-    assert!(
         env.dir
             .path()
             .join("config/systemd/user/tayassu-probe.service")
@@ -527,6 +560,399 @@ fn systemd_unit_install_and_doctor_diagnostics() {
     let doctor_out = env.run_ok(&["doctor"]);
     assert!(doctor_out.contains("[OK  ]"));
     assert!(doctor_out.contains("chmod 600"));
+}
+
+#[test]
+fn dry_run_explains_routing_without_writes_and_reports_next_release() {
+    let env = TestEnv::new();
+    env.run_ok(&["add", "codex", "work", "--no-login", "--priority", "10"]);
+    env.run_ok(&["add", "codex", "personal", "--no-login"]);
+    env.run_ok(&["disable", "personal"]);
+
+    let profile_root = env.dir.path().join("data/tayassu/profiles");
+    fs::remove_dir_all(&profile_root).expect("remove test profiles");
+    let preview = env.run_ok(&["run", "codex", "--dry-run"]);
+    assert!(preview.contains("account: work"));
+    assert!(preview.contains("policy: most-quota"));
+    assert!(preview.contains("skipped personal (codex:default): disabled"));
+    assert!(!profile_root.exists());
+    assert!(!env.dir.path().join("state").exists());
+
+    env.run_ok(&["cooldown", "set", "work"]);
+    let blocked = env.run_cli(&["run", "codex", "--dry-run"]);
+    assert!(!blocked.status.success());
+    assert!(String::from_utf8_lossy(&blocked.stderr).contains("next known availability:"));
+
+    let incompatible = env.run_cli(&["run", "--account", "work", "--no-failover"]);
+    assert!(!incompatible.status.success());
+    assert!(String::from_utf8_lossy(&incompatible.stderr).contains("cannot be used with"));
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_probe_does_not_report_login_ok_or_lose_the_account_id() {
+    let env = TestEnv::new();
+    let mock = env.write_mock_script(
+        "codex.sh",
+        "#!/bin/sh
+printf 'Logged in using ChatGPT\n'
+exit 7
+",
+    );
+    env.run_ok(&["add", "codex", "work", "--no-login", "--binary", &mock]);
+    let probe = env.run_ok(&["probe", "work"]);
+    assert!(probe.contains("exit status: 7"));
+    let status = env.run_ok(&["ls"]);
+    assert!(status.contains("ERROR"));
+    assert!(status.contains("unverified"));
+    assert!(status.contains("tayassu doctor, then tayassu probe --id work"));
+
+    env.write_mock_script(
+        "codex.sh",
+        "#!/bin/sh
+printf 'Not logged in\n' >&2
+exit 1
+",
+    );
+    env.run_ok(&["probe", "work"]);
+    let status = env.run_ok(&["ls"]);
+    assert!(status.contains("AUTH"));
+    assert!(status.contains("tayassu account login work"));
+    let automatic = env.run_cli(&["run", "codex", "--dry-run"]);
+    assert!(!automatic.status.success());
+    assert!(String::from_utf8_lossy(&automatic.stderr).contains("login required"));
+    assert!(
+        env.run_ok(&["run", "--account", "work", "--dry-run"])
+            .contains("explicit account")
+    );
+}
+
+#[test]
+fn shell_completion_reads_current_accounts_providers_and_chains() {
+    let env = TestEnv::new();
+    env.run_ok(&["add", "codex", "work-codex", "--no-login"]);
+    let config = env.dir.path().join("config/tayassu/config.toml");
+    let contents = fs::read_to_string(&config).expect("read config");
+    fs::write(
+        &config,
+        contents.replace(
+            "[fallback_chains]",
+            "[fallback_chains]\nwork-chain = [\"codex\"]",
+        ),
+    )
+    .expect("add chain");
+
+    for (index, args, expected) in [
+        ("1", vec!["act"], "activate"),
+        ("2", vec!["run", "co"], "codex"),
+        ("4", vec!["auto", "run", "--chain", "wo"], "work-chain"),
+        ("3", vec!["run", "--account", "wo"], "work-codex"),
+        ("3", vec!["run", "--chain", "wo"], "work-chain"),
+        ("2", vec!["run", "--dry"], "--dry-run"),
+        ("2", vec!["disable", "wo"], "work-codex"),
+    ] {
+        let output = env
+            .command()
+            .env("TAYASSU_COMPLETE", "bash")
+            .env("_CLAP_COMPLETE_INDEX", index)
+            .args(["--", "tayassu"])
+            .args(&args)
+            .output()
+            .expect("get candidates");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if args == ["run", "co"] {
+            assert!(!String::from_utf8_lossy(&output.stdout).contains("copilot"));
+        }
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains(expected),
+            "{args:?}"
+        );
+    }
+}
+
+#[test]
+fn concurrent_account_registrations_do_not_lose_updates() {
+    let env = TestEnv::new();
+    let children: Vec<_> = (0..8)
+        .map(|index| {
+            env.command()
+                .args(["add", "codex", &format!("worker-{index}"), "--no-login"])
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .expect("start registration")
+        })
+        .collect();
+    for mut child in children {
+        assert!(child.wait().expect("wait for registration").success());
+    }
+    let status = env.run_ok(&["ls"]);
+    for index in 0..8 {
+        assert!(status.contains(&format!("worker-{index}")));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn agy_disabled_window_clears_previous_probe_cooldown_and_keeps_other_quota() {
+    let env = TestEnv::new();
+    let mock = env.write_mock_script(
+        "agy.sh",
+        "#!/bin/sh\nprintf 'Claude and GPT models\tFHour Limit Remaining\t0%%\t2099-01-01T00:00:00Z\n'\n",
+    );
+    env.run_ok(&["add", "agy", "agy-host", "--no-login", "--binary", &mock]);
+    env.run_ok(&["probe", "agy-host"]);
+    assert!(
+        !env.run_cli(&["run", "agy", "--model", "claude", "--dry-run"])
+            .status
+            .success()
+    );
+
+    env.write_mock_script(
+        "agy.sh",
+        "#!/bin/sh\nprintf 'Claude and GPT models\tFHour Limit Remaining\tdisabled\nClaude and GPT models\tWeekly Limit Remaining\t35%%\n'\n",
+    );
+    assert!(env.run_ok(&["probe", "agy-host"]).contains("ok (1 windows"));
+    assert!(env.run_ok(&["ls"]).contains("claude:35%"));
+    assert!(
+        env.run_ok(&["run", "agy", "--model", "claude", "--dry-run"])
+            .contains("account: agy-host")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn opencode_outside_path_works_for_doctor_probe_and_run() {
+    let env = TestEnv::new();
+    let user_bin = env.dir.path().join("home/.opencode/bin");
+    fs::create_dir_all(&user_bin).expect("create provider bin directory");
+    let mock = env.write_mock_script(
+        "mock-opencode",
+        "#!/bin/sh\nif [ \"$1\" = auth ]; then printf 'Google  Google  stored\n'; else printf 'ran opencode\n'; fi\n",
+    );
+    fs::rename(mock, user_bin.join("opencode")).expect("install mock outside PATH");
+
+    env.run_ok(&["add", "opencode", "opencode-host", "--no-login"]);
+    assert!(env.run_ok(&["doctor"]).contains("binary 'opencode' found"));
+    assert!(
+        env.run_ok(&["probe", "opencode-host"])
+            .contains("opencode-host: ok (1 windows")
+    );
+    assert!(
+        env.run_ok(&["run", "opencode", "--dry-run"])
+            .contains(".opencode/bin/opencode")
+    );
+    assert!(env.run_ok(&["run", "opencode"]).contains("ran opencode"));
+}
+
+#[cfg(unix)]
+#[test]
+fn strict_routing_probes_each_profile_and_skips_unknown_or_exhausted_quota() {
+    let env = TestEnv::new();
+    let mock_codex = env.write_mock_script(
+        "codex-quota",
+        r#"#!/bin/bash
+set -eu
+if [[ "${1:-}" == app-server ]]; then
+  IFS= read -r initialize
+  [[ "$initialize" == *'"method":"initialize"'* ]]
+  printf '%s\n' '{"id":1,"result":{}}'
+  IFS= read -r initialized
+  [[ "$initialized" == *'"method":"initialized"'* ]]
+  IFS= read -r quota
+  [[ "$quota" == *'"method":"account/rateLimits/read"'* ]]
+  case "$CODEX_HOME" in
+    */codex-full) used=100 ;;
+    */codex-available) used=27 ;;
+    *) exit 2 ;;
+  esac
+  printf '{"id":2,"result":{"rateLimits":{"primary":{"usedPercent":%s,"resetsAt":4102444800}}}}\n' "$used"
+else
+  printf 'ran %s\n' "${CODEX_HOME##*/}"
+fi
+"#,
+    );
+    let mock_claude =
+        env.write_mock_script("claude-auth", "#!/bin/sh\nprintf '{\"loggedIn\":true}\n'\n");
+    for (id, provider, priority, binary) in [
+        ("codex-full", "codex", "10", &mock_codex),
+        ("codex-available", "codex", "20", &mock_codex),
+        ("claude-unknown", "claude", "1", &mock_claude),
+    ] {
+        env.run_ok(&[
+            "add",
+            provider,
+            id,
+            "--no-login",
+            "--priority",
+            priority,
+            "--binary",
+            binary,
+        ]);
+    }
+    let config = env.dir.path().join("config/tayassu/config.toml");
+    let contents = fs::read_to_string(&config).expect("read config");
+    fs::write(
+        &config,
+        contents.replace(
+            "[fallback_chains]",
+            "[fallback_chains]\nauto = [\"claude\", \"codex\"]",
+        ),
+    )
+    .expect("configure chain");
+
+    let launch = env.run_ok(&["run", "--chain", "auto", "--require-quota"]);
+    assert!(launch.contains("ran codex-available"));
+    let automatic = env.run_ok(&["auto", "run"]);
+    assert!(automatic.contains("ran codex-available"));
+    fs::write(&config, contents).expect("remove configured chain");
+    let automatic = env.run_ok(&["auto", "run"]);
+    assert!(automatic.contains("ran codex-available"));
+    fs::write(
+        &config,
+        fs::read_to_string(&config).expect("config").replace(
+            "[fallback_chains]",
+            "[fallback_chains]\nauto = [\"claude\", \"codex\"]",
+        ),
+    )
+    .expect("restore chain");
+    let status = env.run_ok(&["ls"]);
+    assert!(status.contains("default:73%"));
+    assert!(status.contains("EXHAUSTED"));
+
+    let preview = env.run_ok(&["run", "--chain", "auto", "--require-quota", "--dry-run"]);
+    assert!(preview.contains("account: codex-available"));
+}
+
+#[cfg(unix)]
+#[test]
+fn opencode_strict_routing_uses_the_catalog_and_passes_the_measured_model() {
+    let env = TestEnv::new();
+    let mock_opencode = env.write_mock_script(
+        "opencode-catalog",
+        r#"#!/bin/sh
+case "$1" in
+  auth) printf '%s\n' '[{"id":"github-copilot","connections":[{"id":"linked"}]},{"id":"google","connections":[{"id":"unknown"}]}]' ;;
+  models) printf '%s\n' 'github-copilot/gpt-test' 'google/gemini-test' ;;
+  *) printf '%s\n' "$*" ;;
+esac
+"#,
+    );
+    let mock_copilot = env.write_mock_script(
+        "copilot-quota",
+        r#"#!/bin/bash
+IFS= read -r header
+IFS= read -r empty
+length="${header#Content-Length: }"
+IFS= read -r -N "${length//$'\r'/}" request
+[[ "$request" == *'account.getQuota'* ]] || exit 2
+response='{"jsonrpc":"2.0","id":2,"result":{"quotaSnapshots":{"premium_interactions":{"entitlementRequests":300,"remainingPercentage":42,"resetDate":"2099-01-01T00:00:00Z"}}}}'
+printf 'Content-Length: %s\r\n\r\n%s' "${#response}" "$response"
+"#,
+    );
+    env.run_ok(&[
+        "add",
+        "opencode",
+        "open",
+        "--no-login",
+        "--binary",
+        &mock_opencode,
+    ]);
+    env.run_ok(&[
+        "add",
+        "copilot",
+        "copilot",
+        "--no-login",
+        "--binary",
+        &mock_copilot,
+    ]);
+    let config = env.dir.path().join("config/tayassu/config.toml");
+    let contents = fs::read_to_string(&config).expect("read config");
+    let contents = contents.replace(
+        "provider = \"opencode\"",
+        "provider = \"opencode\"\nopencode_copilot_account = \"copilot\"",
+    );
+    fs::write(config, contents).expect("link matching Copilot profile");
+
+    let launch = env.run_ok(&["run", "opencode", "--require-quota"]);
+    assert!(launch.contains("--model github-copilot/gpt-test"));
+    let models = env.run_ok(&["ls", "opencode", "--list-models"]);
+    assert!(models.contains("github-copilot/gpt-test 42% github-copilot"));
+    assert!(models.contains("google/gemini-test unknown google"));
+    let unavailable = env.run_cli(&[
+        "run",
+        "opencode",
+        "--require-quota",
+        "--model",
+        "google/gemini-test",
+        "--dry-run",
+    ]);
+    assert!(!unavailable.status.success());
+}
+
+#[cfg(unix)]
+#[test]
+fn auto_probe_installs_and_enables_timer_without_overwriting_existing_units() {
+    let env = TestEnv::new();
+    env.write_mock_script(
+        "systemctl",
+        "#!/bin/sh\ncase \"$*\" in *is-enabled*) exit 1;; esac\nexit 0\n",
+    );
+    let path = format!("{}:/usr/bin:/bin", env.dir.path().display());
+    let run = || {
+        env.command()
+            .env("PATH", &path)
+            .args(["auto", "probe"])
+            .output()
+            .expect("run auto probe")
+    };
+    let first = run();
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let timer = env
+        .dir
+        .path()
+        .join("config/systemd/user/tayassu-probe.timer");
+    assert!(timer.exists());
+    fs::write(&timer, "custom timer").expect("customize timer");
+    let second = run();
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(timer).expect("read timer"),
+        "custom timer"
+    );
+}
+
+#[test]
+fn shared_token_does_not_confirm_two_copilot_profiles() {
+    let env = TestEnv::new();
+    let ids = ["copilot-work", "copilot-personal"];
+    for id in ids {
+        env.run_ok(&["add", "copilot", id, "--no-login", "--binary", "/bin/false"]);
+    }
+    let output = env
+        .command()
+        .env("GH_TOKEN", "synthetic")
+        .arg("probe")
+        .output()
+        .expect("probe");
+    assert!(output.status.success());
+    let report = String::from_utf8(output.stdout).expect("text report");
+    for id in ids {
+        assert!(report.contains(&format!(
+            "unable to verify Copilot authentication for account '{id}'"
+        )));
+    }
 }
 
 #[test]
@@ -620,13 +1046,9 @@ fn uninstall_removes_hooks_units_and_binary_while_keeping_data_unless_purged() {
     let fake_bin = env.dir.path().join("tayassu-copy");
     fs::write(&fake_bin, "bin").expect("write fake bin");
 
-    let dry = Command::new(env!("CARGO_BIN_EXE_tayassu"))
+    let dry = env
+        .command()
         .args(["uninstall", "--dry-run"])
-        .env("PATH", "/usr/bin:/bin")
-        .env("HOME", &home)
-        .env("XDG_CONFIG_HOME", env.dir.path().join("config"))
-        .env("XDG_STATE_HOME", env.dir.path().join("state"))
-        .env("XDG_DATA_HOME", env.dir.path().join("data"))
         .env("TAYASSU_UNINSTALL_BIN", &fake_bin)
         .output()
         .expect("dry uninstall");
@@ -636,13 +1058,9 @@ fn uninstall_removes_hooks_units_and_binary_while_keeping_data_unless_purged() {
     assert!(dry_out.contains("[dry-run] binary:"));
     assert!(fake_bin.exists());
 
-    let run = Command::new(env!("CARGO_BIN_EXE_tayassu"))
+    let run = env
+        .command()
         .args(["uninstall", "--yes"])
-        .env("PATH", "/usr/bin:/bin")
-        .env("HOME", &home)
-        .env("XDG_CONFIG_HOME", env.dir.path().join("config"))
-        .env("XDG_STATE_HOME", env.dir.path().join("state"))
-        .env("XDG_DATA_HOME", env.dir.path().join("data"))
         .env("TAYASSU_UNINSTALL_BIN", &fake_bin)
         .output()
         .expect("uninstall");
@@ -662,16 +1080,11 @@ fn uninstall_removes_hooks_units_and_binary_while_keeping_data_unless_purged() {
             .join("config/systemd/user/tayassu-probe.timer")
             .exists()
     );
-    // User data stays untouched without --purge.
     assert!(env.dir.path().join("config/tayassu/config.toml").exists());
 
-    let purge = Command::new(env!("CARGO_BIN_EXE_tayassu"))
+    let purge = env
+        .command()
         .args(["uninstall", "--yes", "--purge"])
-        .env("PATH", "/usr/bin:/bin")
-        .env("HOME", &home)
-        .env("XDG_CONFIG_HOME", env.dir.path().join("config"))
-        .env("XDG_STATE_HOME", env.dir.path().join("state"))
-        .env("XDG_DATA_HOME", env.dir.path().join("data"))
         .env("TAYASSU_UNINSTALL_BIN", &fake_bin)
         .output()
         .expect("purge");

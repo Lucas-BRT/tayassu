@@ -17,8 +17,14 @@ const GITHUB_REPO: &str = "Lucas-BRT/tayassu";
 /// Binary filename inside release archives.
 pub const BIN_NAME: &str = "tayassu";
 
-/// Checksum manifest filename uploaded with every release.
+/// Checksum manifest filename uploaded with every release (fallback).
 pub const CHECKSUMS_ASSET_NAME: &str = "SHA256SUMS";
+
+/// Per-asset checksum filename produced by `tools/package-release.sh`.
+#[must_use]
+pub fn asset_checksum_name(asset_name: &str) -> String {
+    format!("{asset_name}.sha256")
+}
 
 /// HTTP request timeout for release metadata and asset downloads.
 const HTTP_TIMEOUT_SECS: u64 = 10;

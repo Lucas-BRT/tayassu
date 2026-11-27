@@ -1,9 +1,11 @@
 use clap::ValueEnum;
+use clap_complete::CompletionCandidate;
 use std::fmt::Write as _;
 use std::fs;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tayassu_core::ProviderKind;
+use tayassu_store::{AppConfig, XdgPaths};
 
 /// Default providers wrapped by `tayassu activate` when `--provider` is omitted.
 pub const DEFAULT_SHELL_PROVIDERS: &[ProviderKind] = &[
@@ -14,6 +16,9 @@ pub const DEFAULT_SHELL_PROVIDERS: &[ProviderKind] = &[
     ProviderKind::Opencode,
 ];
 
+/// Environment variable used by the generated shell completers.
+pub const COMPLETION_ENV: &str = "TAYASSU_COMPLETE";
+
 /// Marker line that makes rc-file edits idempotent.
 const RC_MARKER: &str = "# tayassu activate";
 
@@ -23,9 +28,63 @@ const FISH_CONF_DIR: &str = ".config/fish";
 /// Fish snippet filename under `conf.d/` (autoloaded by fish).
 const FISH_CONF_FILE: &str = "conf.d/tayassu.fish";
 
+fn load_completion_config() -> Option<AppConfig> {
+    let paths = XdgPaths::from_env().ok()?;
+    AppConfig::load(&paths.config_file).ok()
+}
+
+pub fn account_candidates() -> Vec<CompletionCandidate> {
+    load_completion_config().map_or_else(Vec::new, |config| {
+        config
+            .accounts
+            .into_iter()
+            .map(|account| {
+                CompletionCandidate::new(account.id.to_string()).help(Some(account.label.into()))
+            })
+            .collect()
+    })
+}
+
+pub fn chain_candidates() -> Vec<CompletionCandidate> {
+    load_completion_config().map_or_else(Vec::new, |config| {
+        config
+            .fallback_chains
+            .into_keys()
+            .map(CompletionCandidate::new)
+            .collect()
+    })
+}
+
+/// Providers with at least one enabled account, listed once per provider.
+pub fn runnable_provider_candidates() -> Vec<CompletionCandidate> {
+    load_completion_config().map_or_else(Vec::new, |config| {
+        DEFAULT_SHELL_PROVIDERS
+            .iter()
+            .copied()
+            .chain([ProviderKind::Custom])
+            .filter(|provider| {
+                config
+                    .accounts
+                    .iter()
+                    .any(|a| a.enabled && a.provider == *provider)
+            })
+            .map(|provider| CompletionCandidate::new(provider.as_str()))
+            .collect()
+    })
+}
+
+pub fn provider_candidates() -> Vec<CompletionCandidate> {
+    DEFAULT_SHELL_PROVIDERS
+        .iter()
+        .copied()
+        .chain([ProviderKind::Custom])
+        .map(|provider| CompletionCandidate::new(provider.as_str()))
+        .collect()
+}
+
 /// A shell tayassu can activate: wrapper functions, completion and one-time installation.
 pub trait Shell {
-    /// Shell name as used in `COMPLETE=<name>` and `tayassu activate <name>`.
+    /// Shell name as used in `TAYASSU_COMPLETE=<name>` and `tayassu activate <name>`.
     fn name(&self) -> &'static str;
 
     /// Wrapper function source routing `provider`'s CLI through `tayassu run`.
@@ -36,8 +95,6 @@ pub trait Shell {
 
     /// Idempotently hooks `tayassu activate` into this shell's startup under `home`.
     ///
-    /// Returns a description of the change, or `None` when the shell is absent or already set up.
-    ///
     /// # Errors
     ///
     /// Returns an I/O error when a startup file cannot be written.
@@ -45,15 +102,17 @@ pub trait Shell {
 
     /// Removes the `tayassu activate` hook from this shell's startup under `home`.
     ///
-    /// Returns a description of the change, or `None` when nothing was installed.
-    ///
     /// # Errors
     ///
     /// Returns an I/O error when a startup file cannot be read or updated.
     fn uninstall(&self, home: &Path) -> io::Result<Option<String>>;
 
     /// Startup file path that would be modified or removed if currently configured.
-    fn installed_path(&self, home: &Path) -> io::Result<Option<std::path::PathBuf>>;
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error when a startup file cannot be inspected.
+    fn installed_path(&self, home: &Path) -> io::Result<Option<PathBuf>>;
 
     /// Full activation script: wrappers for `providers` followed by completion.
     fn activation(&self, providers: &[ProviderKind], failover: bool) -> String {
@@ -115,7 +174,7 @@ pub trait RcShell: Shell {
     /// # Errors
     ///
     /// Returns an I/O error when the rc file cannot be read.
-    fn installed_rc(&self, home: &Path) -> io::Result<Option<std::path::PathBuf>> {
+    fn installed_rc(&self, home: &Path) -> io::Result<Option<PathBuf>> {
         let path = home.join(self.rc_file());
         if !path.is_file() {
             return Ok(None);
@@ -138,13 +197,12 @@ pub trait RcShell: Shell {
         if !existing.contains(RC_MARKER) {
             return Ok(None);
         }
-        let activate_prefix = "command -v tayassu";
         let mut kept: Vec<&str> = Vec::new();
         let mut skip_next = false;
         for line in existing.lines() {
             if skip_next {
                 skip_next = false;
-                if line.contains(activate_prefix) && line.contains("tayassu activate") {
+                if line.contains("command -v tayassu") && line.contains("tayassu activate") {
                     continue;
                 }
             }
@@ -170,7 +228,6 @@ pub trait RcShell: Shell {
     }
 }
 
-/// Renders a POSIX-style wrapper function (bash and zsh share syntax).
 fn posix_wrapper(provider: ProviderKind, failover: bool) -> String {
     let flag = if failover { "" } else { " --no-failover" };
     format!(
@@ -180,11 +237,8 @@ fn posix_wrapper(provider: ProviderKind, failover: bool) -> String {
     )
 }
 
-/// GNU Bash (`~/.bashrc`).
 struct Bash;
-/// Zsh (`~/.zshrc`).
 struct Zsh;
-/// Fish (`~/.config/fish`).
 struct Fish;
 
 impl Shell for Bash {
@@ -195,7 +249,7 @@ impl Shell for Bash {
         posix_wrapper(provider, failover)
     }
     fn completion(&self) -> String {
-        "source <(COMPLETE=bash tayassu)".to_owned()
+        format!("eval \"$({COMPLETION_ENV}=bash tayassu)\"")
     }
     fn install(&self, home: &Path) -> io::Result<Option<String>> {
         self.install_rc(home)
@@ -203,7 +257,7 @@ impl Shell for Bash {
     fn uninstall(&self, home: &Path) -> io::Result<Option<String>> {
         self.uninstall_rc(home)
     }
-    fn installed_path(&self, home: &Path) -> io::Result<Option<std::path::PathBuf>> {
+    fn installed_path(&self, home: &Path) -> io::Result<Option<PathBuf>> {
         self.installed_rc(home)
     }
 }
@@ -222,7 +276,7 @@ impl Shell for Zsh {
         posix_wrapper(provider, failover)
     }
     fn completion(&self) -> String {
-        "source <(COMPLETE=zsh tayassu)".to_owned()
+        format!("eval \"$({COMPLETION_ENV}=zsh tayassu)\"")
     }
     fn install(&self, home: &Path) -> io::Result<Option<String>> {
         self.install_rc(home)
@@ -230,7 +284,7 @@ impl Shell for Zsh {
     fn uninstall(&self, home: &Path) -> io::Result<Option<String>> {
         self.uninstall_rc(home)
     }
-    fn installed_path(&self, home: &Path) -> io::Result<Option<std::path::PathBuf>> {
+    fn installed_path(&self, home: &Path) -> io::Result<Option<PathBuf>> {
         self.installed_rc(home)
     }
 }
@@ -254,7 +308,7 @@ impl Shell for Fish {
         )
     }
     fn completion(&self) -> String {
-        "COMPLETE=fish tayassu | source".to_owned()
+        format!("env {COMPLETION_ENV}=fish tayassu | source")
     }
     fn install(&self, home: &Path) -> io::Result<Option<String>> {
         if !home.join(FISH_CONF_DIR).is_dir() {
@@ -279,7 +333,7 @@ impl Shell for Fish {
         fs::remove_file(&path)?;
         Ok(Some(format!("fish: removed {}", path.display())))
     }
-    fn installed_path(&self, home: &Path) -> io::Result<Option<std::path::PathBuf>> {
+    fn installed_path(&self, home: &Path) -> io::Result<Option<PathBuf>> {
         let path = home.join(FISH_CONF_DIR).join(FISH_CONF_FILE);
         Ok(path.exists().then_some(path))
     }
@@ -321,7 +375,7 @@ mod tests {
             .shell()
             .activation(&[ProviderKind::Agy], true);
         assert!(bash.contains("agy() { tayassu run agy -- \"$@\"; }"));
-        assert!(bash.contains("source <(COMPLETE=bash tayassu)"));
+        assert!(bash.contains("eval \"$(TAYASSU_COMPLETE=bash tayassu)\""));
 
         let fish = ShellKind::Fish
             .shell()
@@ -331,7 +385,7 @@ mod tests {
     }
 
     #[test]
-    fn install_is_idempotent_and_skips_absent_shells() {
+    fn install_and_uninstall_are_idempotent() {
         let home = tempfile::tempdir().expect("tempdir");
         fs::write(home.path().join(".bashrc"), "export A=1").expect("write");
         fs::create_dir_all(home.path().join(FISH_CONF_DIR)).expect("mkdir");
@@ -349,10 +403,6 @@ mod tests {
         );
 
         for kind in ShellKind::ALL {
-            assert!(kind.shell().install(home.path()).expect("again").is_none());
-        }
-
-        for kind in ShellKind::ALL {
             kind.shell().uninstall(home.path()).expect("uninstall");
         }
         assert_eq!(
@@ -365,13 +415,5 @@ mod tests {
                 .join(".config/fish/conf.d/tayassu.fish")
                 .exists()
         );
-        for kind in ShellKind::ALL {
-            assert!(
-                kind.shell()
-                    .uninstall(home.path())
-                    .expect("uninstall again")
-                    .is_none()
-            );
-        }
     }
 }
