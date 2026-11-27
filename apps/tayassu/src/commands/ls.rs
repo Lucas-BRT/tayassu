@@ -39,6 +39,11 @@ impl Execute for Ls {
                 .state
                 .statuses
                 .iter()
+                .filter(|status| {
+                    accounts
+                        .iter()
+                        .any(|account| account.id == status.account_id)
+                })
                 .flat_map(|status| {
                     status.windows.iter().map(move |window| {
                         serde_json::json!({
@@ -55,7 +60,7 @@ impl Execute for Ls {
                 .collect();
             let json = serde_json::json!({
                 "accounts": accounts,
-                "statuses": app.state.statuses,
+                "statuses": app.state.statuses.iter().filter(|status| accounts.iter().any(|account| account.id == status.account_id)).collect::<Vec<_>>(),
                 "quota": quota,
             });
             return writeln!(out, "{json:#}").context("failed to write JSON");

@@ -91,9 +91,15 @@ impl<'a> StatusTable<'a> {
             .collect();
 
         if filtered.is_empty() {
+            if let Some(provider) = self.provider_filter {
+                return writeln!(
+                    writer,
+                    "No accounts configured for {provider}. Add one with: tayassu add {provider}"
+                );
+            }
             return writeln!(
                 writer,
-                "No accounts configured. Add one with: tayassu account add <id> <provider>"
+                "No accounts configured. Import existing credentials with: tayassu import\nOr add an account with: tayassu add <provider> [id]"
             );
         }
 
@@ -163,7 +169,7 @@ impl<'a> StatusTable<'a> {
                 let action = if failure.is_authentication() {
                     format!("tayassu login {id}")
                 } else {
-                    format!("tayassu doctor, then tayassu probe --id {id}")
+                    format!("tayassu doctor, then tayassu probe {id}")
                 };
                 writeln!(writer, "  {id}: {reason}. Next: {action}")?;
             }

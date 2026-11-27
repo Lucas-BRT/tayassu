@@ -35,6 +35,9 @@ jobs:
       - name: Activate pinned Rust toolchain
         run: cargo --version
 
+      - name: Install supported shells
+        run: sudo apt-get update && sudo apt-get install -y fish zsh
+
       - name: Cache Cargo artifacts
         # v2.7.8
         uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6
@@ -55,6 +58,8 @@ jobs:
 
       - name: Run tests
         run: cargo nextest run --locked --workspace
+        env:
+          TAYASSU_REQUIRE_TEST_SHELLS: "1"
 
       - name: Test installer and packaging
         run: |

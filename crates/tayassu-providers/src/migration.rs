@@ -41,7 +41,7 @@ pub struct MigrationFile {
     pub dest_rel: PathBuf,
     /// Whether `source_path` currently exists as a regular file.
     pub exists: bool,
-    /// Whether removing `source_path` after a verified copy is safe in [`MigrationMode::MoveAuth`].
+    /// Whether `source_path` may be removed after copying in [`MigrationMode::MoveAuth`].
     pub removable_on_move: bool,
 }
 
@@ -52,7 +52,7 @@ pub struct MigrationSummary {
     pub copied_files: usize,
     /// Number of original host auth files removed (only non-zero under [`MigrationMode::MoveAuth`]).
     pub removed_source_files: usize,
-    /// Whether the user still needs to run `tayassu account login <id>` for this profile.
+    /// Whether the user still needs to run `tayassu login <id>` for this profile.
     pub requires_relogin: bool,
 }
 
@@ -69,7 +69,7 @@ pub struct DiscoveredAgent {
     pub files: Vec<MigrationFile>,
     /// Human-readable explanation of how auto-updates remain safe for this provider.
     pub update_safety_note: &'static str,
-    /// Whether an interactive `tayassu account login` is still required after import.
+    /// Whether an interactive `tayassu login` is still required after import.
     pub requires_relogin: bool,
 }
 
@@ -100,6 +100,7 @@ impl DiscoveredAgent {
 
         let mut copied_files = 0usize;
         let mut removed_source_files = 0usize;
+        let mut sources_to_remove = Vec::new();
 
         for file in &self.files {
             if !file.exists {
@@ -118,13 +119,29 @@ impl DiscoveredAgent {
             })?;
             copied_files += 1;
 
-            if mode == MigrationMode::MoveAuth && file.removable_on_move && dest_path.is_file() {
-                fs::remove_file(&file.source_path).map_err(|source| ProviderError::Io {
+            if mode == MigrationMode::MoveAuth && file.removable_on_move {
+                let original = fs::read(&file.source_path).map_err(|source| ProviderError::Io {
                     path: file.source_path.clone(),
                     source,
                 })?;
-                removed_source_files += 1;
+                let copy = fs::read(&dest_path).map_err(|source| ProviderError::Io {
+                    path: dest_path.clone(),
+                    source,
+                })?;
+                if original != copy {
+                    return Err(ProviderError::CopyVerification {
+                        path: file.source_path.clone(),
+                    });
+                }
+                sources_to_remove.push(&file.source_path);
             }
+        }
+        for path in sources_to_remove {
+            fs::remove_file(path).map_err(|source| ProviderError::Io {
+                path: path.clone(),
+                source,
+            })?;
+            removed_source_files += 1;
         }
 
         Ok(MigrationSummary {
@@ -132,6 +149,52 @@ impl DiscoveredAgent {
             removed_source_files,
             requires_relogin: self.requires_relogin,
         })
+    }
+}
+
+#[cfg(test)]
+mod migration_tests {
+    use super::*;
+    use crate::AdapterRegistry;
+    use tayassu_core::AccountConfig;
+
+    #[test]
+    fn failed_later_copy_keeps_all_original_credentials() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let first = dir.path().join("first");
+        fs::write(&first, b"credential").expect("write source");
+        let missing = dir.path().join("missing");
+        let account = AccountConfig::new("work".parse().expect("id"), ProviderKind::Claude, "work");
+        let profile = AdapterRegistry
+            .adapter_for(ProviderKind::Claude)
+            .build_environment(&account, &dir.path().join("profiles"));
+        let agent = DiscoveredAgent {
+            provider: ProviderKind::Claude,
+            binary_path: dir.path().join("cli"),
+            default_account_id: account.id,
+            files: vec![
+                MigrationFile {
+                    source_path: first.clone(),
+                    dest_rel: "first".into(),
+                    exists: true,
+                    removable_on_move: true,
+                },
+                MigrationFile {
+                    source_path: missing,
+                    dest_rel: "second".into(),
+                    exists: true,
+                    removable_on_move: true,
+                },
+            ],
+            update_safety_note: "",
+            requires_relogin: false,
+        };
+        assert!(
+            agent
+                .apply(&profile, dir.path(), MigrationMode::MoveAuth)
+                .is_err()
+        );
+        assert_eq!(fs::read(first).expect("source preserved"), b"credential");
     }
 }
 
@@ -296,7 +359,7 @@ const fn update_safety_note_for(provider: ProviderKind) -> &'static str {
             "Uses COPILOT_HOME; ~/.local/bin/copilot and auto-updater stay untouched"
         }
         ProviderKind::Agy => {
-            "Uses fake HOME with ~/.local/bin symlinked so agy update updates the shared host binary; run tayassu account login to authenticate"
+            "Uses fake HOME with ~/.local/bin symlinked so agy update updates the shared host binary"
         }
         ProviderKind::Opencode => {
             "Uses fake HOME with ~/.opencode/bin symlinked so opencode upgrade updates the shared host binary"

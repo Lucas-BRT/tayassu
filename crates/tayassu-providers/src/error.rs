@@ -5,6 +5,9 @@ use thiserror::Error;
 /// Errors returned by provider isolation and probing adapters.
 #[derive(Debug, Error)]
 pub enum ProviderError {
+    /// Copied credentials differ from their source.
+    #[error("copied file differs from source: {path}; source was preserved")]
+    CopyVerification { path: PathBuf },
     /// Filesystem operation failed while preparing an isolated profile.
     #[error("profile filesystem error at {path}: {source}")]
     Io {
@@ -24,7 +27,7 @@ pub enum ProviderError {
 
     /// Isolated profile has not been authenticated yet.
     #[error(
-        "account '{account_id}' ({provider}) is not logged in; run `tayassu account login {account_id}`"
+        "account '{account_id}' ({provider}) is not logged in; run `tayassu login {account_id}`"
     )]
     AuthenticationRequired {
         /// Provider requiring authentication.

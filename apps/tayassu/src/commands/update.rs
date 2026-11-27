@@ -114,8 +114,10 @@ impl Update {
         writeln!(out, "Updated {} to {}.", exe.display(), release.tag)?;
 
         // Refresh shell activation and any existing systemd units.
-        for line in ShellActivation.install(app)? {
-            writeln!(out, "shell: {line}")?;
+        if !ShellActivation.planned_removals(app)?.is_empty() {
+            for line in ShellActivation.install(app)? {
+                writeln!(out, "shell: {line}")?;
+            }
         }
         if let Some(config_base) = app.paths.config_file.parent().and_then(Path::parent) {
             let systemd_dir = config_base.join("systemd/user");
@@ -143,6 +145,7 @@ impl Update {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::release::MockReleaseSource;
     use crate::release::ReleaseAsset;
     use flate2::Compression;
     use flate2::write::GzEncoder;
@@ -167,6 +170,62 @@ mod tests {
                 .cloned()
                 .with_context(|| format!("missing fake blob {url}"))
         }
+    }
+
+    #[test]
+    fn checksum_mismatch_preserves_installed_binary() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let exe = dir.path().join("tayassu");
+        fs::write(&exe, b"original").expect("write original");
+        let asset = archive_name(current_target().expect("target"));
+        let release = Release {
+            tag: "v99.0.0".to_owned(),
+            version: Version::new(99, 0, 0),
+            prerelease: false,
+            assets: vec![
+                ReleaseAsset {
+                    name: asset.clone(),
+                    download_url: "archive".to_owned(),
+                },
+                ReleaseAsset {
+                    name: CHECKSUMS_ASSET_NAME.to_owned(),
+                    download_url: "sums".to_owned(),
+                },
+            ],
+        };
+        let mut source = MockReleaseSource::new();
+        source
+            .expect_latest()
+            .with(mockall::predicate::eq(false))
+            .times(1)
+            .return_once(move |_| Ok(release));
+        let sums = format!("{}  {asset}\n", "0".repeat(64));
+        source
+            .expect_download()
+            .with(mockall::predicate::eq("sums"))
+            .times(1)
+            .return_once(move |_| Ok(sums.into_bytes()));
+        source
+            .expect_download()
+            .with(mockall::predicate::eq("archive"))
+            .times(1)
+            .return_once(|_| Ok(b"bad archive".to_vec()));
+        let app = App {
+            paths: XdgPaths::under(dir.path()),
+            config: tayassu_store::AppConfig::default(),
+            state: tayassu_store::RuntimeState::default(),
+        };
+        let cmd = Update {
+            check: false,
+            version: None,
+            pre: false,
+            dry_run: false,
+        };
+        let error = cmd
+            .run_with(&source, &exe, &app, &mut Vec::new())
+            .expect_err("reject invalid checksum");
+        assert!(error.to_string().contains("checksum"));
+        assert_eq!(fs::read(exe).expect("read original"), b"original");
     }
 
     #[test]
