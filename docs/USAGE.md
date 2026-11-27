@@ -194,6 +194,15 @@ tayassu uninstall --purge       # also remove config, state and isolated profile
 tayassu providers update        # run each provider CLI's native updater with real $HOME
 ```
 
+If GitHub's unauthenticated API quota is exhausted, retry after the time shown
+or set `TAYASSU_GITHUB_TOKEN`. With GitHub CLI already signed in, run:
+
+```bash
+TAYASSU_GITHUB_TOKEN="$(gh auth token --hostname github.com)" tayassu update
+```
+
+Tayassu uses the token only for GitHub release metadata requests.
+
 When running interactively in a terminal, `tayassu` checks for new releases in
 the background at most once every 24 hours and prints a one-line notice on
 stderr when an update is available (never during `run` or `activate`). Disable
