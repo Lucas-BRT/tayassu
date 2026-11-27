@@ -29,8 +29,23 @@ const RATE_LIMIT_MARKERS: &[&str] = &[
     "too many requests",
     "resource_exhausted",
     "limit reached",
-    "429",
 ];
+
+/// Phrases that introduce the time to wait inside a rate-limit message.
+const RETRY_ANCHORS: &[&[&str]] = &[
+    &["try", "again", "in"],
+    &["retry", "after"],
+    &["retry", "in"],
+    &["resets", "in"],
+    &["reset", "in"],
+    &["wait"],
+];
+
+/// HTTP status text that only counts as a rate-limit marker when it stands alone.
+const HTTP_TOO_MANY_REQUESTS: &str = "429";
+
+/// Seconds per day used when parsing textual retry-after durations.
+const SECS_PER_DAY: i64 = 24 * SECS_PER_HOUR;
 
 /// Seconds per minute used when parsing textual retry-after durations.
 const SECS_PER_MINUTE: i64 = 60;
@@ -39,7 +54,7 @@ const SECS_PER_MINUTE: i64 = 60;
 const SECS_PER_HOUR: i64 = 3600;
 
 /// Maximum retry-after duration (7 days in seconds) accepted from unstructured CLI stderr.
-const MAX_PARSED_COOLDOWN_SECS: i64 = 7 * 24 * SECS_PER_HOUR;
+const MAX_PARSED_COOLDOWN_SECS: i64 = 7 * SECS_PER_DAY;
 
 /// Substring marker emitted by `agy` when a profile has no stored OAuth credentials.
 const AGY_AUTH_REQUIRED_MARKER: &str = "authentication required";
@@ -69,6 +84,18 @@ const AGY_EXTRA_SHARED_LINKS: &[&str] = &[
     ".gemini/antigravity-cli/mcp",
     ".gemini/GEMINI.md",
 ];
+
+/// First port of the range used for per-account `opencode` managed services (host default is 49374).
+const OPENCODE_SERVICE_PORT_BASE: u16 = 50_000;
+
+/// Number of ports in the per-account `opencode` managed-service range.
+const OPENCODE_SERVICE_PORT_SPAN: u32 = 10_000;
+
+/// FNV-1a 32-bit offset basis.
+const FNV_OFFSET_BASIS: u32 = 0x811c_9dc5;
+
+/// FNV-1a 32-bit prime.
+const FNV_PRIME: u32 = 0x0100_0193;
 
 /// Shared links added for `opencode` fake `HOME` so `opencode upgrade`, skills, and plugins stay unified.
 const OPENCODE_EXTRA_SHARED_LINKS: &[&str] = &[
@@ -164,14 +191,31 @@ pub trait ProviderAdapter: Send + Sync {
         now: DateTime<Utc>,
     ) -> Option<CooldownEntry> {
         let lowered = output.to_ascii_lowercase();
-        let matched = RATE_LIMIT_MARKERS
+        // Only consider 429 as a rate limit when it appears as a standalone HTTP-like status,
+        // not embedded in longer numbers (e.g., "1429" or "status-429-extra").
+        let has_status_429 = mentions_status_429(&lowered);
+
+        // Rate-limit markers must appear in a context that looks like an error/output line,
+        // not just as substring anywhere in the (truncated) stderr. We check if the marker
+        // appears adjacent to error-related keywords, which distinguishes real rate-limit
+        // output from incidental text.
+        let has_rate_limit_marker = RATE_LIMIT_MARKERS
             .iter()
-            .any(|marker| lowered.contains(marker));
+            .any(|marker| is_marker_adjacent_to_error_keyword(&lowered, marker));
+
+        let matched = has_status_429 || has_rate_limit_marker;
         if !matched {
             return None;
         }
-        let duration_secs =
-            parse_retry_after_secs(&lowered).unwrap_or(DEFAULT_FALLBACK_COOLDOWN_SECS);
+
+        // Only parse retry-after if we actually found a clear rate-limit signal.
+        let duration_secs = if has_status_429 {
+            // For 429, use a moderate default; some providers specify a retry-after.
+            parse_retry_after_secs(&lowered).unwrap_or(DEFAULT_FALLBACK_COOLDOWN_SECS)
+        } else {
+            // For textual markers, try to parse a retry-after duration; fall back gracefully.
+            parse_retry_after_secs(&lowered).unwrap_or(DEFAULT_FALLBACK_COOLDOWN_SECS)
+        };
         Some(CooldownEntry {
             bucket: bucket.clone(),
             resets_at: now + TimeDelta::seconds(duration_secs),
@@ -557,6 +601,18 @@ impl ProviderAdapter for OpencodeAdapter {
         }
     }
 
+    fn build_environment(
+        &self,
+        account: &AccountConfig,
+        profiles_root: &Path,
+    ) -> ProfileEnvironment {
+        let profile_dir = profiles_root
+            .join(self.kind().as_str())
+            .join(account.id.as_str());
+        ProfileEnvironment::new(profile_dir, self.isolation(account))
+            .with_service_port(opencode_service_port(account.id.as_str()))
+    }
+
     fn login_args(&self) -> Vec<String> {
         vec!["auth".to_owned(), "login".to_owned()]
     }
@@ -618,6 +674,15 @@ impl ProviderAdapter for OpencodeAdapter {
             cooldowns: Vec::new(),
         })
     }
+}
+
+/// Derives a stable per-account managed-service port so isolated `opencode` homes never share one.
+fn opencode_service_port(account_id: &str) -> u16 {
+    let hash = account_id.bytes().fold(FNV_OFFSET_BASIS, |acc, byte| {
+        (acc ^ u32::from(byte)).wrapping_mul(FNV_PRIME)
+    });
+    let offset = u16::try_from(hash % OPENCODE_SERVICE_PORT_SPAN).unwrap_or_default();
+    OPENCODE_SERVICE_PORT_BASE + offset
 }
 
 /// Generic adapter for custom subscription-authenticated CLIs.
@@ -762,33 +827,85 @@ fn parse_retry_after_secs(lowered: &str) -> Option<i64> {
         .filter(|tok| !tok.is_empty())
         .collect();
 
-    let mut total_secs: i64 = 0;
-    let mut idx = 0;
+    let start = RETRY_ANCHORS
+        .iter()
+        .filter_map(|anchor| {
+            tokens
+                .windows(anchor.len())
+                .position(|window| window == *anchor)
+                .map(|pos| pos + anchor.len())
+        })
+        .min()
+        .unwrap_or(0);
 
+    let mut total_secs: i64 = 0;
+    let mut idx = start;
     while idx < tokens.len() {
         let token = tokens[idx];
         if let Some(secs) = parse_compact_duration_token(token) {
             total_secs = total_secs.saturating_add(secs);
             idx += 1;
-            continue;
-        }
-        if let Ok(value) = token.parse::<i64>()
+        } else if let Ok(value) = token.parse::<i64>()
             && value > 0
-            && let Some(unit) = tokens.get(idx + 1).copied()
-            && let Some(multiplier) = unit_multiplier_secs(unit)
         {
-            total_secs = total_secs.saturating_add(value.saturating_mul(multiplier));
-            idx += 2;
-            continue;
+            let multiplier = tokens.get(idx + 1).copied().and_then(unit_multiplier_secs);
+            match multiplier {
+                Some(multiplier) => {
+                    total_secs = total_secs.saturating_add(value.saturating_mul(multiplier));
+                    idx += 2;
+                }
+                // A bare number right after "retry after" is a count of seconds.
+                None if total_secs == 0 && idx == start && start > 0 => {
+                    total_secs = value;
+                    break;
+                }
+                None => break,
+            }
+        } else if total_secs > 0 && token == "and" {
+            idx += 1;
+        } else if total_secs > 0 {
+            break;
+        } else {
+            idx += 1;
         }
-        idx += 1;
     }
 
-    if total_secs > 0 && total_secs <= MAX_PARSED_COOLDOWN_SECS {
-        Some(total_secs)
-    } else {
-        None
+    (total_secs > 0 && total_secs <= MAX_PARSED_COOLDOWN_SECS).then_some(total_secs)
+}
+
+/// Returns `true` when `text` mentions HTTP status 429 as a standalone number.
+fn mentions_status_429(text: &str) -> bool {
+    text.match_indices(HTTP_TOO_MANY_REQUESTS)
+        .any(|(pos, found)| {
+            let before = text[..pos].chars().next_back();
+            let after = text[pos + found.len()..].chars().next();
+            !before.is_some_and(|ch| ch.is_ascii_alphanumeric())
+                && !after.is_some_and(|ch| ch.is_ascii_alphanumeric())
+        })
+}
+
+/// Returns `true` when a rate-limit marker is adjacent to a clear error/rate-keyword
+/// such as "error", "429", "limit", "exceeded", etc. This prevents matching markers
+/// that happen to appear in neutral or positive context.
+fn is_marker_adjacent_to_error_keyword(lowered: &str, marker: &str) -> bool {
+    // Check for common error/retry indicators nearby.
+    const ERROR_KEYWORDS: &[&str] = &[
+        "error", "429", "limit", "exceeded", "blocked", "throttl", "quota",
+    ];
+    // Search for the marker and check if it's near error-related keywords.
+    let Some(marker_pos) = lowered.find(marker) else {
+        return false;
+    };
+    // Grab a small window around the marker (up to 30 chars before/after).
+    let start = marker_pos.saturating_sub(30);
+    let end = std::cmp::min(lowered.len(), marker_pos + marker.len() + 30);
+    let window = &lowered[start..end];
+    for kw in ERROR_KEYWORDS {
+        if window.contains(*kw) {
+            return true;
+        }
     }
+    false
 }
 
 fn parse_compact_duration_token(token: &str) -> Option<i64> {
@@ -804,6 +921,7 @@ fn parse_compact_duration_token(token: &str) -> Option<i64> {
         "h" => Some(value.saturating_mul(SECS_PER_HOUR)),
         "m" => Some(value.saturating_mul(SECS_PER_MINUTE)),
         "s" => Some(value),
+        "d" => Some(value.saturating_mul(SECS_PER_DAY)),
         _ => None,
     }
 }
@@ -813,6 +931,7 @@ fn unit_multiplier_secs(unit: &str) -> Option<i64> {
         "h" | "hr" | "hrs" | "hour" | "hours" => Some(SECS_PER_HOUR),
         "m" | "min" | "mins" | "minute" | "minutes" => Some(SECS_PER_MINUTE),
         "s" | "sec" | "secs" | "second" | "seconds" => Some(1),
+        "d" | "day" | "days" => Some(SECS_PER_DAY),
         _ => None,
     }
 }

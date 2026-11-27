@@ -59,6 +59,9 @@ impl fmt::Display for RemainingPercent {
     }
 }
 
+/// Reason prefix marking cooldowns inferred from CLI output rather than reported by a provider.
+pub const PASSIVE_COOLDOWN_REASON_PREFIX: &str = "detected-rate-limit";
+
 /// Snapshot of a single rolling or weekly quota window reported by a provider.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QuotaWindow {
@@ -177,6 +180,10 @@ pub struct AccountStatus {
     /// Number of concurrent `tayassu run` sessions currently using this account.
     #[serde(default)]
     pub active_sessions: u32,
+    /// Process ids of the sessions counted in [`Self::active_sessions`], used to drop sessions
+    /// whose `tayassu` process was killed without running its destructors.
+    #[serde(default)]
+    pub session_pids: Vec<u32>,
 }
 
 impl AccountStatus {
@@ -190,7 +197,43 @@ impl AccountStatus {
             cooldowns: Vec::new(),
             last_probe_error: None,
             active_sessions: 0,
+            session_pids: Vec::new(),
         }
+    }
+
+    /// Registers a live session owned by process `pid`.
+    pub fn add_session(&mut self, pid: u32) {
+        if !self.session_pids.contains(&pid) {
+            self.session_pids.push(pid);
+        }
+        self.sync_session_count();
+    }
+
+    /// Unregisters the session owned by process `pid`.
+    pub fn remove_session(&mut self, pid: u32) {
+        self.session_pids.retain(|&owner| owner != pid);
+        self.sync_session_count();
+    }
+
+    /// Returns `true` when the stored count disagrees with the sessions still alive.
+    #[must_use]
+    pub fn sessions_stale(&self, is_alive: impl Fn(u32) -> bool) -> bool {
+        let live = self
+            .session_pids
+            .iter()
+            .filter(|&&pid| is_alive(pid))
+            .count();
+        u32::try_from(live) != Ok(self.active_sessions)
+    }
+
+    /// Drops sessions whose owning process is gone and resyncs the counter.
+    pub fn prune_sessions(&mut self, is_alive: impl Fn(u32) -> bool) {
+        self.session_pids.retain(|&pid| is_alive(pid));
+        self.sync_session_count();
+    }
+
+    fn sync_session_count(&mut self) {
+        self.active_sessions = u32::try_from(self.session_pids.len()).unwrap_or(u32::MAX);
     }
 
     /// Records a failed probe.
@@ -264,6 +307,30 @@ impl AccountStatus {
         let before = self.cooldowns.len();
         self.cooldowns.retain(|entry| &entry.bucket != bucket);
         self.cooldowns.len() < before
+    }
+
+    /// Removes passively detected cooldowns contradicted by fresh windows that still show quota.
+    pub fn clear_contradicted_passive_cooldowns(&mut self) {
+        let default_bucket = ModelBucket::default_bucket();
+        let windows = &self.windows;
+        self.cooldowns.retain(|entry| {
+            if !entry.reason.starts_with(PASSIVE_COOLDOWN_REASON_PREFIX) {
+                return true;
+            }
+            let covering = windows
+                .iter()
+                .filter(|window| window.bucket == entry.bucket || window.bucket == default_bucket)
+                .filter_map(|window| window.remaining);
+            // Keep the cooldown unless every covering window reports quota left.
+            let mut seen = false;
+            for remaining in covering {
+                seen = true;
+                if remaining.is_exhausted() {
+                    return true;
+                }
+            }
+            !seen
+        });
     }
 
     /// Drops cooldown entries that have already expired at `now`.

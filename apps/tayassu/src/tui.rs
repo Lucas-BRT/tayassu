@@ -476,6 +476,16 @@ struct TerminalGuard {
 impl TerminalGuard {
     fn enter() -> Result<Self> {
         enable_raw_mode().context("failed to enable terminal raw mode")?;
+        match Self::enter_alternate_screen() {
+            Ok(guard) => Ok(guard),
+            Err(err) => {
+                let _ = disable_raw_mode();
+                Err(err)
+            }
+        }
+    }
+
+    fn enter_alternate_screen() -> Result<Self> {
         let mut stdout = io::stdout();
         execute!(stdout, EnterAlternateScreen).context("failed to enter alternate screen")?;
         let backend = CrosstermBackend::new(stdout);
@@ -524,7 +534,7 @@ where
             && let Event::Key(key) = event::read().context("failed to read key event")?
             && key.kind == KeyEventKind::Press
         {
-            match ui.handle_key(key.code, key.modifiers, accounts.len()) {
+            match ui.handle_key(key.code, key.modifiers, visible.len()) {
                 DashAction::None => {}
                 DashAction::Quit => break,
                 DashAction::ProbeAll => {

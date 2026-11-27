@@ -225,6 +225,69 @@ Claude and GPT models\tFive Hour Limit Remaining\t0%\t2026-11-27T00:38:57Z
     }
 
     #[test]
+    fn rate_limit_detection_ignores_embedded_429_and_prefers_retry_hint() {
+        const FIVE_HOURS_PLUS_RETRY_MINUTES: i64 = 20;
+        const RETRY_AFTER_SECS: i64 = 120;
+        let account = AccountConfig::new("c".parse().expect("id"), ProviderKind::Claude, "C");
+        let now = Utc::now();
+        let bucket = ModelBucket::default_bucket();
+        let detect = |text: &str| ClaudeAdapter.detect_rate_limit(&account, &bucket, text, now);
+
+        assert!(detect("listening on port 4291 id=a429b").is_none());
+        assert!(detect("status: 429").is_some());
+
+        let hint = detect("5 hour limit reached. Try again in 20 minutes").expect("hint");
+        assert_eq!(
+            hint.resets_at.signed_duration_since(now).num_minutes(),
+            FIVE_HOURS_PLUS_RETRY_MINUTES
+        );
+        let bare = detect("429 Too Many Requests, retry-after: 120").expect("bare");
+        assert_eq!(
+            bare.resets_at.signed_duration_since(now).num_seconds(),
+            RETRY_AFTER_SECS
+        );
+        let days = detect("usage limit reached, resets in 2 days").expect("days");
+        assert_eq!(days.resets_at.signed_duration_since(now).num_hours(), 48);
+    }
+
+    #[test]
+    fn opencode_gets_stable_service_port_and_keeps_user_override() {
+        const OVERRIDE_PORT: u64 = 51_234;
+        let profiles_root = tempfile::tempdir().expect("profiles");
+        let real_home = tempfile::tempdir().expect("home");
+        let account = AccountConfig::new(
+            "opencode-a".parse().expect("id"),
+            ProviderKind::Opencode,
+            "A",
+        );
+        let adapter = AdapterRegistry.adapter_for(ProviderKind::Opencode);
+        let env = adapter.build_environment(&account, profiles_root.path());
+        let port = env.service_port.expect("port");
+        assert!((50_000..60_000).contains(&port));
+        assert_eq!(
+            Some(port),
+            adapter
+                .build_environment(&account, profiles_root.path())
+                .service_port
+        );
+
+        env.prepare(real_home.path()).expect("prepare");
+        let config = env
+            .profile_dir
+            .join(FAKE_HOME_SUBDIR)
+            .join(".config/opencode/service.json");
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&config).expect("read")).expect("json");
+        assert_eq!(written["port"], u64::from(port));
+
+        std::fs::write(&config, format!(r#"{{"port":{OVERRIDE_PORT}}}"#)).expect("override");
+        env.prepare(real_home.path()).expect("prepare again");
+        let kept: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&config).expect("read")).expect("json");
+        assert_eq!(kept["port"], OVERRIDE_PORT);
+    }
+
+    #[test]
     fn copilot_uses_native_env_and_opencode_isolates_home_and_xdg() {
         let profiles_root = TempDir::new().expect("temp dir");
         let registry = AdapterRegistry;

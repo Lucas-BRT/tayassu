@@ -247,4 +247,23 @@ mod tests {
         assert_eq!(picked.id, claude_idle.id);
         assert_eq!(bucket.as_str(), "default");
     }
+
+    #[test]
+    fn dead_session_pids_are_pruned() {
+        const LIVE_PID: u32 = 10;
+        const DEAD_PID: u32 = 20;
+        let mut status = AccountStatus::empty("a".parse().expect("id"));
+        status.add_session(LIVE_PID);
+        status.add_session(DEAD_PID);
+        assert_eq!(status.active_sessions, 2);
+
+        let alive = |pid: u32| pid == LIVE_PID;
+        assert!(status.sessions_stale(alive));
+        status.prune_sessions(alive);
+        assert_eq!(status.active_sessions, 1);
+        assert!(!status.sessions_stale(alive));
+
+        status.remove_session(LIVE_PID);
+        assert_eq!(status.active_sessions, 0);
+    }
 }

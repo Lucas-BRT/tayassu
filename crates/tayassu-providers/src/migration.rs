@@ -256,12 +256,6 @@ fn host_files_for(provider: ProviderKind, real_home: &Path) -> Vec<MigrationFile
             ),
             mig_file(
                 real_home,
-                ".config/opencode/service.json",
-                ".config/opencode/service.json",
-                true,
-            ),
-            mig_file(
-                real_home,
                 ".local/share/opencode/auth.json",
                 ".local/share/opencode/auth.json",
                 true,

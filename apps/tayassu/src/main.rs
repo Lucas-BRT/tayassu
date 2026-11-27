@@ -16,7 +16,8 @@ use std::collections::BTreeSet;
 use std::env;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command as ProcessCommand, ExitStatus, Stdio};
+use std::process::{self, Command as ProcessCommand, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use systemd::SystemdUnits;
 use tayassu_core::{
@@ -36,6 +37,17 @@ const DEFAULT_LOG_FILTER: &str = "warn";
 /// Fallback non-zero exit code when a child process is terminated by a signal.
 const SIGNAL_FALLBACK_EXIT_CODE: i32 = 1;
 
+/// Atomic flag set when SIGINT (Ctrl-C) is received, to trigger explicit session cleanup.
+static RECEIVED_INT: AtomicBool = AtomicBool::new(false);
+
+/// Installs a Ctrl-C handler that sets `RECEIVED_INT`.
+/// On systems where ctrlc isn't available (e.g. some Windows configs), it gracefully no-ops.
+fn install_ctrlc_handler() {
+    let _ = ctrlc::set_handler(move || {
+        RECEIVED_INT.store(true, Ordering::SeqCst);
+    });
+}
+
 /// Maximum stderr bytes buffered in memory during `tayassu run` for passive rate-limit detection.
 const MAX_CAPTURED_STDERR_BYTES: usize = 64 * 1024;
 
@@ -48,12 +60,18 @@ const MAX_FAILOVER_ATTEMPTS: usize = 2;
 /// CLI flags indicating the user is resuming an existing conversation in the current directory.
 const RESUME_FLAGS: &[&str] = &["-c", "--continue", "-r", "--resume", "--conversation"];
 
+/// Arguments for dumping the host `opencode` credentials as JSON on stdout.
+const OPENCODE_AUTH_EXPORT_ARGS: &[&str] = &["auth", "export"];
+
+/// Arguments for reading exported `opencode` credentials from stdin.
+const OPENCODE_AUTH_IMPORT_ARGS: &[&str] = &["auth", "import"];
+
 /// Relative path under `$XDG_CONFIG_HOME` where `systemd --user` units live.
 const SYSTEMD_USER_REL_DIR: &str = "systemd/user";
 
 struct RunRequest {
-    provider: Option<ProviderKind>,
     account: Option<AccountId>,
+    provider: Option<ProviderKind>,
     chain: Option<String>,
     model: Option<ModelBucket>,
     policy: Option<SelectionPolicy>,
@@ -67,6 +85,11 @@ struct RunOutcome {
     captured_stderr: String,
 }
 
+/// Returns whether a process with `pid` currently exists (Linux `/proc`).
+fn process_is_alive(pid: u32) -> bool {
+    Path::new("/proc").join(pid.to_string()).exists()
+}
+
 /// RAII guard tracking an active `tayassu run` session in `state.json` under an exclusive lock.
 struct SessionGuard {
     state_file: PathBuf,
@@ -77,8 +100,7 @@ impl SessionGuard {
     fn acquire(state_file: PathBuf, account_id: AccountId) -> Result<Self> {
         let id = account_id.clone();
         RuntimeState::update_locked(&state_file, |state| {
-            let entry = state.status_for_mut(&id);
-            entry.active_sessions = entry.active_sessions.saturating_add(1);
+            state.status_for_mut(&id).add_session(process::id());
         })
         .with_context(|| format!("failed to record active session for '{account_id}'"))?;
         Ok(Self {
@@ -92,8 +114,7 @@ impl Drop for SessionGuard {
     fn drop(&mut self) {
         let id = self.account_id.clone();
         let _ = RuntimeState::update_locked(&self.state_file, |state| {
-            let entry = state.status_for_mut(&id);
-            entry.active_sessions = entry.active_sessions.saturating_sub(1);
+            state.status_for_mut(&id).remove_session(process::id());
         });
     }
 }
@@ -133,8 +154,8 @@ impl App {
             }
             Command::Dash => self.handle_dash(),
             Command::Run {
-                provider,
                 account,
+                provider,
                 chain,
                 model,
                 policy,
@@ -143,8 +164,8 @@ impl App {
                 args,
             } => self.run_agent(
                 &RunRequest {
-                    provider,
                     account,
+                    provider,
                     chain,
                     model,
                     policy,
@@ -223,6 +244,8 @@ impl App {
             1
         };
 
+        self.prune_stale_sessions()?;
+
         for attempt in 1..=max_attempts {
             let (account, bucket) =
                 self.resolve_run_target(req, project_cfg.as_ref(), &cwd, router)?;
@@ -252,14 +275,18 @@ impl App {
                 .with_context(|| format!("failed to save {}", self.paths.state_file.display()))?;
             self.state = updated_state;
 
-            let _session_guard =
+            let session_guard =
                 SessionGuard::acquire(self.paths.state_file.clone(), account.id.clone())?;
 
             info!(account = %account.id, executable = account.executable(), "launching agent CLI");
             let outcome = spawn_capturing_stderr(&account, &env_profile.env_vars, &req.args)?;
 
-            let rate_limit_hit =
-                adapter.detect_rate_limit(&account, &bucket, &outcome.captured_stderr, Utc::now());
+            // A clean exit never signals a limit; stderr noise must not cool the account down.
+            let rate_limit_hit = if outcome.status.success() {
+                None
+            } else {
+                adapter.detect_rate_limit(&account, &bucket, &outcome.captured_stderr, Utc::now())
+            };
 
             if let Some(cooldown) = rate_limit_hit {
                 let resets_at = cooldown.resets_at;
@@ -284,7 +311,7 @@ impl App {
                     resets_at.to_rfc3339()
                 );
 
-                if req.failover && attempt < max_attempts {
+                if req.failover && attempt < max_attempts && !outcome.status.success() {
                     let _ = writeln!(
                         io::stderr(),
                         "tayassu: failing over to next available account..."
@@ -295,15 +322,34 @@ impl App {
 
             if !outcome.status.success() {
                 let code = outcome.status.code().unwrap_or(SIGNAL_FALLBACK_EXIT_CODE);
-                bail!(
-                    "'{}' (account '{}') exited with status {code}",
-                    account.executable(),
-                    account.id
-                );
+                // Release the session counter first: `exit` skips destructors.
+                drop(session_guard);
+                // Propagate the agent's own status so shell wrappers and scripts see it.
+                process::exit(code);
             }
             return Ok(());
         }
 
+        Ok(())
+    }
+
+    /// Drops sessions left behind by `tayassu` processes that were killed before cleanup.
+    fn prune_stale_sessions(&mut self) -> Result<()> {
+        if !self
+            .state
+            .statuses
+            .iter()
+            .any(|status| status.sessions_stale(process_is_alive))
+        {
+            return Ok(());
+        }
+        let (updated, ()) = RuntimeState::update_locked(&self.paths.state_file, |state| {
+            for status in &mut state.statuses {
+                status.prune_sessions(process_is_alive);
+            }
+        })
+        .with_context(|| format!("failed to save {}", self.paths.state_file.display()))?;
+        self.state = updated;
         Ok(())
     }
 
@@ -404,6 +450,9 @@ impl App {
                 } else {
                     label
                 };
+                if self.config.find_account(&id).is_some() {
+                    bail!("account '{id}' already exists; remove it first to re-register");
+                }
                 let mut account = AccountConfig::new(id.clone(), provider, display_label);
                 account.priority = priority;
                 account.binary_override = binary;
@@ -478,10 +527,12 @@ impl App {
                 if self.config.find_account(&id).is_none() {
                     bail!("account '{id}' not found");
                 }
-                let minutes_i64 =
-                    i64::try_from(minutes).context("cooldown duration exceeds supported range")?;
+                let resets_at = i64::try_from(minutes)
+                    .ok()
+                    .and_then(TimeDelta::try_minutes)
+                    .and_then(|delta| Utc::now().checked_add_signed(delta))
+                    .context("cooldown duration exceeds supported range")?;
                 let bucket = model.unwrap_or_else(ModelBucket::default_bucket);
-                let resets_at = Utc::now() + TimeDelta::minutes(minutes_i64);
                 let bucket_for_lock = bucket.clone();
                 let (updated, ()) = RuntimeState::update_locked(&self.paths.state_file, |state| {
                     state.status_for_mut(&id).set_cooldown(CooldownEntry {
@@ -620,7 +671,18 @@ impl App {
                 summary.removed_source_files
             )?;
             writeln!(out, "  update-safety: {}", agent.update_safety_note)?;
-            if summary.requires_relogin {
+            let credentials_transferred = agent.provider == ProviderKind::Opencode
+                && match transfer_opencode_auth(&agent.binary_path, &profile_env.env_vars) {
+                    Ok(()) => {
+                        writeln!(out, "  credentials: exported from host and imported")?;
+                        true
+                    }
+                    Err(err) => {
+                        warn!(error = %err, "opencode credential transfer failed");
+                        false
+                    }
+                };
+            if summary.requires_relogin && !credentials_transferred {
                 writeln!(
                     out,
                     "  next: run `tayassu account login {}`",
@@ -879,6 +941,46 @@ fn send_desktop_notification(title: &str, body: &str) {
         .status();
 }
 
+/// Copies host `opencode` credentials (stored in its database, not a file) into an isolated profile.
+///
+/// The secrets flow through a pipe from `auth export` to `auth import` and never touch disk.
+fn transfer_opencode_auth(binary: &Path, profile_env: &[(String, String)]) -> Result<()> {
+    let exported = ProcessCommand::new(binary)
+        .args(OPENCODE_AUTH_EXPORT_ARGS)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .context("failed to run `opencode auth export` on the host")?;
+    if !exported.status.success() {
+        bail!("`opencode auth export` exited with {}", exported.status);
+    }
+
+    let mut cmd = ProcessCommand::new(binary);
+    cmd.args(OPENCODE_AUTH_IMPORT_ARGS)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    for (key, value) in profile_env {
+        cmd.env(key, value);
+    }
+    let mut child = cmd
+        .spawn()
+        .context("failed to run `opencode auth import` in the profile")?;
+    child
+        .stdin
+        .take()
+        .context("opencode import stdin unavailable")?
+        .write_all(&exported.stdout)
+        .context("failed to pipe credentials into `opencode auth import`")?;
+    let status = child
+        .wait()
+        .context("failed waiting on `opencode auth import`")?;
+    if !status.success() {
+        bail!("`opencode auth import` exited with {status}");
+    }
+    Ok(())
+}
+
 fn spawn_interactive(
     account: &AccountConfig,
     env_vars: &[(String, String)],
@@ -944,10 +1046,11 @@ fn spawn_capturing_stderr(
                 let chunk = &buf[..read_len];
                 let _ = host_stderr.write_all(chunk);
                 let _ = host_stderr.flush();
-                if captured.len() < MAX_CAPTURED_STDERR_BYTES {
-                    let remaining = MAX_CAPTURED_STDERR_BYTES - captured.len();
-                    let take = read_len.min(remaining);
-                    captured.extend_from_slice(&chunk[..take]);
+                captured.extend_from_slice(chunk);
+                // Keep the newest bytes: a limit message appears at the end of a session.
+                if captured.len() > MAX_CAPTURED_STDERR_BYTES {
+                    let excess = captured.len() - MAX_CAPTURED_STDERR_BYTES;
+                    captured.drain(..excess);
                 }
             }
             String::from_utf8_lossy(&captured).into_owned()
@@ -1029,10 +1132,23 @@ fn bail_unknown_probe_panic() -> (AccountId, Result<ProbeOutput>) {
 
 fn main() -> Result<()> {
     init_tracing();
+    install_ctrlc_handler();
     let cli = Cli::parse();
     let mut app = App::load()?;
     let mut stdout = io::stdout().lock();
-    app.execute(cli.command, &mut stdout)
+
+    // Run the CLI; if SIGINT was received, perform explicit session cleanup before exiting.
+    let result = app.execute(cli.command, &mut stdout);
+    if RECEIVED_INT.load(Ordering::SeqCst) {
+        // Attempt to clean up any pending session guard state.
+        // The guard's Drop may have been skipped; we reset the session count here.
+        let _ = RuntimeState::update_locked(&app.paths.state_file, |state| {
+            for status in &mut state.statuses {
+                status.prune_sessions(process_is_alive);
+            }
+        });
+    }
+    result
 }
 
 fn init_tracing() {
