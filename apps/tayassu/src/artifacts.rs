@@ -89,7 +89,8 @@ impl ShellCompletion {
     fn script(shell: &str) -> String {
         match shell {
             "fish" => "command -q tayassu; and env TAYASSU_COMPLETE=fish tayassu | source".to_owned(),
-            "zsh" => "if command -v tayassu >/dev/null 2>&1; then (( $+functions[compdef] )) || { autoload -Uz compinit && compinit -D; }; eval \"$(TAYASSU_COMPLETE=zsh tayassu)\"; fi".to_owned(),
+            // Zsh's -i skips insecure completion directories without prompting.
+            "zsh" => "if command -v tayassu >/dev/null 2>&1 && { (( $+functions[compdef] )) || { autoload -Uz compinit && compinit -i -D; }; }; then eval \"$(TAYASSU_COMPLETE=zsh tayassu)\"; fi".to_owned(),
             _ => format!(
                 "command -v tayassu >/dev/null 2>&1 && eval \"$(TAYASSU_COMPLETE={shell} tayassu)\""
             ),
