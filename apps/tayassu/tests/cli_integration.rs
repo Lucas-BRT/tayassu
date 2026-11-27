@@ -795,6 +795,19 @@ fi
 
     let launch = env.run_ok(&["run", "--chain", "auto", "--require-quota"]);
     assert!(launch.contains("ran codex-available"));
+    let automatic = env.run_ok(&["auto", "run"]);
+    assert!(automatic.contains("ran codex-available"));
+    fs::write(&config, contents).expect("remove configured chain");
+    let automatic = env.run_ok(&["auto", "run"]);
+    assert!(automatic.contains("ran codex-available"));
+    fs::write(
+        &config,
+        fs::read_to_string(&config).expect("config").replace(
+            "[fallback_chains]",
+            "[fallback_chains]\nauto = [\"claude\", \"codex\"]",
+        ),
+    )
+    .expect("restore chain");
     let status = env.run_ok(&["status"]);
     assert!(status.contains("default:73%"));
     assert!(status.contains("EXHAUSTED"));
@@ -867,4 +880,44 @@ printf 'Content-Length: %s\r\n\r\n%s' "${#response}" "$response"
         "--dry-run",
     ]);
     assert!(!unavailable.status.success());
+}
+
+#[cfg(unix)]
+#[test]
+fn auto_probe_installs_and_enables_timer_without_overwriting_existing_units() {
+    let env = TestEnv::new();
+    env.write_mock_script(
+        "systemctl",
+        "#!/bin/sh\ncase \"$*\" in *is-enabled*) exit 1;; esac\nexit 0\n",
+    );
+    let path = format!("{}:/usr/bin:/bin", env.dir.path().display());
+    let run = || {
+        env.command()
+            .env("PATH", &path)
+            .args(["auto", "probe"])
+            .output()
+            .expect("run auto probe")
+    };
+    let first = run();
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let timer = env
+        .dir
+        .path()
+        .join("config/systemd/user/tayassu-probe.timer");
+    assert!(timer.exists());
+    fs::write(&timer, "custom timer").expect("customize timer");
+    let second = run();
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(timer).expect("read timer"),
+        "custom timer"
+    );
 }
