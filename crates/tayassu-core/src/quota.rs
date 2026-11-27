@@ -59,6 +59,36 @@ impl fmt::Display for RemainingPercent {
     }
 }
 
+/// Minutes a probe stays "fresh" before its readings are shown as estimates.
+pub const FRESH_WINDOW_MINUTES: i64 = 15;
+
+/// How trustworthy a cached quota reading is at a given instant (derived, never persisted).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WindowState {
+    /// Probed recently; the percentage is a live reading.
+    Fresh,
+    /// Probed a while ago; the percentage is the last known value.
+    Stale,
+    /// The recorded reset instant has passed; the quota has presumably been restored.
+    Reset,
+    /// Never probed.
+    Unknown,
+}
+
+impl WindowState {
+    /// Lowercase name used in JSON and text output.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Fresh => "fresh",
+            Self::Stale => "stale",
+            Self::Reset => "reset",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 /// Reason prefix marking cooldowns inferred from CLI output rather than reported by a provider.
 pub const PASSIVE_COOLDOWN_REASON_PREFIX: &str = "detected-rate-limit";
 
@@ -80,6 +110,29 @@ pub struct QuotaWindow {
 }
 
 impl QuotaWindow {
+    /// Returns `true` when the recorded reset instant has already passed at `now`.
+    #[must_use]
+    pub fn has_reset_at(&self, now: DateTime<Utc>) -> bool {
+        self.resets_at.is_some_and(|reset| reset <= now)
+    }
+
+    /// Classifies this reading given when its account was last probed.
+    #[must_use]
+    pub fn state(&self, probed_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> WindowState {
+        if self.has_reset_at(now) {
+            return WindowState::Reset;
+        }
+        match probed_at {
+            None => WindowState::Unknown,
+            Some(at)
+                if now.signed_duration_since(at) < TimeDelta::minutes(FRESH_WINDOW_MINUTES) =>
+            {
+                WindowState::Fresh
+            }
+            Some(_) => WindowState::Stale,
+        }
+    }
+
     /// Returns `true` when this window is exhausted and has not reset yet.
     #[must_use]
     pub fn is_exhausted_at(&self, now: DateTime<Utc>) -> bool {
@@ -346,6 +399,41 @@ impl AccountStatus {
             .filter(|window| window.resets_at.is_none_or(|reset| reset > now))
             .filter_map(|window| window.remaining)
             .min()
+    }
+
+    /// Worst reading state across windows covering `bucket` (`Reset` > `Stale` > `Unknown` > `Fresh`).
+    #[must_use]
+    pub fn bucket_state(&self, bucket: &ModelBucket, now: DateTime<Utc>) -> Option<WindowState> {
+        let probed_at = self.last_probed_at;
+        let states: Vec<_> = self
+            .windows
+            .iter()
+            .filter(|window| self.covers(&window.bucket, bucket))
+            .map(|window| window.state(probed_at, now))
+            .collect();
+        [
+            WindowState::Reset,
+            WindowState::Stale,
+            WindowState::Unknown,
+            WindowState::Fresh,
+        ]
+        .into_iter()
+        .find(|candidate| states.contains(candidate))
+    }
+
+    /// Compact quota text for `bucket`: `43%`, `~43%` (stale), `reset✓` or `unknown` (no percentage).
+    #[must_use]
+    pub fn quota_label(&self, bucket: &ModelBucket, now: DateTime<Utc>) -> String {
+        match self.bucket_state(bucket, now) {
+            Some(WindowState::Reset) => "reset✓".to_owned(),
+            state => self.lowest_remaining_percent(bucket, now).map_or_else(
+                || "unknown".to_owned(),
+                |pct| match state {
+                    Some(WindowState::Fresh) => pct.to_string(),
+                    _ => format!("~{pct}"),
+                },
+            ),
+        }
     }
 
     /// Returns the earliest known reset timestamp among windows covering `bucket`.

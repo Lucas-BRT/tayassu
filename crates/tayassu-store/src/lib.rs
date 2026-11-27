@@ -7,6 +7,7 @@ pub mod paths;
 pub mod project;
 pub mod state;
 
+pub use atomic::write_atomic;
 pub use config::AppConfig;
 pub use error::StoreError;
 pub use paths::{APP_DIR_NAME, CONFIG_FILE_NAME, PROFILES_DIR_NAME, STATE_FILE_NAME, XdgPaths};

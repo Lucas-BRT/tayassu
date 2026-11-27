@@ -1,7 +1,7 @@
-use crate::{
-    App, SIGNAL_FALLBACK_EXIT_CODE, SessionGuard, account_executable, probe_accounts,
-    process_is_alive, spawn_capturing_stderr,
-};
+use crate::app::App;
+use crate::probing::probe_accounts;
+use crate::session::{SessionGuard, process_is_alive};
+use crate::spawn::{SIGNAL_FALLBACK_EXIT_CODE, account_executable, spawn_capturing_stderr};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use std::env;
@@ -83,7 +83,7 @@ impl std::fmt::Display for SelectionReason {
 }
 
 impl App {
-    pub(super) fn run_agent(&mut self, req: &RunRequest, out: &mut impl Write) -> Result<()> {
+    pub(crate) fn run_agent(&mut self, req: &RunRequest, out: &mut impl Write) -> Result<()> {
         let cwd = env::current_dir().context("failed to resolve current directory")?;
         let project_cfg = ProjectConfig::discover(&cwd)
             .context("failed to load .tayassu.toml")?

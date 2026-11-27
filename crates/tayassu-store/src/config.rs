@@ -4,23 +4,42 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
-use tayassu_core::{AccountConfig, AccountId, FallbackTarget, SelectionPolicy};
+use tayassu_core::{AccountConfig, AccountId, FallbackTarget, ProviderKind, SelectionPolicy};
 
 /// Sibling lock filename for configuration read-modify-write operations.
 const CONFIG_LOCK_FILE_NAME: &str = "config.lock";
 
+/// Returns `true` for serde defaults where a feature is enabled unless explicitly disabled.
+const fn default_true() -> bool {
+    true
+}
+
 /// Top-level user configuration persisted in `config.toml`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppConfig {
     /// Default routing policy when `--policy` is not passed on the CLI.
     #[serde(default)]
     pub default_policy: SelectionPolicy,
+    /// Whether background update checks and terminal notices are enabled.
+    #[serde(default = "default_true")]
+    pub update_check: bool,
     /// Named cross-provider fallback chains (e.g. `claude = ["agy:claude", "claude:default"]`).
     #[serde(default)]
     pub fallback_chains: BTreeMap<String, Vec<FallbackTarget>>,
     /// Configured subscription accounts.
     #[serde(default)]
     pub accounts: Vec<AccountConfig>,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            default_policy: SelectionPolicy::default(),
+            update_check: true,
+            fallback_chains: BTreeMap::new(),
+            accounts: Vec::new(),
+        }
+    }
 }
 
 impl AppConfig {
@@ -67,6 +86,31 @@ impl AppConfig {
     {
         let _lock = FileLock::acquire(path.with_file_name(CONFIG_LOCK_FILE_NAME))?;
         operation(Self::load(path)?)
+    }
+
+    /// Returns the first unused account id for `provider` (`claude`, `claude-2`, `claude-3`, ...).
+    ///
+    /// # Panics
+    ///
+    /// Never in practice: the candidate sequence is unbounded and ids are short valid slugs.
+    #[must_use]
+    pub fn next_free_id(&self, provider: ProviderKind) -> AccountId {
+        let base = provider.as_str();
+        (1_u32..)
+            .map(|n| {
+                if n == 1 {
+                    base.to_owned()
+                } else {
+                    format!("{base}-{n}")
+                }
+            })
+            .find_map(|candidate| {
+                candidate
+                    .parse::<AccountId>()
+                    .ok()
+                    .filter(|id| self.find_account(id).is_none())
+            })
+            .expect("unbounded candidate sequence yields a free id")
     }
 
     /// Looks up a configured account by `id`.

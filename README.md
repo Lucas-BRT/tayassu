@@ -12,7 +12,7 @@ When you hold multiple legitimately paid or granted subscription accounts across
 curl -fsSL https://raw.githubusercontent.com/Lucas-BRT/tayassu/main/install.sh | bash
 ```
 
-The script downloads the latest release binary into `${TAYASSU_INSTALL_DIR:-$HOME/.local/bin}` and falls back to `cargo install` when no prebuilt asset matches your platform. You can also build from source:
+The script downloads the latest release binary into `${TAYASSU_INSTALL_DIR:-$HOME/.local/bin}` and falls back to `cargo install` when no prebuilt asset matches your platform. It also runs `tayassu setup --no-systemd` to configure shell wrappers and tab completion for bash, zsh, and fish. You can also build from source (then run `tayassu setup` yourself):
 
 ```bash
 cargo install --locked --path apps/tayassu
