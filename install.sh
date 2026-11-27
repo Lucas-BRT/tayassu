@@ -44,7 +44,7 @@ resolve_tag() {
     printf '%s' "$latest"
     return
   fi
-  printf 'v0.2.0'
+  printf 'v0.3.0'
 }
 
 get_installed_version() {
