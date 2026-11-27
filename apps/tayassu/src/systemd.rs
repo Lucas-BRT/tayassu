@@ -34,7 +34,7 @@ impl SystemdUnits {
     /// Renders `(service_unit, timer_unit)` contents.
     #[must_use]
     pub fn render(&self) -> (String, String) {
-        let bin = self.binary_path.display();
+        let bin = format!("\"{}\"", self.binary_path.display());
         let service = format!(
             "[Unit]\n\
              Description=Refresh tayassu AI CLI account quotas and cooldowns\n\
@@ -103,7 +103,7 @@ mod tests {
         );
         let (service, timer) = units.render();
 
-        assert!(service.contains("ExecStart=/usr/local/bin/tayassu probe --notify"));
+        assert!(service.contains(r#"ExecStart="/usr/local/bin/tayassu" probe --notify"#));
         assert!(timer.contains("OnUnitActiveSec=10m"));
 
         let (svc_path, tmr_path) = units.install_to(dir.path()).expect("install units");

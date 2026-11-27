@@ -191,15 +191,31 @@ pub trait ProviderAdapter: Send + Sync {
         now: DateTime<Utc>,
     ) -> Option<CooldownEntry> {
         let lowered = output.to_ascii_lowercase();
-        let matched = mentions_status_429(&lowered)
-            || RATE_LIMIT_MARKERS
-                .iter()
-                .any(|marker| lowered.contains(marker));
+        // Only consider 429 as a rate limit when it appears as a standalone HTTP-like status,
+        // not embedded in longer numbers (e.g., "1429" or "status-429-extra").
+        let has_status_429 = mentions_status_429(&lowered);
+
+        // Rate-limit markers must appear in a context that looks like an error/output line,
+        // not just as substring anywhere in the (truncated) stderr. We check if the marker
+        // appears adjacent to error-related keywords, which distinguishes real rate-limit
+        // output from incidental text.
+        let has_rate_limit_marker = RATE_LIMIT_MARKERS
+            .iter()
+            .any(|marker| is_marker_adjacent_to_error_keyword(&lowered, marker));
+
+        let matched = has_status_429 || has_rate_limit_marker;
         if !matched {
             return None;
         }
-        let duration_secs =
-            parse_retry_after_secs(&lowered).unwrap_or(DEFAULT_FALLBACK_COOLDOWN_SECS);
+
+        // Only parse retry-after if we actually found a clear rate-limit signal.
+        let duration_secs = if has_status_429 {
+            // For 429, use a moderate default; some providers specify a retry-after.
+            parse_retry_after_secs(&lowered).unwrap_or(DEFAULT_FALLBACK_COOLDOWN_SECS)
+        } else {
+            // For textual markers, try to parse a retry-after duration; fall back gracefully.
+            parse_retry_after_secs(&lowered).unwrap_or(DEFAULT_FALLBACK_COOLDOWN_SECS)
+        };
         Some(CooldownEntry {
             bucket: bucket.clone(),
             resets_at: now + TimeDelta::seconds(duration_secs),
@@ -866,6 +882,30 @@ fn mentions_status_429(text: &str) -> bool {
             !before.is_some_and(|ch| ch.is_ascii_alphanumeric())
                 && !after.is_some_and(|ch| ch.is_ascii_alphanumeric())
         })
+}
+
+/// Returns `true` when a rate-limit marker is adjacent to a clear error/rate-keyword
+/// such as "error", "429", "limit", "exceeded", etc. This prevents matching markers
+/// that happen to appear in neutral or positive context.
+fn is_marker_adjacent_to_error_keyword(lowered: &str, marker: &str) -> bool {
+    // Check for common error/retry indicators nearby.
+    const ERROR_KEYWORDS: &[&str] = &[
+        "error", "429", "limit", "exceeded", "blocked", "throttl", "quota",
+    ];
+    // Search for the marker and check if it's near error-related keywords.
+    let Some(marker_pos) = lowered.find(marker) else {
+        return false;
+    };
+    // Grab a small window around the marker (up to 30 chars before/after).
+    let start = marker_pos.saturating_sub(30);
+    let end = std::cmp::min(lowered.len(), marker_pos + marker.len() + 30);
+    let window = &lowered[start..end];
+    for kw in ERROR_KEYWORDS {
+        if window.contains(*kw) {
+            return true;
+        }
+    }
+    false
 }
 
 fn parse_compact_duration_token(token: &str) -> Option<i64> {

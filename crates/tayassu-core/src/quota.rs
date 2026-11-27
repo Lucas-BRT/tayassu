@@ -59,6 +59,9 @@ impl fmt::Display for RemainingPercent {
     }
 }
 
+/// Reason prefix marking cooldowns inferred from CLI output rather than reported by a provider.
+pub const PASSIVE_COOLDOWN_REASON_PREFIX: &str = "detected-rate-limit";
+
 /// Snapshot of a single rolling or weekly quota window reported by a provider.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QuotaWindow {
@@ -304,6 +307,30 @@ impl AccountStatus {
         let before = self.cooldowns.len();
         self.cooldowns.retain(|entry| &entry.bucket != bucket);
         self.cooldowns.len() < before
+    }
+
+    /// Removes passively detected cooldowns contradicted by fresh windows that still show quota.
+    pub fn clear_contradicted_passive_cooldowns(&mut self) {
+        let default_bucket = ModelBucket::default_bucket();
+        let windows = &self.windows;
+        self.cooldowns.retain(|entry| {
+            if !entry.reason.starts_with(PASSIVE_COOLDOWN_REASON_PREFIX) {
+                return true;
+            }
+            let covering = windows
+                .iter()
+                .filter(|window| window.bucket == entry.bucket || window.bucket == default_bucket)
+                .filter_map(|window| window.remaining);
+            // Keep the cooldown unless every covering window reports quota left.
+            let mut seen = false;
+            for remaining in covering {
+                seen = true;
+                if remaining.is_exhausted() {
+                    return true;
+                }
+            }
+            !seen
+        });
     }
 
     /// Drops cooldown entries that have already expired at `now`.

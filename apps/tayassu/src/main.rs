@@ -17,7 +17,9 @@ use std::env;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{self, Command as ProcessCommand, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
+use ctrlc;
 use systemd::SystemdUnits;
 use tayassu_core::{
     AccountConfig, AccountId, AccountRouter, CooldownEntry, ModelBucket, ProbeFailure,
@@ -35,6 +37,17 @@ const DEFAULT_LOG_FILTER: &str = "warn";
 
 /// Fallback non-zero exit code when a child process is terminated by a signal.
 const SIGNAL_FALLBACK_EXIT_CODE: i32 = 1;
+
+/// Atomic flag set when SIGINT (Ctrl-C) is received, to trigger explicit session cleanup.
+static RECEIVED_INT: AtomicBool = AtomicBool::new(false);
+
+/// Installs a Ctrl-C handler that sets `RECEIVED_INT`.
+/// On systems where ctrlc isn't available (e.g. some Windows configs), it gracefully no-ops.
+fn install_ctrlc_handler() {
+    let _ = ctrlc::set_handler(move || {
+        RECEIVED_INT.store(true, Ordering::SeqCst);
+    });
+}
 
 /// Maximum stderr bytes buffered in memory during `tayassu run` for passive rate-limit detection.
 const MAX_CAPTURED_STDERR_BYTES: usize = 64 * 1024;
@@ -58,8 +71,8 @@ const OPENCODE_AUTH_IMPORT_ARGS: &[&str] = &["auth", "import"];
 const SYSTEMD_USER_REL_DIR: &str = "systemd/user";
 
 struct RunRequest {
-    provider: Option<ProviderKind>,
     account: Option<AccountId>,
+    provider: Option<ProviderKind>,
     chain: Option<String>,
     model: Option<ModelBucket>,
     policy: Option<SelectionPolicy>,
@@ -142,8 +155,8 @@ impl App {
             }
             Command::Dash => self.handle_dash(),
             Command::Run {
-                provider,
                 account,
+                provider,
                 chain,
                 model,
                 policy,
@@ -152,8 +165,8 @@ impl App {
                 args,
             } => self.run_agent(
                 &RunRequest {
-                    provider,
                     account,
+                    provider,
                     chain,
                     model,
                     policy,
@@ -1120,10 +1133,23 @@ fn bail_unknown_probe_panic() -> (AccountId, Result<ProbeOutput>) {
 
 fn main() -> Result<()> {
     init_tracing();
+    install_ctrlc_handler();
     let cli = Cli::parse();
     let mut app = App::load()?;
     let mut stdout = io::stdout().lock();
-    app.execute(cli.command, &mut stdout)
+
+    // Run the CLI; if SIGINT was received, perform explicit session cleanup before exiting.
+    let result = app.execute(cli.command, &mut stdout);
+    if RECEIVED_INT.load(Ordering::SeqCst) {
+        // Attempt to clean up any pending session guard state.
+        // The guard's Drop may have been skipped; we reset the session count here.
+        let _ = RuntimeState::update_locked(&app.paths.state_file, |state| {
+            for status in &mut state.statuses {
+                status.prune_sessions(process_is_alive);
+            }
+        });
+    }
+    result
 }
 
 fn init_tracing() {
