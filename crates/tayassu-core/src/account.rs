@@ -184,13 +184,14 @@ impl FromStr for ModelBucket {
                 reason: format!("length must be 1..={MAX_MODEL_BUCKET_LEN}"),
             });
         }
-        let valid_chars = trimmed
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'/'));
+        let valid_chars = trimmed.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'/' | b':')
+        });
         if !valid_chars {
             return Err(CoreError::InvalidModelBucket {
                 value: raw.to_owned(),
-                reason: "only ASCII letters, digits, '-', '_', '.', and '/' are allowed".to_owned(),
+                reason: "only ASCII letters, digits, '-', '_', '.', '/', and ':' are allowed"
+                    .to_owned(),
             });
         }
         Ok(Self(trimmed.to_ascii_lowercase()))
@@ -229,6 +230,9 @@ pub struct AccountConfig {
     /// Selection preference (lower number is preferred first).
     #[serde(default = "default_priority")]
     pub priority: u8,
+    /// Copilot profile that the user confirms matches this `OpenCode` profile's Copilot connection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opencode_copilot_account: Option<AccountId>,
     /// Optional binary path override instead of the provider default.
     #[serde(default)]
     pub binary_override: Option<String>,
@@ -257,6 +261,7 @@ impl AccountConfig {
             provider,
             label: label.into(),
             priority: DEFAULT_ACCOUNT_PRIORITY,
+            opencode_copilot_account: None,
             binary_override: None,
             enabled: true,
             shared_home_links: Vec::new(),
