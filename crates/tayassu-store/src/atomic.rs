@@ -7,7 +7,11 @@ use std::path::Path;
 const TEMP_FILE_SUFFIX: &str = ".tmp";
 
 /// Writes `bytes` to a sibling temp file, syncs it, and atomically renames it over `target`.
-pub(crate) fn write_atomic(target: &Path, bytes: &[u8]) -> Result<(), StoreError> {
+///
+/// # Errors
+///
+/// Returns [`StoreError::Io`] if directory creation, file writing, sync, or rename fails.
+pub fn write_atomic(target: &Path, bytes: &[u8]) -> Result<(), StoreError> {
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent).map_err(|source| StoreError::Io {
             path: parent.to_path_buf(),

@@ -6,18 +6,37 @@ use std::fs;
 use std::path::Path;
 use tayassu_core::{AccountConfig, AccountId, FallbackTarget, ProviderKind, SelectionPolicy};
 
+/// Returns `true` for serde defaults where a feature is enabled unless explicitly disabled.
+const fn default_true() -> bool {
+    true
+}
+
 /// Top-level user configuration persisted in `config.toml`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppConfig {
     /// Default routing policy when `--policy` is not passed on the CLI.
     #[serde(default)]
     pub default_policy: SelectionPolicy,
+    /// Whether background update checks and terminal notices are enabled.
+    #[serde(default = "default_true")]
+    pub update_check: bool,
     /// Named cross-provider fallback chains (e.g. `claude = ["agy:claude", "claude:default"]`).
     #[serde(default)]
     pub fallback_chains: BTreeMap<String, Vec<FallbackTarget>>,
     /// Configured subscription accounts.
     #[serde(default)]
     pub accounts: Vec<AccountConfig>,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            default_policy: SelectionPolicy::default(),
+            update_check: true,
+            fallback_chains: BTreeMap::new(),
+            accounts: Vec::new(),
+        }
+    }
 }
 
 impl AppConfig {
