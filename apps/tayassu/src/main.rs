@@ -16,7 +16,7 @@ use std::collections::BTreeSet;
 use std::env;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command as ProcessCommand, ExitStatus, Stdio};
+use std::process::{self, Command as ProcessCommand, ExitStatus, Stdio};
 use std::thread;
 use systemd::SystemdUnits;
 use tayassu_core::{
@@ -73,6 +73,11 @@ struct RunOutcome {
     captured_stderr: String,
 }
 
+/// Returns whether a process with `pid` currently exists (Linux `/proc`).
+fn process_is_alive(pid: u32) -> bool {
+    Path::new("/proc").join(pid.to_string()).exists()
+}
+
 /// RAII guard tracking an active `tayassu run` session in `state.json` under an exclusive lock.
 struct SessionGuard {
     state_file: PathBuf,
@@ -83,8 +88,7 @@ impl SessionGuard {
     fn acquire(state_file: PathBuf, account_id: AccountId) -> Result<Self> {
         let id = account_id.clone();
         RuntimeState::update_locked(&state_file, |state| {
-            let entry = state.status_for_mut(&id);
-            entry.active_sessions = entry.active_sessions.saturating_add(1);
+            state.status_for_mut(&id).add_session(process::id());
         })
         .with_context(|| format!("failed to record active session for '{account_id}'"))?;
         Ok(Self {
@@ -98,8 +102,7 @@ impl Drop for SessionGuard {
     fn drop(&mut self) {
         let id = self.account_id.clone();
         let _ = RuntimeState::update_locked(&self.state_file, |state| {
-            let entry = state.status_for_mut(&id);
-            entry.active_sessions = entry.active_sessions.saturating_sub(1);
+            state.status_for_mut(&id).remove_session(process::id());
         });
     }
 }
@@ -229,6 +232,8 @@ impl App {
             1
         };
 
+        self.prune_stale_sessions()?;
+
         for attempt in 1..=max_attempts {
             let (account, bucket) =
                 self.resolve_run_target(req, project_cfg.as_ref(), &cwd, router)?;
@@ -264,8 +269,12 @@ impl App {
             info!(account = %account.id, executable = account.executable(), "launching agent CLI");
             let outcome = spawn_capturing_stderr(&account, &env_profile.env_vars, &req.args)?;
 
-            let rate_limit_hit =
-                adapter.detect_rate_limit(&account, &bucket, &outcome.captured_stderr, Utc::now());
+            // A clean exit never signals a limit; stderr noise must not cool the account down.
+            let rate_limit_hit = if outcome.status.success() {
+                None
+            } else {
+                adapter.detect_rate_limit(&account, &bucket, &outcome.captured_stderr, Utc::now())
+            };
 
             if let Some(cooldown) = rate_limit_hit {
                 let resets_at = cooldown.resets_at;
@@ -304,11 +313,31 @@ impl App {
                 // Release the session counter first: `exit` skips destructors.
                 drop(session_guard);
                 // Propagate the agent's own status so shell wrappers and scripts see it.
-                std::process::exit(code);
+                process::exit(code);
             }
             return Ok(());
         }
 
+        Ok(())
+    }
+
+    /// Drops sessions left behind by `tayassu` processes that were killed before cleanup.
+    fn prune_stale_sessions(&mut self) -> Result<()> {
+        if !self
+            .state
+            .statuses
+            .iter()
+            .any(|status| status.sessions_stale(process_is_alive))
+        {
+            return Ok(());
+        }
+        let (updated, ()) = RuntimeState::update_locked(&self.paths.state_file, |state| {
+            for status in &mut state.statuses {
+                status.prune_sessions(process_is_alive);
+            }
+        })
+        .with_context(|| format!("failed to save {}", self.paths.state_file.display()))?;
+        self.state = updated;
         Ok(())
     }
 
@@ -1005,10 +1034,11 @@ fn spawn_capturing_stderr(
                 let chunk = &buf[..read_len];
                 let _ = host_stderr.write_all(chunk);
                 let _ = host_stderr.flush();
-                if captured.len() < MAX_CAPTURED_STDERR_BYTES {
-                    let remaining = MAX_CAPTURED_STDERR_BYTES - captured.len();
-                    let take = read_len.min(remaining);
-                    captured.extend_from_slice(&chunk[..take]);
+                captured.extend_from_slice(chunk);
+                // Keep the newest bytes: a limit message appears at the end of a session.
+                if captured.len() > MAX_CAPTURED_STDERR_BYTES {
+                    let excess = captured.len() - MAX_CAPTURED_STDERR_BYTES;
+                    captured.drain(..excess);
                 }
             }
             String::from_utf8_lossy(&captured).into_owned()
