@@ -70,9 +70,10 @@ removed after a verified copy.
 | `doctor` | | Validate binaries, profiles and credential permissions. |
 | `activate <shell>` | | Print wrapper functions and completion for `eval`. |
 | `setup` | | Hook `activate` into your shells and install the systemd probe timer. |
-| `config ls\|get\|set` | | Read or change global settings (`default-policy`). |
-| `self-update` | | Update tayassu itself. |
-| `upgrade-clis` | | Run each provider CLI's own updater. |
+| `config ls\|get\|set` | | Read or change global settings (`default-policy`, `update-check`). |
+| `update` | | Update tayassu itself (verifies SHA-256; `--check`, `--pre`, `--version`). |
+| `providers update` | | Run each provider CLI's own updater. |
+| `uninstall` | | Remove shell hooks, systemd timer, and binary (`--purge` also deletes profiles). |
 
 `tayassu cooldown ls|set|clear` exists for manual overrides but is hidden from `--help`.
 
@@ -162,10 +163,22 @@ plus dynamic tab completion for providers, accounts, chains and policies.
 `tayassu-probe.timer` under `$XDG_CONFIG_HOME/systemd/user/` (enable with
 `systemctl --user enable --now tayassu-probe.timer`). It is idempotent.
 
-### `tayassu self-update` and `tayassu upgrade-clis`
+### `tayassu update`, `tayassu uninstall`, and `tayassu providers update`
 
-`self-update` re-runs the installer. `upgrade-clis` runs each provider CLI's
-native updater with the real host `$HOME`, so isolated profiles never break upgrades.
+```bash
+tayassu update                  # download latest stable release, verify SHA-256, replace binary
+tayassu update --check          # check only
+tayassu update --pre            # allow pre-releases
+tayassu update --version v0.2.0 # install a specific tag
+tayassu uninstall --dry-run     # preview removal
+tayassu uninstall --purge       # also remove config, state and isolated profiles
+tayassu providers update        # run each provider CLI's native updater with real $HOME
+```
+
+When running interactively in a terminal, `tayassu` checks for new releases in
+the background at most once every 24 hours and prints a one-line notice on
+stderr when an update is available (never during `run` or `activate`). Disable
+with `tayassu config set update-check off` or `TAYASSU_NO_UPDATE_CHECK=1`.
 
 ## Configuration
 

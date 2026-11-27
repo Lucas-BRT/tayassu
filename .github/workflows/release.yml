@@ -1,0 +1,89 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout
+        # v4.2.2
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Install Rust toolchain
+        # master (reads rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9
+
+      - name: Cache Cargo artifacts
+        # v2.7.8
+        uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6
+        with:
+          shared-key: tayassu-release-${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --release --locked --bin tayassu
+
+      - name: Package archive
+        run: |
+          mkdir -p dist
+          tar -C target/release -czf "dist/tayassu-${{ matrix.target }}.tar.gz" tayassu
+
+      - name: Upload artifact
+        # v4.6.2
+        uses: actions/upload-artifact@ea165f8d65b6e75b1b1058d685447f9f67a62e47
+        with:
+          name: tayassu-${{ matrix.target }}
+          path: dist/tayassu-${{ matrix.target }}.tar.gz
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download build artifacts
+        # v4.2.1
+        uses: actions/download-artifact@fa0a91b85d4fe4045a0765e0fedbfd6514e5b4e5
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS
+        working-directory: dist
+        run: sha256sum tayassu-*.tar.gz > SHA256SUMS
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          prerelease_flag=""
+          case "$TAG" in
+            *-*) prerelease_flag="--prerelease" ;;
+          esac
+          gh release create "$TAG" dist/* \
+            --title "$TAG" \
+            --generate-notes \
+            $prerelease_flag

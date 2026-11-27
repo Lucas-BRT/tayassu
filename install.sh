@@ -56,10 +56,12 @@ get_installed_version() {
 install_from_release() {
   need curl
   need tar
-  local tag target asset tmp
+  need sha256sum
+  local tag target asset sums tmp
   tag="$(resolve_tag)"
   target="$(detect_target)"
   asset="${BIN_NAME}-${target}.tar.gz"
+  sums="SHA256SUMS"
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' RETURN
   log "Downloading ${BIN_NAME} ${tag} (${target})"
@@ -68,6 +70,15 @@ install_from_release() {
     log "Warning: failed to download release asset; falling back to source build."
     return 1
   fi
+  if ! curl -fsSL "https://github.com/${REPO}/releases/download/${tag}/${sums}" \
+    -o "${tmp}/${sums}" 2>/dev/null; then
+    log "Warning: failed to download ${sums}; falling back to source build."
+    return 1
+  fi
+  (cd "$tmp" && grep "  ${asset}\$" "$sums" | sha256sum -c - >/dev/null) || {
+    log "Warning: checksum verification failed for ${asset}; falling back to source build."
+    return 1
+  }
   tar -xzf "${tmp}/${asset}" -C "$tmp"
   install -Dm755 "${tmp}/${BIN_NAME}" "${INSTALL_DIR}/${BIN_NAME}"
 }
