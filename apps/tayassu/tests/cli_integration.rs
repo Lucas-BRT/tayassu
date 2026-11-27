@@ -31,6 +31,7 @@ impl TestEnv {
             .env("XDG_CONFIG_HOME", self.dir.path().join("config"))
             .env("XDG_STATE_HOME", self.dir.path().join("state"))
             .env("XDG_DATA_HOME", self.dir.path().join("data"))
+            .env("TAYASSU_NO_UPDATE_CHECK", "1")
             .env_remove("SHELL")
             .env_remove("ZDOTDIR")
             .env_remove("TAYASSU_COMPLETE");
