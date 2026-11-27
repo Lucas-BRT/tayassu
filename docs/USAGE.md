@@ -42,16 +42,10 @@ cargo install --locked --path apps/tayassu
 ## Quick start
 
 ```bash
-# 1. Discover installed CLIs and copy their credentials into isolated profiles.
-tayassu import
-
-# 2. Authenticate any account that needs a fresh login.
-tayassu account login agy
-
-# 3. Inspect quota and cooldown state.
-tayassu status
-
-# 4. Run an agent through the account router.
+tayassu setup            # shell wrappers, tab completion and the background probe timer
+tayassu import           # discover installed CLIs and copy their credentials
+tayassu add agy work     # or register an account yourself and log in
+tayassu                  # same as `tayassu ls`: quota and cooldown state
 tayassu run agy -- --help
 ```
 
@@ -59,148 +53,115 @@ tayassu run agy -- --help
 auth files by default; pass `--move-auth` only when you want the host files
 removed after a verified copy.
 
-## Commands
+## Command overview
 
-### `tayassu import` (alias `discover`)
+| Command | Alias | Purpose |
+| ------- | ----- | ------- |
+| `ls [provider]` | (bare `tayassu`) | Quota, cooldowns and sessions per account; `--json`. |
+| `add <provider> [id]` | | Register an account and log in (`--no-login` to skip). |
+| `rm <id>` | | Remove an account from `config.toml`. |
+| `login <id>` | | Re-authenticate inside the isolated profile. |
+| `import` | | Discover installed CLIs and import credentials. |
+| `use [account]` | | Pin account, `--chain` or `--policy` for this project (`.tayassu.toml`); `--global` for the policy. |
+| `run <provider> -- ...` | `r`, `x` | Route to the best account and run its CLI, failing over on rate limits. |
+| `where <provider>` | | Show the account, executable and environment that `run` would use. |
+| `probe [id]` | | Refresh quota windows. |
+| `dash` | | Interactive dashboard. |
+| `doctor` | | Validate binaries, profiles and credential permissions. |
+| `activate <shell>` | | Print wrapper functions and completion for `eval`. |
+| `setup` | | Hook `activate` into your shells and install the systemd probe timer. |
+| `config ls\|get\|set` | | Read or change global settings (`default-policy`). |
+| `self-update` | | Update tayassu itself. |
+| `upgrade-clis` | | Run each provider CLI's own updater. |
 
-Scans the host for installed AI CLIs and registers one account per provider.
+`tayassu cooldown ls|set|clear` exists for manual overrides but is hidden from `--help`.
+
+### `tayassu add`
 
 ```bash
-tayassu import --dry-run
-tayassu import --provider claude --provider codex
-tayassu import --exclude copilot --priority 10
+tayassu add agy student --label "Student plan" --priority 10
+tayassu add claude                  # id defaults to `claude`, then `claude-2`, ...
+tayassu add claude work --binary /opt/claude/bin/claude --no-login
 ```
 
-Options: `--provider` (repeatable include filter), `--exclude` (repeatable),
-`--dry-run`, `--move-auth`, `--priority`.
-
-### `tayassu account`
-
-```bash
-tayassu account add agy-student agy --label "Student plan" --priority 10
-tayassu account add work-claude claude --binary /opt/claude/bin/claude
-tayassu account env agy-student
-tayassu account login agy-student
-tayassu account remove agy-student
-```
-
-- `add` creates the isolated profile directory and writes the account to `config.toml`.
-- `env` prints the profile directory and `export` lines for manual use.
-- `login` launches the provider CLI inside the isolated profile.
-- `remove` drops the account from `config.toml` but leaves profile data on disk.
+Creates the isolated profile, writes the account to `config.toml`, then starts
+the provider's login flow.
 
 ### `tayassu run`
-
-Selects an available account and invokes its CLI inside the isolated profile.
 
 ```bash
 tayassu run claude -- "explain this repository"
 tayassu run --account codex-work -- --version
-tayassu run --chain claude --model claude --failover -- "fix the tests"
-tayassu run agy --dry-run -- --help
+tayassu run --chain claude --model claude -- "fix the tests"
+tayassu where claude
 ```
-
-Options:
 
 | Option          | Effect                                                              |
 | --------------- | ------------------------------------------------------------------- |
 | `--account ID`  | Force a specific account instead of routing automatically.          |
 | `--chain NAME`  | Use a named cross-provider fallback chain from `config.toml`.       |
 | `--model NAME`  | Model bucket to evaluate cooldowns against (default `default`).     |
-| `--policy NAME` | Override the selection policy (`priority`, `most-quota`, `soonest-reset`). |
+| `--policy NAME` | Override the selection policy (`priority`, `most-quota`, `soonest-reset`). Default is `most-quota`. |
 | `--dry-run`     | Print the selected account and environment without spawning.        |
-| `--failover`    | Retry once on the next available account after a rate limit.        |
+| `--no-failover` | Do not retry on the next account after a rate limit (failover is on by default). |
 
 Arguments after `--` are passed verbatim to the underlying CLI.
 
-### `tayassu status`
+### `tayassu use`
 
 ```bash
-tayassu status
-tayassu status --provider claude
-tayassu status --model claude
+tayassu use work                      # prefer account `work` for its provider in this project
+tayassu use --chain claude-any        # default fallback chain for this project
+tayassu use --policy priority         # project policy
+tayassu use --policy most-quota --global
 ```
-
-Prints remaining quota, cooldown windows, and active sessions per account.
 
 ### `tayassu dash`
 
 Interactive terminal dashboard. `r` probes every account, `c` clears cooldowns
-for the selected account, and `q` quits. Quota is shown per model bucket, one
-line per bucket, with active cooldown countdowns.
+for the selected account, and `q` quits.
 
 ### `tayassu probe`
 
 ```bash
 tayassu probe
-tayassu probe --id agy-student
+tayassu probe agy-student
 tayassu probe --notify
 ```
 
 Runs each provider's non-interactive usage check and records cooldowns. With
 `--notify`, `notify-send` is used when a previously active cooldown clears.
 
-### `tayassu cooldown`
-
-```bash
-tayassu cooldown set agy-student --minutes 300 --reason "weekly limit"
-tayassu cooldown set claude-work --model opus --minutes 60
-tayassu cooldown clear agy-student
-```
-
-Default manual cooldown is 300 minutes (5 hours).
-
 ### `tayassu doctor`
 
-```bash
-tayassu doctor
-tayassu doctor --strict
-```
+`--strict` exits non-zero on warnings as well as errors.
 
-Validates binaries, fake-`HOME` symlinks, and credential permissions. `--strict`
-exits non-zero on warnings as well as errors.
-
-### `tayassu update`
+### `tayassu activate` and `tayassu setup`
 
 ```bash
-tayassu update --dry-run
-tayassu update --provider claude
+eval "$(tayassu activate bash)"        # zsh: same; fish: tayassu activate fish | source
+tayassu setup                          # do it for every detected shell, once
+tayassu setup --no-systemd
 ```
 
-Runs each CLI's native self-updater with the real host `$HOME`, so isolated
-profiles never break upgrades.
+`activate` prints wrapper functions that route `agy`, `claude`, `codex`,
+`copilot` and `opencode` through `tayassu run` (bypass with `command <cli>`),
+plus dynamic tab completion for providers, accounts, chains and policies.
+`setup` appends the `eval` line to `~/.bashrc`/`~/.zshrc`, writes
+`~/.config/fish/conf.d/tayassu.fish`, and installs `tayassu-probe.service` and
+`tayassu-probe.timer` under `$XDG_CONFIG_HOME/systemd/user/` (enable with
+`systemctl --user enable --now tayassu-probe.timer`). It is idempotent.
 
-### `tayassu shell-init`
+### `tayassu self-update` and `tayassu upgrade-clis`
 
-```bash
-eval "$(tayassu shell-init bash)"
-eval "$(tayassu shell-init zsh --failover)"
-tayassu shell-init fish | source
-```
-
-Generates wrapper functions that route `agy`, `claude`, `codex`, `copilot`, and
-`opencode` through `tayassu run`. Bypass a wrapper with `command <cli> ...`.
-
-Add the `eval` line to `~/.bashrc`, `~/.zshrc`, or `~/.config/fish/config.fish`
-to make routing permanent.
-
-### `tayassu systemd-unit`
-
-```bash
-tayassu systemd-unit
-tayassu systemd-unit --interval-minutes 30 --install
-systemctl --user daemon-reload
-systemctl --user enable --now tayassu-probe.timer
-```
-
-Generates or installs `tayassu-probe.service` and `tayassu-probe.timer` under
-`$XDG_CONFIG_HOME/systemd/user/`. The timer runs `tayassu probe --notify`.
+`self-update` re-runs the installer. `upgrade-clis` runs each provider CLI's
+native updater with the real host `$HOME`, so isolated profiles never break upgrades.
 
 ## Configuration
 
 `tayassu` reads `$XDG_CONFIG_HOME/tayassu/config.toml` (default
 `~/.config/tayassu/config.toml`). Accounts are normally created by
-`tayassu import` or `tayassu account add`, but the file can be edited directly.
+`tayassu import` or `tayassu add`, but the file can be edited directly.
 
 ```toml
 default_policy = "priority"
@@ -263,13 +224,13 @@ an exclusive file lock, so concurrent runs and background probes are safe.
 
 - **No accounts after `import`**: run `tayassu import --dry-run` to see what was
   discovered, and confirm the CLI is on `PATH`.
-- **Login required**: run `tayassu account login <id>`; some providers require a
+- **Login required**: run `tayassu login <id>`; some providers require a
   fresh OAuth flow after credentials are copied.
 - **Broken profile links**: run `tayassu doctor --strict`.
-- **A provider stopped working after an upgrade**: run `tayassu update`, then
+- **A provider stopped working after an upgrade**: run `tayassu upgrade-clis`, then
   `tayassu doctor`.
 - **Wrapper loops or wrong account**: call the CLI directly with
   `command <cli> ...`, or check the account selected by
   `tayassu run <provider> --dry-run`.
-- **Rate limited during a run**: add `--failover`, or use a chain that includes
+- **Rate limited during a run**: failover is on by default; use a chain that includes
   another provider.
