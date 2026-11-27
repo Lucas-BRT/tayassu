@@ -7,7 +7,7 @@ use tayassu_core::ProviderKind;
 
 /// Print shell code that routes `claude`, `agy`, ... through tayassu and enables completion.
 ///
-/// Use as `eval "$(tayassu activate bash)"`; `tayassu setup` adds this to your rc file.
+/// Use as `eval "$(tayassu activate bash)"`; `tayassu setup shell` adds this to your rc file.
 #[derive(Debug, Args)]
 pub struct Activate {
     /// Target shell.

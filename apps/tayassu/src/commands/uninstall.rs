@@ -1,5 +1,7 @@
 use crate::app::{App, Execute};
-use crate::artifacts::{BinaryFile, ManagedArtifact, ShellActivation, SystemdTimer, UserData};
+use crate::artifacts::{
+    BinaryFile, ManagedArtifact, ShellActivation, ShellCompletion, SystemdTimer, UserData,
+};
 use crate::systemd::DEFAULT_PROBE_INTERVAL_MINUTES;
 use anyhow::{Context, Result, bail};
 use clap::Args;
@@ -23,6 +25,7 @@ impl Uninstall {
     fn artifacts(&self) -> Vec<Box<dyn ManagedArtifact>> {
         let mut items: Vec<Box<dyn ManagedArtifact>> = vec![
             Box::new(ShellActivation),
+            Box::new(ShellCompletion),
             Box::new(SystemdTimer {
                 interval_minutes: DEFAULT_PROBE_INTERVAL_MINUTES,
             }),
@@ -82,6 +85,10 @@ impl Execute for Uninstall {
                 writeln!(out, "{}: {line}", artifact.label())?;
             }
         }
+        writeln!(
+            out,
+            "shell: restart your shell to remove active provider wrappers and refresh its command cache"
+        )?;
         Ok(())
     }
 }

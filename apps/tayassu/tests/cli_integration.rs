@@ -31,6 +31,8 @@ impl TestEnv {
             .env("XDG_CONFIG_HOME", self.dir.path().join("config"))
             .env("XDG_STATE_HOME", self.dir.path().join("state"))
             .env("XDG_DATA_HOME", self.dir.path().join("data"))
+            .env_remove("SHELL")
+            .env_remove("ZDOTDIR")
             .env_remove("TAYASSU_COMPLETE");
         command
     }
@@ -105,6 +107,140 @@ fn filtered_empty_status_names_the_requested_provider() {
     let output = env.run_ok(&["ls", "codex"]);
     assert!(output.contains("No accounts configured for codex"));
     assert!(output.contains("tayassu add codex"));
+}
+
+#[test]
+fn setup_without_shell_configuration_does_not_claim_it_is_configured() {
+    let env = TestEnv::new();
+    let output = env.run_ok(&["setup", "shell"]);
+    assert!(output.contains("no supported shell configuration found"));
+    assert!(!output.contains("already configured"));
+}
+
+#[test]
+fn setup_requires_explicit_shell_opt_in() {
+    let env = TestEnv::new();
+    let rc = env.dir.path().join("home/.bashrc");
+    fs::write(&rc, "# original\n").expect("write shell config");
+    env.run_ok(&["setup", "--no-systemd"]);
+    assert_eq!(
+        fs::read_to_string(&rc).expect("read shell config"),
+        "# original\n"
+    );
+    env.run_ok(&["setup", "shell"]);
+    assert!(
+        fs::read_to_string(rc)
+            .expect("read shell config")
+            .contains("tayassu activate bash")
+    );
+}
+
+#[test]
+fn completion_setup_is_idempotent_and_does_not_enable_wrappers() {
+    let env = TestEnv::new();
+    let rc = env.dir.path().join("home/.bashrc");
+    fs::write(&rc, "# original\n").expect("write rc");
+    env.run_ok(&["setup", "completion"]);
+    env.run_ok(&["setup", "completion"]);
+    let contents = fs::read_to_string(&rc).expect("read rc");
+    assert_eq!(contents.matches("# tayassu completion").count(), 1);
+    assert!(contents.contains("TAYASSU_COMPLETE=bash"));
+    assert!(!contents.contains("tayassu activate"));
+    let bin = env.dir.path().join("binary");
+    fs::write(&bin, "binary").expect("write binary");
+    let output = env
+        .command()
+        .args(["uninstall", "--yes"])
+        .env("TAYASSU_UNINSTALL_BIN", bin)
+        .output()
+        .expect("uninstall");
+    assert!(output.status.success());
+    assert_eq!(fs::read_to_string(rc).expect("read rc"), "# original\n");
+}
+
+#[test]
+fn completion_uninstall_preserves_unrelated_fish_configuration() {
+    let env = TestEnv::new();
+    let directory = env.dir.path().join("home/.config/fish/conf.d");
+    fs::create_dir_all(&directory).expect("create fish config");
+    let path = directory.join("tayassu-completion.fish");
+    fs::write(&path, "set -g user_setting yes\n").expect("write user setting");
+    env.run_ok(&["setup", "completion"]);
+    let bin = env.dir.path().join("binary");
+    fs::write(&bin, "binary").expect("write binary");
+    let output = env
+        .command()
+        .args(["uninstall", "--yes"])
+        .env("TAYASSU_UNINSTALL_BIN", bin)
+        .output()
+        .expect("uninstall");
+    assert!(output.status.success());
+    assert_eq!(
+        fs::read_to_string(path).expect("read user setting"),
+        "set -g user_setting yes\n"
+    );
+}
+
+#[cfg(unix)]
+fn test_shell(shell: &str) -> Option<std::path::PathBuf> {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let executable = std::env::split_paths(&path)
+        .map(|directory| directory.join(shell))
+        .find(|candidate| candidate.is_file());
+    assert!(
+        executable.is_some() || std::env::var_os("TAYASSU_REQUIRE_TEST_SHELLS").is_none(),
+        "{shell} is required for shell integration tests"
+    );
+    executable
+}
+
+#[cfg(unix)]
+#[test]
+fn installed_completion_loads_without_provider_wrappers() {
+    for (shell, flags, script) in [
+        (
+            "bash",
+            "-c",
+            "source ~/.bashrc && complete -p tayassu && ! declare -F agy",
+        ),
+        (
+            "zsh",
+            "-ic",
+            "[[ ${_comps[tayassu]} == _clap_dynamic_completer_tayassu ]] && (( ! $+functions[agy] ))",
+        ),
+        (
+            "fish",
+            "-c",
+            "contains -- setup (complete -C 'tayassu set' | cut -f1); and not functions -q agy",
+        ),
+    ] {
+        let Some(executable) = test_shell(shell) else {
+            continue;
+        };
+        let env = TestEnv::new();
+        let bin = env.dir.path().join("bin");
+        fs::create_dir_all(&bin).expect("create bin");
+        std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_tayassu"), bin.join("tayassu"))
+            .expect("link tayassu");
+        let mut setup = env.command();
+        let result = setup
+            .env("SHELL", shell)
+            .args(["setup", "completion"])
+            .output()
+            .expect("setup completion");
+        assert!(result.status.success(), "{shell}: {result:?}");
+        let mut run = Command::new(executable);
+        run.current_dir(env.dir.path())
+            .envs(
+                setup
+                    .get_envs()
+                    .filter_map(|(key, value)| value.map(|value| (key, value))),
+            )
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .args([flags, script]);
+        let output = run.output().expect("run configured shell");
+        assert!(output.status.success(), "{shell}: {output:?}");
+    }
 }
 
 #[test]
@@ -463,16 +599,171 @@ fn activate_emits_valid_wrappers_for_bash_and_fish() {
     let env = TestEnv::new();
 
     let bash_out = env.run_ok(&["activate", "bash"]);
-    assert!(bash_out.contains("agy() { tayassu run agy -- \"$@\"; }"));
-    assert!(bash_out.contains("claude() { tayassu run claude -- \"$@\"; }"));
+    assert!(bash_out.contains("command tayassu __has-account agy"));
+    assert!(bash_out.contains("command tayassu __has-account claude"));
     assert!(bash_out.contains("TAYASSU_COMPLETE=bash"));
 
     let no_failover = env.run_ok(&["activate", "bash", "--no-failover"]);
-    assert!(no_failover.contains("codex() { tayassu run codex --no-failover -- \"$@\"; }"));
+    assert!(no_failover.contains("command tayassu run codex --no-failover -- \"$@\""));
 
     let fish_out = env.run_ok(&["activate", "fish", "--provider", "copilot"]);
     assert!(fish_out.contains("function copilot --wraps copilot"));
     assert!(!fish_out.contains("function agy"));
+}
+
+#[cfg(unix)]
+#[test]
+fn bash_wrapper_falls_back_without_an_account_and_after_uninstall() {
+    let env = TestEnv::new();
+    let bin = env.dir.path().join("bin");
+    fs::create_dir_all(&bin).expect("create bin");
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_tayassu"), bin.join("tayassu"))
+        .expect("link tayassu");
+    let host = bin.join("agy");
+    fs::write(&host, "#!/bin/sh\nprintf 'host:%s\\n' \"$*\"\n").expect("write host");
+    fs::set_permissions(&host, fs::Permissions::from_mode(SCRIPT_EXECUTABLE_MODE))
+        .expect("chmod host");
+    let script = "eval \"$(tayassu activate bash --provider agy)\"; agy --help; rm \"$BIN_DIR/tayassu\"; agy after-uninstall";
+    let output = env
+        .command()
+        .get_envs()
+        .fold(Command::new("bash"), |mut cmd, (key, value)| {
+            if let Some(value) = value {
+                cmd.env(key, value);
+            } else {
+                cmd.env_remove(key);
+            }
+            cmd
+        })
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+        .env("BIN_DIR", &bin)
+        .args(["-c", script])
+        .output()
+        .expect("run shell");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "host:--help\nhost:after-uninstall\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn zsh_and_fish_wrappers_fall_back_when_tayassu_is_removed() {
+    for (shell, script) in [
+        (
+            "zsh",
+            "eval \"$(tayassu activate zsh --provider agy)\"; agy 'hello world'; rm \"$BIN_DIR/tayassu\"; agy after",
+        ),
+        (
+            "fish",
+            "tayassu activate fish --provider agy | source; agy 'hello world'; rm $BIN_DIR/tayassu; agy after",
+        ),
+    ] {
+        let Some(executable) = test_shell(shell) else {
+            continue;
+        };
+        let env = TestEnv::new();
+        let bin = env.dir.path().join("bin");
+        fs::create_dir_all(&bin).expect("create bin");
+        std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_tayassu"), bin.join("tayassu"))
+            .expect("link tayassu");
+        let host = bin.join("agy");
+        fs::write(&host, "#!/bin/sh\nprintf 'host:%s\\n' \"$*\"\n").expect("write host");
+        fs::set_permissions(&host, fs::Permissions::from_mode(SCRIPT_EXECUTABLE_MODE))
+            .expect("chmod host");
+        let output = env
+            .command()
+            .get_envs()
+            .fold(Command::new(executable), |mut cmd, (key, value)| {
+                if let Some(value) = value {
+                    cmd.env(key, value);
+                } else {
+                    cmd.env_remove(key);
+                }
+                cmd
+            })
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .env("BIN_DIR", &bin)
+            .args(["-c", script])
+            .output()
+            .expect("run shell");
+        assert!(
+            output.status.success(),
+            "{shell}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "host:hello world\nhost:after\n",
+            "{shell}"
+        );
+    }
+}
+
+#[test]
+fn wrapper_account_check_keeps_disabled_accounts_in_routing() {
+    let env = TestEnv::new();
+    assert_eq!(env.run_ok(&["__has-account", "agy"]).trim(), "false");
+    env.run_ok(&["add", "agy", "work", "--no-login"]);
+    assert_eq!(env.run_ok(&["__has-account", "agy"]).trim(), "true");
+    env.run_ok(&["disable", "work"]);
+    assert_eq!(env.run_ok(&["__has-account", "agy"]).trim(), "true");
+    env.run_ok(&["rm", "work"]);
+    assert_eq!(env.run_ok(&["__has-account", "agy"]).trim(), "false");
+}
+
+#[cfg(unix)]
+#[test]
+fn bash_wrapper_routes_configured_accounts_and_does_not_bypass_disabled_accounts() {
+    let env = TestEnv::new();
+    let bin = env.dir.path().join("bin");
+    fs::create_dir_all(&bin).expect("create bin");
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_tayassu"), bin.join("tayassu"))
+        .expect("link tayassu");
+    let host = bin.join("agy");
+    fs::write(&host, "#!/bin/sh\nprintf 'host invoked\\n'\n").expect("write host");
+    fs::set_permissions(&host, fs::Permissions::from_mode(SCRIPT_EXECUTABLE_MODE))
+        .expect("chmod host");
+    let routed = env.write_mock_script("routed", "#!/bin/sh\nprintf 'routed:%s\\n' \"$*\"\n");
+    env.run_ok(&["add", "agy", "work", "--no-login", "--binary", &routed]);
+    let run_shell = || {
+        env.command()
+            .get_envs()
+            .fold(Command::new("bash"), |mut cmd, (key, value)| {
+                if let Some(value) = value {
+                    cmd.env(key, value);
+                } else {
+                    cmd.env_remove(key);
+                }
+                cmd
+            })
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .args([
+                "-c",
+                "eval \"$(tayassu activate bash --provider agy)\"; agy --example",
+            ])
+            .output()
+            .expect("run wrapper")
+    };
+    let output = run_shell();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "routed:--example\n"
+    );
+    env.run_ok(&["disable", "work"]);
+    let output = run_shell();
+    assert!(!output.status.success());
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("host invoked"));
 }
 
 #[cfg(unix)]
@@ -1057,6 +1348,7 @@ fn uninstall_removes_hooks_units_and_binary_while_keeping_data_unless_purged() {
     fs::write(home.join(".bashrc"), "export KEEP=1\n").expect("write bashrc");
     env.run_ok(&["add", "claude", "work", "--no-login"]);
     env.run_ok(&["setup", "--interval-minutes", "15"]);
+    env.run_ok(&["setup", "shell"]);
 
     let fake_bin = env.dir.path().join("tayassu-copy");
     fs::write(&fake_bin, "bin").expect("write fake bin");

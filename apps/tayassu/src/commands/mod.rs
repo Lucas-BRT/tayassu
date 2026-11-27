@@ -59,7 +59,7 @@ pub enum Command {
     Doctor(doctor::Doctor),
     /// Print shell code for wrappers and completion (`eval "$(tayassu activate bash)"`).
     Activate(activate::Activate),
-    /// Configure shell activation and the background probe timer.
+    /// Configure background probing or opt in to shell wrappers.
     Setup(setup::Setup),
     /// Read or write global settings.
     Config(config::Config),
@@ -75,6 +75,11 @@ pub enum Command {
     /// Internal background release check spawned by the update notifier.
     #[command(name = "__check-update", hide = true)]
     CheckUpdate,
+    /// Internal shell-wrapper account check.
+    #[command(name = "__has-account", hide = true)]
+    HasAccount {
+        provider: tayassu_core::ProviderKind,
+    },
 }
 
 impl Default for Command {
@@ -113,6 +118,17 @@ impl Execute for Command {
                 &app.paths.state_file,
                 chrono::Utc::now(),
             ),
+            Self::HasAccount { provider } => {
+                writeln!(
+                    out,
+                    "{}",
+                    app.config
+                        .accounts
+                        .iter()
+                        .any(|account| account.provider == provider)
+                )?;
+                Ok(())
+            }
         }
     }
 }

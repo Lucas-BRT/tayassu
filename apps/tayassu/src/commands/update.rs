@@ -114,8 +114,10 @@ impl Update {
         writeln!(out, "Updated {} to {}.", exe.display(), release.tag)?;
 
         // Refresh shell activation and any existing systemd units.
-        for line in ShellActivation.install(app)? {
-            writeln!(out, "shell: {line}")?;
+        if !ShellActivation.planned_removals(app)?.is_empty() {
+            for line in ShellActivation.install(app)? {
+                writeln!(out, "shell: {line}")?;
+            }
         }
         if let Some(config_base) = app.paths.config_file.parent().and_then(Path::parent) {
             let systemd_dir = config_base.join("systemd/user");

@@ -231,7 +231,9 @@ pub trait RcShell: Shell {
 fn posix_wrapper(provider: ProviderKind, failover: bool) -> String {
     let flag = if failover { "" } else { " --no-failover" };
     format!(
-        "{}() {{ tayassu run {}{flag} -- \"$@\"; }}",
+        "{}() {{ if [ ! -x \"$(command -v tayassu)\" ] || [ \"$(command tayassu __has-account {})\" = false ]; then command {} \"$@\"; else command tayassu run {}{flag} -- \"$@\"; fi; }}",
+        provider.default_binary(),
+        provider.as_str(),
         provider.default_binary(),
         provider.as_str()
     )
@@ -303,7 +305,8 @@ impl Shell for Fish {
         let cmd = provider.default_binary();
         let flag = if failover { "" } else { " --no-failover" };
         format!(
-            "function {cmd} --wraps {cmd}\n    tayassu run {}{flag} -- $argv\nend",
+            "function {cmd} --wraps {cmd}\n    if not command -q tayassu; or test (command tayassu __has-account {}) = false\n        command {cmd} $argv\n    else\n        command tayassu run {}{flag} -- $argv\n    end\nend",
+            provider.as_str(),
             provider.as_str()
         )
     }
@@ -374,7 +377,7 @@ mod tests {
         let bash = ShellKind::Bash
             .shell()
             .activation(&[ProviderKind::Agy], true);
-        assert!(bash.contains("agy() { tayassu run agy -- \"$@\"; }"));
+        assert!(bash.contains("command tayassu __has-account agy"));
         assert!(bash.contains("eval \"$(TAYASSU_COMPLETE=bash tayassu)\""));
 
         let fish = ShellKind::Fish

@@ -12,7 +12,11 @@ mkdir -p "$scratch/bin" "$scratch/assets"
 
 cat > "$scratch/tayassu" <<'MOCK'
 #!/usr/bin/env bash
-printf 'tayassu 9.8.7\n'
+case "$*" in
+  --version) printf 'tayassu 9.8.7\n' ;;
+  'setup completion') touch "${0%/*}/completion-configured" ;;
+  *) exit 1 ;;
+esac
 MOCK
 cat > "$scratch/bin/uname" <<'MOCK'
 #!/usr/bin/env bash
@@ -40,6 +44,7 @@ asset=tayassu-x86_64-unknown-linux-gnu.tar.gz
 bash "$repo_dir/tools/package-release.sh" "$scratch/tayassu" x86_64-unknown-linux-gnu "$scratch/assets"
 bash "$repo_dir/install.sh"
 [[ "$("$TAYASSU_INSTALL_DIR/tayassu" --version)" == "tayassu 9.8.7" ]]
+[[ -e "$TAYASSU_INSTALL_DIR/completion-configured" ]]
 [[ ! -e "$scratch/source-used" ]]
 
 export TAYASSU_INSTALL_DIR="$scratch/invalid"
@@ -55,3 +60,4 @@ mv "$scratch/assets/$asset" "$scratch/unused.tar.gz"
 bash "$repo_dir/install.sh"
 [[ -e "$scratch/source-used" ]]
 [[ "$("$TAYASSU_INSTALL_DIR/tayassu" --version)" == "tayassu 9.8.7" ]]
+[[ -e "$TAYASSU_INSTALL_DIR/completion-configured" ]]
