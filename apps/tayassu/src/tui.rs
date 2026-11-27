@@ -1052,17 +1052,13 @@ fn summarize_buckets(status: Option<&AccountStatus>, now: DateTime<Utc>) -> Vec<
     buckets
         .iter()
         .map(|bucket| {
-            let pct = st.lowest_remaining_percent(bucket, now).map_or_else(
-                || "unknown".to_owned(),
-                |val| {
-                    let stale = if st.last_probe_error.is_some() {
-                        " stale"
-                    } else {
-                        ""
-                    };
-                    format!("{val}{stale}")
-                },
-            );
+            let label = st.quota_label(bucket, now);
+            let pct =
+                if st.last_probe_error.is_some() && !label.starts_with('~') && label != "reset✓" {
+                    format!("{label} stale")
+                } else {
+                    label
+                };
             if let Some(cd) = st.active_cooldown(bucket, now) {
                 let rem = cd
                     .remaining(now)
@@ -1115,6 +1111,7 @@ mod tests {
             "Student Plan",
         );
         let mut status = AccountStatus::empty(account.id.clone());
+        status.last_probed_at = Some(now);
         status.windows.push(QuotaWindow {
             window_name: "5h".to_owned(),
             bucket: "gemini".parse().expect("bucket"),
@@ -1157,6 +1154,7 @@ mod tests {
         let account =
             AccountConfig::new("agy-host".parse().expect("id"), ProviderKind::Agy, "Host");
         let mut status = AccountStatus::empty(account.id.clone());
+        status.last_probed_at = Some(now);
 
         for (bucket, pct) in [("gemini", TEST_GEMINI_PCT), ("claude", TEST_CLAUDE_PCT)] {
             let bucket: ModelBucket = bucket.parse().expect("bucket");
@@ -1230,6 +1228,8 @@ mod tests {
         failed.priority = 10;
 
         let mut failed_status = AccountStatus::empty(failed.id.clone());
+
+        failed_status.last_probed_at = Some(now);
         failed_status.set_probe_failure(ProbeFailure::authentication(
             "account 'alpha' is not logged in",
         ));
@@ -1287,6 +1287,7 @@ mod tests {
     fn quota_bars_show_threshold_colors() {
         let now = Utc::now();
         let mut status = AccountStatus::empty("test".parse().expect("id"));
+        status.last_probed_at = Some(now);
         for (name, percent) in [("critical", 9), ("low", 24), ("healthy", 25)] {
             status.windows.push(QuotaWindow {
                 window_name: "weekly".to_owned(),
@@ -1305,6 +1306,7 @@ mod tests {
     fn quota_windows_show_each_period_and_catalog_is_paged() {
         let now = Utc::now();
         let mut status = AccountStatus::empty("test".parse().expect("id"));
+        status.last_probed_at = Some(now);
         for (name, pct) in [("weekly", TEST_GEMINI_PCT), ("5h", TEST_CLAUDE_PCT)] {
             status.windows.push(QuotaWindow {
                 window_name: name.to_owned(),

@@ -5,7 +5,12 @@ use std::path::{Path, PathBuf};
 use tempfile::NamedTempFile;
 
 /// Writes to a unique sibling file before publishing the completed contents.
-pub(crate) fn write_atomic(target: &Path, bytes: &[u8]) -> Result<(), StoreError> {
+/// Writes `bytes` to a sibling temp file, syncs it, and atomically renames it over `target`.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Io`] if directory creation, file writing, sync, or rename fails.
+pub fn write_atomic(target: &Path, bytes: &[u8]) -> Result<(), StoreError> {
     let parent = target
         .parent()
         .filter(|path| !path.as_os_str().is_empty())

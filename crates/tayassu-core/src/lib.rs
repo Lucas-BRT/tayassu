@@ -12,8 +12,8 @@ pub use account::{
 pub use error::CoreError;
 pub use quota::{
     AGY_PROBE_COOLDOWN_REASON_PREFIX, AccountStatus, CooldownEntry, DEFAULT_FALLBACK_COOLDOWN_SECS,
-    KeyBudget, MAX_REMAINING_PERCENT, MIN_REMAINING_PERCENT, ProbeFailure, ProbeFailureKind,
-    QuotaWindow, RemainingPercent,
+    FRESH_WINDOW_MINUTES, KeyBudget, MAX_REMAINING_PERCENT, MIN_REMAINING_PERCENT, ProbeFailure,
+    ProbeFailureKind, QuotaWindow, RemainingPercent, WindowState,
 };
 pub use router::{AccountRouter, FallbackTarget, SelectionPolicy};
 

@@ -130,5 +130,8 @@ case ":${PATH}:" in
   *) log "Add ${INSTALL_DIR} to PATH to run ${BIN_NAME} directly." ;;
 esac
 
+# Configure shell activation and completion (non-fatal).
+"${INSTALL_DIR}/${BIN_NAME}" setup --no-systemd || log "Warning: could not configure shell completions."
+
 # Print final version.
 "${INSTALL_DIR}/${BIN_NAME}" --version

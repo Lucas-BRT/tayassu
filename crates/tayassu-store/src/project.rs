@@ -1,3 +1,4 @@
+use crate::atomic::write_atomic;
 use crate::error::StoreError;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -53,5 +54,15 @@ impl ProjectConfig {
     #[must_use]
     pub fn preferred_account_for(&self, provider: ProviderKind) -> Option<&AccountId> {
         self.preferred_accounts.get(provider.as_str())
+    }
+
+    /// Atomically writes this project configuration to `path`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::ConfigSerialize`] or [`StoreError::Io`].
+    pub fn save_atomic(&self, path: &Path) -> Result<(), StoreError> {
+        let serialized = toml::to_string_pretty(self)?;
+        write_atomic(path, serialized.as_bytes())
     }
 }

@@ -84,6 +84,38 @@ impl SystemdUnits {
 
         Ok((service_path, timer_path))
     }
+
+    /// Returns installed unit paths under `systemd_user_dir` that exist on disk.
+    #[must_use]
+    pub fn installed_in(systemd_user_dir: &Path) -> Vec<PathBuf> {
+        [SYSTEMD_SERVICE_NAME, SYSTEMD_TIMER_NAME]
+            .into_iter()
+            .map(|name| systemd_user_dir.join(name))
+            .filter(|path| path.exists())
+            .collect()
+    }
+
+    /// Disables the timer (best-effort) and removes unit files from `systemd_user_dir`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if an existing unit file cannot be deleted.
+    pub fn uninstall_from(systemd_user_dir: &Path) -> Result<Vec<PathBuf>> {
+        let existing = Self::installed_in(systemd_user_dir);
+        if existing.is_empty() {
+            return Ok(Vec::new());
+        }
+        let _ = std::process::Command::new("systemctl")
+            .args(["--user", "disable", "--now", SYSTEMD_TIMER_NAME])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        for path in &existing {
+            fs::remove_file(path)
+                .with_context(|| format!("failed to remove {}", path.display()))?;
+        }
+        Ok(existing)
+    }
 }
 
 #[cfg(test)]

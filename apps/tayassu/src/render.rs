@@ -161,7 +161,7 @@ impl<'a> StatusTable<'a> {
                     .collect::<Vec<_>>()
                     .join(" ");
                 let action = if failure.is_authentication() {
-                    format!("tayassu account login {id}")
+                    format!("tayassu login {id}")
                 } else {
                     format!("tayassu doctor, then tayassu probe --id {id}")
                 };
@@ -252,9 +252,7 @@ fn render_quota(
     let parts: Vec<String> = buckets
         .iter()
         .map(|bucket| {
-            let pct = st
-                .lowest_remaining_percent(bucket, now)
-                .map_or_else(|| "unknown".to_owned(), |val| val.to_string());
+            let pct = st.quota_label(bucket, now);
             if let Some(cd) = st.active_cooldown(bucket, now) {
                 let rem = cd
                     .remaining(now)
@@ -302,6 +300,7 @@ mod tests {
             "Work",
         );
         let mut status = AccountStatus::empty(account.id.clone());
+        status.last_probed_at = Some(now);
         status.set_probe_failure(tayassu_core::ProbeFailure::authentication("not logged in"));
 
         let accounts = [account];
@@ -330,6 +329,8 @@ mod tests {
         );
 
         let mut cooling_status = AccountStatus::empty(cooling.id.clone());
+
+        cooling_status.last_probed_at = Some(now);
         cooling_status.windows.push(QuotaWindow {
             window_name: "weekly".to_owned(),
             bucket: "gemini".parse().expect("bucket"),
