@@ -1,18 +1,23 @@
 //! GitHub release fetching, SHA-256 verification, and atomic binary replacement.
 
 use anyhow::{Context, Result, bail};
+use chrono::{DateTime, SecondsFormat};
 use flate2::read::GzDecoder;
 use semver::Version;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use std::fs;
 use std::io::Read;
 use std::path::Path;
 use std::time::Duration;
+use std::{env, fs};
 use tar::Archive;
+use ureq::http::{HeaderMap, StatusCode};
 
 /// GitHub repository slug (`owner/repo`).
 const GITHUB_REPO: &str = "Lucas-BRT/tayassu";
+
+/// Optional token for GitHub release metadata requests.
+const GITHUB_TOKEN_ENV: &str = "TAYASSU_GITHUB_TOKEN";
 
 /// Binary filename inside release archives.
 pub const BIN_NAME: &str = "tayassu";
@@ -111,6 +116,49 @@ impl GitHubReleases {
             agent: config.into(),
         }
     }
+
+    fn check_metadata_status(
+        status: StatusCode,
+        headers: &HeaderMap,
+        authenticated: bool,
+    ) -> Result<()> {
+        if status.is_success() {
+            return Ok(());
+        }
+
+        let quota_exhausted = headers
+            .get("x-ratelimit-remaining")
+            .is_some_and(|remaining| remaining == "0");
+        let retry_after = headers
+            .get("retry-after")
+            .and_then(|value| value.to_str().ok()?.parse::<u64>().ok());
+        if status == StatusCode::TOO_MANY_REQUESTS
+            || (status == StatusCode::FORBIDDEN && (quota_exhausted || retry_after.is_some()))
+        {
+            let reset = headers
+                .get("x-ratelimit-reset")
+                .and_then(|value| value.to_str().ok()?.parse::<i64>().ok())
+                .and_then(|timestamp| DateTime::from_timestamp(timestamp, 0));
+            let retry = if let Some(seconds) = retry_after {
+                format!("retry in {seconds} seconds")
+            } else if let Some(reset) = reset.filter(|_| quota_exhausted) {
+                format!(
+                    "retry after {}",
+                    reset.to_rfc3339_opts(SecondsFormat::Secs, true)
+                )
+            } else {
+                "retry later".to_owned()
+            };
+            if authenticated {
+                bail!("GitHub API rate limit exceeded (HTTP {status}). Please {retry}.");
+            }
+            bail!(
+                "GitHub API rate limit exceeded (HTTP {status}). Please {retry} or set {GITHUB_TOKEN_ENV}."
+            );
+        }
+
+        bail!("HTTP {status}");
+    }
 }
 
 #[derive(Deserialize)]
@@ -131,12 +179,24 @@ impl ReleaseSource for GitHubReleases {
     fn fetch_releases(&self) -> Result<Vec<Release>> {
         let url = format!("https://api.github.com/repos/{GITHUB_REPO}/releases?per_page=20");
         let user_agent = format!("{BIN_NAME}/{}", env!("CARGO_PKG_VERSION"));
-        let mut resp = self
+        let token = env::var(GITHUB_TOKEN_ENV).ok();
+        let token = token
+            .as_deref()
+            .map(str::trim)
+            .filter(|token| !token.is_empty());
+        let mut request = self
             .agent
             .get(&url)
             .header("Accept", "application/vnd.github+json")
             .header("User-Agent", &user_agent)
-            .call()
+            .config()
+            .http_status_as_error(false)
+            .build();
+        if let Some(token) = token {
+            request = request.header("Authorization", format!("Bearer {token}"));
+        }
+        let mut resp = request.call().context("failed to query GitHub releases")?;
+        Self::check_metadata_status(resp.status(), resp.headers(), token.is_some())
             .context("failed to query GitHub releases")?;
         let raw_json = resp
             .body_mut()
@@ -323,6 +383,32 @@ mod tests {
             prerelease,
             assets: Vec::new(),
         }
+    }
+
+    #[test]
+    fn github_rate_limit_reports_retry_and_authentication_options() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-ratelimit-remaining", "0".parse().expect("remaining"));
+        headers.insert("x-ratelimit-reset", "1795796424".parse().expect("reset"));
+        let error = GitHubReleases::check_metadata_status(StatusCode::FORBIDDEN, &headers, false)
+            .expect_err("unauthenticated primary rate limit")
+            .to_string();
+        assert!(error.contains("retry after 2026-11-27T16:20:24Z"));
+        assert!(error.contains(GITHUB_TOKEN_ENV));
+
+        headers.clear();
+        headers.insert("retry-after", "60".parse().expect("retry after"));
+        let error =
+            GitHubReleases::check_metadata_status(StatusCode::TOO_MANY_REQUESTS, &headers, true)
+                .expect_err("authenticated secondary rate limit")
+                .to_string();
+        assert!(error.contains("retry in 60 seconds"));
+        assert!(!error.contains(GITHUB_TOKEN_ENV));
+
+        let error =
+            GitHubReleases::check_metadata_status(StatusCode::FORBIDDEN, &HeaderMap::new(), false)
+                .expect_err("unrelated forbidden response");
+        assert_eq!(error.to_string(), "HTTP 403 Forbidden");
     }
 
     #[test]
