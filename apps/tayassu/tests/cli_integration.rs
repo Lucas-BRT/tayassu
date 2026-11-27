@@ -181,9 +181,21 @@ fn live_probe_updates_buckets_and_routes_per_model_cooldown() {
     assert!(status_out.contains("gemini:43%"));
     assert!(status_out.contains("claude:0%("));
 
-    // Gemini is still available on higher-priority agy-student.
-    let gemini_run = env.run_ok(&["run", "agy", "--model", "gemini", "--dry-run"]);
+    // Explicit priority policy keeps the higher-priority agy-student.
+    let gemini_run = env.run_ok(&[
+        "run",
+        "agy",
+        "--model",
+        "gemini",
+        "--policy",
+        "priority",
+        "--dry-run",
+    ]);
     assert!(gemini_run.contains("account: agy-student"));
+
+    // Default policy is most-quota: agy-pro has more gemini quota left (90% vs 43%).
+    let gemini_default = env.run_ok(&["run", "agy", "--model", "gemini", "--dry-run"]);
+    assert!(gemini_default.contains("account: agy-pro"));
 
     // Claude bucket is at 0% on agy-student, so router must fail over to agy-pro.
     let claude_run = env.run_ok(&["run", "agy", "--model", "claude", "--dry-run"]);

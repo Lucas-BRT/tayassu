@@ -12,9 +12,9 @@ use std::str::FromStr;
 #[serde(rename_all = "kebab-case")]
 pub enum SelectionPolicy {
     /// Prefer lowest configured `priority`, breaking ties by fewer active sessions and highest quota.
-    #[default]
     Priority,
-    /// Prefer highest remaining quota percentage, breaking ties by `priority` and fewer sessions.
+    /// Prefer highest remaining quota percentage, breaking ties by fewer sessions and `priority`.
+    #[default]
     MostQuota,
     /// Prefer the account whose current quota window resets soonest (use-it-or-lose-it).
     SoonestReset,
