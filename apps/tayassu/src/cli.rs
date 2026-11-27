@@ -36,6 +36,13 @@ pub enum Command {
         list_models: bool,
     },
 
+    /// Automatic routing and background probing.
+    Auto {
+        /// Automatic operation.
+        #[command(subcommand)]
+        action: AutoAction,
+    },
+
     /// Open an interactive live terminal dashboard for accounts, quotas, and cooldowns.
     Dash,
 
@@ -142,6 +149,25 @@ pub enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+}
+
+/// Automatic operations.
+#[derive(Debug, Subcommand)]
+pub enum AutoAction {
+    /// Select a configured fallback target with confirmed quota and launch it.
+    Run {
+        /// Override the configured fallback chain.
+        #[arg(long)]
+        chain: Option<String>,
+        /// Show the selected target using the last recorded quota.
+        #[arg(long)]
+        dry_run: bool,
+        /// Arguments forwarded to the selected agent.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Enable periodic probing and refresh quotas now.
+    Probe,
 }
 
 /// Options for discovering and importing host accounts.

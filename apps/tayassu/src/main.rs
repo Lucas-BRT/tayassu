@@ -13,7 +13,7 @@ use anyhow::{Context, Result, bail};
 use chrono::{TimeDelta, Utc};
 use clap::{CommandFactory, Parser};
 use clap_complete::CompleteEnv;
-use cli::{AccountAction, Cli, Command, CooldownAction, ImportArgs};
+use cli::{AccountAction, AutoAction, Cli, Command, CooldownAction, ImportArgs};
 use doctor::DoctorReport;
 use render::StatusTable;
 use routing::RunRequest;
@@ -151,6 +151,7 @@ impl App {
                         .context("failed to write status table")
                 }
             }
+            Command::Auto { action } => self.handle_auto(action, out),
             Command::Dash => self.handle_dash(),
             Command::Run {
                 account,
@@ -207,6 +208,66 @@ impl App {
         }
     }
 
+    fn handle_auto(&mut self, action: AutoAction, out: &mut impl Write) -> Result<()> {
+        match action {
+            AutoAction::Run {
+                chain,
+                dry_run,
+                args,
+            } => {
+                let project_chain = tayassu_store::ProjectConfig::discover(&env::current_dir()?)?
+                    .and_then(|(_, config)| config.fallback_chain);
+                let chain = chain.or(project_chain).or_else(|| {
+                    self.config
+                        .fallback_chains
+                        .contains_key("auto")
+                        .then(|| "auto".to_owned())
+                });
+                let chain = chain.or_else(|| {
+                    let mut accounts: Vec<_> = self
+                        .config
+                        .accounts
+                        .iter()
+                        .filter(|account| account.enabled)
+                        .collect();
+                    accounts.sort_by_key(|account| account.priority);
+                    let mut targets = Vec::new();
+                    for account in accounts {
+                        if !targets.iter().any(|target: &tayassu_core::FallbackTarget| {
+                            target.provider == account.provider
+                        }) {
+                            targets.push(tayassu_core::FallbackTarget::new(
+                                account.provider,
+                                ModelBucket::default_bucket(),
+                            ));
+                        }
+                    }
+                    if targets.is_empty() {
+                        return None;
+                    }
+                    let name = "__automatic".to_owned();
+                    self.config.fallback_chains.insert(name.clone(), targets);
+                    Some(name)
+                });
+                self.run_agent(
+                    &RunRequest {
+                        account: None,
+                        provider: None,
+                        chain,
+                        model: None,
+                        policy: None,
+                        dry_run,
+                        require_quota: true,
+                        failover: false,
+                        args,
+                    },
+                    out,
+                )
+            }
+            AutoAction::Probe => self.handle_auto_probe(out),
+        }
+    }
+
     fn with_current_config(
         &mut self,
         operation: impl FnOnce(&mut Self) -> Result<()>,
@@ -221,12 +282,21 @@ impl App {
         let paths = self.paths.clone();
         let accounts = self.config.accounts.clone();
 
+        let probe_accounts_list = accounts.clone();
+        let probe_paths = paths.clone();
         tui::run_dashboard(
             &accounts,
             &mut self.state,
-            |state| {
-                let (ok_count, err_count) =
-                    probe_accounts(&accounts, &accounts, &paths, state, false, None)?;
+            &paths.state_file,
+            move |state| {
+                let (ok_count, err_count) = probe_accounts(
+                    &probe_accounts_list,
+                    &probe_accounts_list,
+                    &probe_paths,
+                    state,
+                    false,
+                    None,
+                )?;
                 Ok(format!("Probe complete: {ok_count} ok, {err_count} failed"))
             },
             |state, account_id| {
@@ -587,6 +657,68 @@ impl App {
         Ok(())
     }
 
+    fn handle_auto_probe(&mut self, out: &mut impl Write) -> Result<()> {
+        self.handle_probe(None, false, out)?;
+        let active = ProcessCommand::new("systemctl")
+            .args([
+                "--user",
+                "is-enabled",
+                "--quiet",
+                systemd::SYSTEMD_TIMER_NAME,
+            ])
+            .status()
+            .context("failed to check systemd user timer")?
+            .success();
+        if active {
+            anyhow::ensure!(
+                ProcessCommand::new("systemctl")
+                    .args(["--user", "start", systemd::SYSTEMD_TIMER_NAME])
+                    .status()
+                    .context("failed to start timer")?
+                    .success(),
+                "failed to start background probe timer"
+            );
+            writeln!(out, "Background probe timer already enabled.")?;
+        } else {
+            let config_base = self
+                .paths
+                .config_file
+                .parent()
+                .and_then(Path::parent)
+                .context("failed to resolve XDG config root")?;
+            let dir = config_base.join(SYSTEMD_USER_REL_DIR);
+            let service = dir.join(systemd::SYSTEMD_SERVICE_NAME);
+            let timer = dir.join(systemd::SYSTEMD_TIMER_NAME);
+            if !service.exists() && !timer.exists() {
+                SystemdUnits::new(
+                    env::current_exe().context("failed to resolve current binary")?,
+                    systemd::DEFAULT_PROBE_INTERVAL_MINUTES,
+                )
+                .install_to(&dir)?;
+            } else {
+                anyhow::ensure!(
+                    service.exists() && timer.exists(),
+                    "incomplete existing systemd units; repair them before enabling the timer"
+                );
+            }
+            for args in [
+                vec!["--user", "daemon-reload"],
+                vec!["--user", "enable", "--now", systemd::SYSTEMD_TIMER_NAME],
+            ] {
+                anyhow::ensure!(
+                    ProcessCommand::new("systemctl")
+                        .args(args)
+                        .status()
+                        .context("failed to run systemctl")?
+                        .success(),
+                    "failed to enable background probe timer"
+                );
+            }
+            writeln!(out, "Background probe timer enabled.")?;
+        }
+        Ok(())
+    }
+
     fn handle_systemd_unit(
         &self,
         interval_minutes: u64,
@@ -706,6 +838,38 @@ impl App {
     }
 }
 
+fn auth_only_replaces_measurements(
+    probe: &ProbeOutput,
+    status: &tayassu_core::AccountStatus,
+) -> bool {
+    !probe.windows.is_empty()
+        && probe
+            .windows
+            .iter()
+            .all(|window| window.window_name == "auth" || window.window_name.starts_with("auth:"))
+        && probe.model_buckets.is_empty()
+        && probe.key_budget.is_none()
+        && probe.cooldowns.is_empty()
+        && (status
+            .windows
+            .iter()
+            .any(|window| window.remaining.is_some())
+            || !status.model_buckets.is_empty()
+            || status.key_budget.is_some())
+}
+
+fn record_auth_only_failure(
+    status: &mut tayassu_core::AccountStatus,
+    account_id: &AccountId,
+    out: &mut Option<&mut dyn Write>,
+) {
+    let message = "quota probe unavailable; showing last successful measurement";
+    status.set_probe_failure(ProbeFailure::other(message));
+    if let Some(writer) = out.as_deref_mut() {
+        let _ = writeln!(writer, "{account_id}: {message}");
+    }
+}
+
 fn probe_accounts(
     targets: &[AccountConfig],
     configured_accounts: &[AccountConfig],
@@ -761,6 +925,11 @@ fn probe_accounts(
             }
             status.last_probed_at = Some(now);
             match outcome {
+                Ok(parsed) if auth_only_replaces_measurements(&parsed, status) =>
+                {
+                    err_count += 1;
+                    record_auth_only_failure(status, &account_id, &mut out);
+                }
                 Ok(parsed) => {
                     let window_count = parsed.windows.len();
                     let cooldown_count = parsed.cooldowns.len();
@@ -1111,4 +1280,36 @@ fn init_tracing() {
         .with_env_filter(filter)
         .with_writer(io::stderr)
         .init();
+}
+
+#[cfg(test)]
+mod probe_tests {
+    use super::*;
+    use tayassu_core::{QuotaWindow, RemainingPercent};
+
+    /// Known percentage for the previous measurement.
+    const TEST_PERCENT: u8 = 50;
+
+    #[test]
+    fn authentication_only_does_not_replace_measured_quota() {
+        let mut status = tayassu_core::AccountStatus::empty("test".parse().expect("id"));
+        status.windows.push(QuotaWindow {
+            window_name: "weekly".to_owned(),
+            bucket: ModelBucket::default_bucket(),
+            remaining: Some(RemainingPercent::try_from(TEST_PERCENT).expect("percent")),
+            resets_at: None,
+        });
+        let mut probe = ProbeOutput::default();
+        probe.windows.push(QuotaWindow {
+            window_name: "auth".to_owned(),
+            bucket: ModelBucket::default_bucket(),
+            remaining: None,
+            resets_at: None,
+        });
+        assert!(auth_only_replaces_measurements(&probe, &status));
+        probe.windows[0].remaining =
+            Some(RemainingPercent::try_from(TEST_PERCENT).expect("percent"));
+        probe.windows[0].window_name = "weekly".to_owned();
+        assert!(!auth_only_replaces_measurements(&probe, &status));
+    }
 }

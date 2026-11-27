@@ -439,3 +439,21 @@ lock for configuration changes.
   `tayassu run <provider> --dry-run`.
 - **Rate limited during a run**: add `--failover`, or use a chain that includes
   another provider.
+
+### Automatic routing and probing
+
+`tayassu auto run` uses the project fallback chain, or the global `auto`
+chain when no project chain is configured. Without either, it tries enabled
+providers in account priority order. It refreshes quota and selects only
+a target with confirmed quota. Use `--chain NAME` to override the chain or
+`--dry-run` to inspect the last recorded measurements.
+
+`tayassu auto probe` refreshes accounts immediately, then installs (if absent)
+and enables the systemd user timer. Existing unit files are preserved. The
+user systemd manager must be available. In the dashboard, `r` starts a probe
+in the background so navigation remains responsive.
+
+In `tayassu dash`, select an account with `j`/`k` to see its individual
+quota windows. Press `m` to switch between windows and models, `g` to cycle
+model quota scopes, and `Page Up`/`Page Down` to move between pages. Model
+percentages reflect shared limits when the provider reports a shared scope.
