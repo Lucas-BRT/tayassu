@@ -75,10 +75,10 @@ fn account_lifecycle_and_aligned_status_table() {
     let env = TestEnv::new();
 
     let added = env.run_ok(&[
-        "account",
         "add",
-        "agy-student",
         "agy",
+        "agy-student",
+        "--no-login",
         "--label",
         "Student Plan",
         "--priority",
@@ -86,15 +86,15 @@ fn account_lifecycle_and_aligned_status_table() {
     ]);
     assert!(added.contains("Added account 'agy-student' (agy)"));
 
-    let env_out = env.run_ok(&["account", "env", "agy-student"]);
-    assert!(env_out.contains("export HOME="));
-    assert!(env_out.contains("export XDG_CONFIG_HOME="));
+    let env_out = env.run_ok(&["where", "--account", "agy-student"]);
+    assert!(env_out.contains("env: HOME="));
+    assert!(env_out.contains("env: XDG_CONFIG_HOME="));
 
-    let status_out = env.run_ok(&["status"]);
+    let status_out = env.run_ok(&["ls"]);
     assert!(status_out.contains("agy-student        agy        10"));
     assert!(status_out.contains("READY"));
 
-    let removed = env.run_ok(&["account", "remove", "agy-student"]);
+    let removed = env.run_ok(&["rm", "agy-student"]);
     assert!(removed.contains("Removed account 'agy-student'"));
 }
 
@@ -103,18 +103,18 @@ fn manual_cooldown_routes_run_to_fallback_account() {
     let env = TestEnv::new();
 
     env.run_ok(&[
-        "account",
         "add",
-        "claude-work",
         "claude",
+        "claude-work",
+        "--no-login",
         "--priority",
         "10",
     ]);
     env.run_ok(&[
-        "account",
         "add",
-        "claude-personal",
         "claude",
+        "claude-personal",
+        "--no-login",
         "--priority",
         "20",
     ]);
@@ -153,20 +153,20 @@ fn live_probe_updates_buckets_and_routes_per_model_cooldown() {
     );
 
     env.run_ok(&[
-        "account",
         "add",
-        "agy-student",
         "agy",
+        "agy-student",
+        "--no-login",
         "--priority",
         "10",
         "--binary",
         &student_script,
     ]);
     env.run_ok(&[
-        "account",
         "add",
-        "agy-pro",
         "agy",
+        "agy-pro",
+        "--no-login",
         "--priority",
         "20",
         "--binary",
@@ -177,7 +177,7 @@ fn live_probe_updates_buckets_and_routes_per_model_cooldown() {
     assert!(probe_out.contains("agy-student: ok (4 windows, 1 active cooldowns)"));
     assert!(probe_out.contains("agy-pro: ok (2 windows, 0 active cooldowns)"));
 
-    let status_out = env.run_ok(&["status"]);
+    let status_out = env.run_ok(&["ls"]);
     assert!(status_out.contains("gemini:43%"));
     assert!(status_out.contains("claude:0%("));
 
@@ -217,18 +217,18 @@ fn run_injects_isolated_env_into_spawned_copilot_and_codex() {
     );
 
     env.run_ok(&[
-        "account",
         "add",
-        "gh-main",
         "copilot",
+        "gh-main",
+        "--no-login",
         "--binary",
         &echo_copilot,
     ]);
     env.run_ok(&[
-        "account",
         "add",
-        "oai-main",
         "codex",
+        "oai-main",
+        "--no-login",
         "--binary",
         &echo_codex,
     ]);
@@ -261,30 +261,30 @@ fn probe_supports_claude_codex_copilot_and_opencode_in_parallel() {
     );
 
     env.run_ok(&[
-        "account",
         "add",
-        "claude-main",
         "claude",
+        "claude-main",
+        "--no-login",
         "--binary",
         &mock_claude,
     ]);
     env.run_ok(&[
-        "account",
         "add",
-        "codex-main",
         "codex",
+        "codex-main",
+        "--no-login",
         "--binary",
         &mock_codex,
     ]);
     env.run_ok(&[
-        "account",
         "add",
-        "opencode-main",
         "opencode",
+        "opencode-main",
+        "--no-login",
         "--binary",
         &mock_opencode,
     ]);
-    env.run_ok(&["account", "add", "copilot-main", "copilot"]);
+    env.run_ok(&["add", "copilot", "copilot-main", "--no-login"]);
 
     let copilot_cfg = env
         .dir
@@ -303,7 +303,7 @@ fn probe_supports_claude_codex_copilot_and_opencode_in_parallel() {
     assert!(probe_out.contains("opencode-main: ok (2 windows, 0 active cooldowns)"));
     assert!(probe_out.contains("copilot-main: ok (1 windows, 0 active cooldowns)"));
 
-    let status_out = env.run_ok(&["status"]);
+    let status_out = env.run_ok(&["ls"]);
     assert!(status_out.contains("claude-main"));
     assert!(status_out.contains("default:ok"));
     assert!(status_out.contains("github-copilot:ok google:ok"));
@@ -324,42 +324,42 @@ fn run_captures_stderr_rate_limit_and_failover_switches_account() {
     );
 
     env.run_ok(&[
-        "account",
         "add",
-        "claude-primary",
         "claude",
+        "claude-primary",
+        "--no-login",
         "--priority",
         "10",
         "--binary",
         &rate_limited_script,
     ]);
     env.run_ok(&[
-        "account",
         "add",
-        "claude-backup",
         "claude",
+        "claude-backup",
+        "--no-login",
         "--priority",
         "20",
         "--binary",
         &healthy_script,
     ]);
 
-    // Without --failover: command exits non-zero, but cooldown is recorded automatically.
-    let first_run = env.run_cli(&["run", "claude"]);
+    // With --no-failover: command exits non-zero, but cooldown is recorded automatically.
+    let first_run = env.run_cli(&["run", "claude", "--no-failover"]);
     assert!(!first_run.status.success());
     let first_stderr = String::from_utf8_lossy(&first_run.stderr);
     assert!(first_stderr.contains("rate limit detected on 'claude-primary'"));
 
-    let status_after = env.run_ok(&["status"]);
+    let status_after = env.run_ok(&["ls"]);
     assert!(status_after.contains("claude-primary"));
     assert!(status_after.contains("COOLDOWN (45m)"));
 
-    // Clear cooldown and verify --failover automatically retries on claude-backup.
+    // Clear cooldown and verify default failover automatically retries on claude-backup.
     env.run_ok(&["cooldown", "clear", "claude-primary"]);
-    let failover_out = env.run_ok(&["run", "claude", "--failover"]);
+    let failover_out = env.run_ok(&["run", "claude"]);
     assert!(failover_out.contains("served-by-fallback"));
 
-    let status_final = env.run_ok(&["status"]);
+    let status_final = env.run_ok(&["ls"]);
     assert!(status_final.contains("COOLDOWN (45m)"));
 }
 
@@ -407,15 +407,18 @@ fn import_discovers_filters_and_migrates_update_safely() {
 }
 
 #[test]
-fn shell_init_emits_valid_wrappers_for_bash_and_fish() {
+fn activate_emits_valid_wrappers_for_bash_and_fish() {
     let env = TestEnv::new();
 
-    let bash_out = env.run_ok(&["shell-init", "bash", "--failover"]);
-    assert!(bash_out.contains("agy() { tayassu run agy --failover -- \"$@\"; }"));
-    assert!(bash_out.contains("claude() { tayassu run claude --failover -- \"$@\"; }"));
-    assert!(bash_out.contains("codex() { tayassu run codex --failover -- \"$@\"; }"));
+    let bash_out = env.run_ok(&["activate", "bash"]);
+    assert!(bash_out.contains("agy() { tayassu run agy -- \"$@\"; }"));
+    assert!(bash_out.contains("claude() { tayassu run claude -- \"$@\"; }"));
+    assert!(bash_out.contains("source <(COMPLETE=bash tayassu)"));
 
-    let fish_out = env.run_ok(&["shell-init", "fish", "--provider", "copilot"]);
+    let no_failover = env.run_ok(&["activate", "bash", "--no-failover"]);
+    assert!(no_failover.contains("codex() { tayassu run codex --no-failover -- \"$@\"; }"));
+
+    let fish_out = env.run_ok(&["activate", "fish", "--provider", "copilot"]);
     assert!(fish_out.contains("function copilot --wraps copilot"));
     assert!(!fish_out.contains("function agy"));
 }
@@ -434,10 +437,10 @@ fn project_policy_resume_memory_and_fallback_chain() {
         ("claude-personal", "claude", "10"),
     ] {
         env.run_ok(&[
-            "account",
             "add",
-            id,
             provider,
+            id,
+            "--no-login",
             "--priority",
             pri,
             "--binary",
@@ -494,16 +497,20 @@ fn systemd_unit_install_and_doctor_diagnostics() {
     let env = TestEnv::new();
     let mock_ok = env.write_mock_script("mock-ok.sh", "#!/usr/bin/env bash\necho ok\n");
     env.run_ok(&[
-        "account",
         "add",
-        "claude-work",
         "claude",
+        "claude-work",
+        "--no-login",
         "--binary",
         &mock_ok,
     ]);
 
-    let unit_out = env.run_ok(&["systemd-unit", "--interval-minutes", "10", "--install"]);
+    let unit_out = env.run_ok(&["setup", "--interval-minutes", "10"]);
     assert!(unit_out.contains("tayassu-probe.timer"));
+    assert!(
+        env.run_ok(&["setup", "--no-systemd"])
+            .contains("already configured")
+    );
     assert!(
         env.dir
             .path()
@@ -520,4 +527,38 @@ fn systemd_unit_install_and_doctor_diagnostics() {
     let doctor_out = env.run_ok(&["doctor"]);
     assert!(doctor_out.contains("[OK  ]"));
     assert!(doctor_out.contains("chmod 600"));
+}
+
+#[test]
+fn bare_command_lists_accounts_and_json_is_machine_readable() {
+    let env = TestEnv::new();
+    env.run_ok(&["add", "claude", "--no-login"]);
+    env.run_ok(&["add", "claude", "--no-login"]);
+
+    let bare = env.run_ok(&[]);
+    assert!(bare.contains("claude-2"));
+
+    let json = env.run_ok(&["ls", "--json"]);
+    let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+    assert_eq!(parsed["accounts"].as_array().map(Vec::len), Some(2));
+}
+
+#[test]
+fn use_and_config_persist_routing_settings() {
+    let env = TestEnv::new();
+    let repo = env.dir.path().join("repo");
+    fs::create_dir_all(&repo).expect("mkdir repo");
+    env.run_ok(&["add", "claude", "work", "--no-login"]);
+
+    let out = env.run_cli_in(&repo, &["use", "work", "--policy", "priority"]);
+    assert!(out.status.success());
+    let project = fs::read_to_string(repo.join(".tayassu.toml")).expect("project file");
+    assert!(project.contains("claude = \"work\""));
+    assert!(project.contains("default_policy = \"priority\""));
+
+    env.run_ok(&["config", "set", "default-policy", "soonest-reset"]);
+    assert_eq!(
+        env.run_ok(&["config", "get", "default-policy"]).trim(),
+        "soonest-reset"
+    );
 }
