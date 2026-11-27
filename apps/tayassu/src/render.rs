@@ -168,6 +168,8 @@ impl<'a> StatusTable<'a> {
                     .join(" ");
                 let action = if failure.is_authentication() {
                     format!("tayassu login {id}")
+                } else if failure.is_locked() {
+                    format!("tayassu run {id} (or tayassu login {id})")
                 } else {
                     format!("tayassu doctor, then tayassu probe {id}")
                 };
@@ -191,6 +193,8 @@ fn render_state(
     if let Some(failure) = status.and_then(|st| st.last_probe_error.as_ref()) {
         return if failure.is_authentication() {
             "AUTH".to_owned()
+        } else if failure.is_locked() {
+            "LOCKED".to_owned()
         } else {
             "ERROR".to_owned()
         };
@@ -216,6 +220,14 @@ pub(crate) fn render_login(status: Option<&AccountStatus>) -> &'static str {
                 .is_some_and(tayassu_core::ProbeFailure::is_authentication) =>
         {
             "required"
+        }
+        Some(st)
+            if st
+                .last_probe_error
+                .as_ref()
+                .is_some_and(tayassu_core::ProbeFailure::is_locked) =>
+        {
+            "locked"
         }
         Some(st) if st.last_probe_error.is_none() && st.last_probed_at.is_some() => "ok",
         _ => "unverified",

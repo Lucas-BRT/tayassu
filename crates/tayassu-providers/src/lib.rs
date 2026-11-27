@@ -565,4 +565,34 @@ OpenRouter      OpenRouter                  stored
         assert!(codex_dir.join("config.toml").is_file());
         assert!(packages_dir.join("marker").is_file());
     }
+
+    #[test]
+    fn clear_auth_removes_credentials_and_preserves_settings() {
+        let profiles_root = TempDir::new().expect("profiles root");
+        let registry = AdapterRegistry;
+
+        for (provider, auth_rel) in [
+            (ProviderKind::Agy, ".local/share/keyrings/login.keyring"),
+            (ProviderKind::Claude, ".credentials.json"),
+            (ProviderKind::Codex, "auth.json"),
+            (ProviderKind::Copilot, "hosts.json"),
+            (ProviderKind::Opencode, ".local/share/opencode/auth.json"),
+        ] {
+            let account = AccountConfig::new(
+                format!("{provider}-test").parse().expect("id"),
+                provider,
+                "Test",
+            );
+            let adapter = registry.adapter_for(provider);
+            let env = adapter.build_environment(&account, profiles_root.path());
+            assert!(!env.env_remove.is_empty(), "{provider} must strip host env");
+
+            let auth_path = env.state_root().join(auth_rel);
+            fs::create_dir_all(auth_path.parent().expect("parent")).expect("mkdir");
+            fs::write(&auth_path, "secret").expect("write auth");
+
+            adapter.clear_auth(&env).expect("clear auth");
+            assert!(!auth_path.exists(), "{provider} auth should be removed");
+        }
+    }
 }

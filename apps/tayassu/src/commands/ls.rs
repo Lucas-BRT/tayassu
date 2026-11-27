@@ -1,6 +1,6 @@
 use crate::app::{App, Execute};
 use crate::render::StatusTable;
-use crate::shell::provider_candidates;
+use crate::shell::{model_candidates, provider_candidates};
 use anyhow::{Context, Result};
 use chrono::Utc;
 use clap::Args;
@@ -15,7 +15,7 @@ pub struct Ls {
     #[arg(add = ArgValueCandidates::new(provider_candidates))]
     provider: Option<ProviderKind>,
     /// Model bucket to evaluate availability against.
-    #[arg(long)]
+    #[arg(long, add = ArgValueCandidates::new(model_candidates))]
     model: Option<ModelBucket>,
     /// List discovered `OpenCode` models and their measured quota.
     #[arg(long, conflicts_with = "model")]

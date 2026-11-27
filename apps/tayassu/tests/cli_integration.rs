@@ -303,6 +303,7 @@ fn live_probe_updates_buckets_and_routes_per_model_cooldown() {
         "agy",
         "agy-student",
         "--no-login",
+        "--shared-keyring",
         "--priority",
         "10",
         "--binary",
@@ -313,6 +314,7 @@ fn live_probe_updates_buckets_and_routes_per_model_cooldown() {
         "agy",
         "agy-pro",
         "--no-login",
+        "--shared-keyring",
         "--priority",
         "20",
         "--binary",
@@ -731,7 +733,15 @@ fn bash_wrapper_routes_configured_accounts_and_does_not_bypass_disabled_accounts
     fs::set_permissions(&host, fs::Permissions::from_mode(SCRIPT_EXECUTABLE_MODE))
         .expect("chmod host");
     let routed = env.write_mock_script("routed", "#!/bin/sh\nprintf 'routed:%s\\n' \"$*\"\n");
-    env.run_ok(&["add", "agy", "work", "--no-login", "--binary", &routed]);
+    env.run_ok(&[
+        "add",
+        "agy",
+        "work",
+        "--no-login",
+        "--shared-keyring",
+        "--binary",
+        &routed,
+    ]);
     let run_shell = || {
         env.command()
             .get_envs()
@@ -1023,7 +1033,15 @@ fn agy_disabled_window_clears_previous_probe_cooldown_and_keeps_other_quota() {
         "agy.sh",
         "#!/bin/sh\nprintf 'Claude and GPT models\tFHour Limit Remaining\t0%%\t2099-01-01T00:00:00Z\n'\n",
     );
-    env.run_ok(&["add", "agy", "agy-host", "--no-login", "--binary", &mock]);
+    env.run_ok(&[
+        "add",
+        "agy",
+        "agy-host",
+        "--no-login",
+        "--shared-keyring",
+        "--binary",
+        &mock,
+    ]);
     env.run_ok(&["probe", "agy-host"]);
     assert!(
         !env.run_cli(&["run", "agy", "--model", "claude", "--dry-run"])
@@ -1331,9 +1349,10 @@ fn shared_token_does_not_confirm_two_copilot_profiles() {
     assert!(output.status.success());
     let report = String::from_utf8(output.stdout).expect("text report");
     for id in ids {
-        assert!(report.contains(&format!(
-            "unable to verify Copilot authentication for account '{id}'"
-        )));
+        assert!(
+            report.contains(&format!("account '{id}' (copilot) is not logged in")),
+            "{report}"
+        );
     }
 }
 
@@ -1379,7 +1398,15 @@ fn cached_window_past_its_reset_is_shown_as_reset_and_routable() {
         "mock-agy-old.sh",
         "#!/usr/bin/env bash\ncat <<'EOF'\nQuota:\nGemini Models          Five Hour Limit Remaining  0%  2000-01-01 00:00 -03\nEOF\n",
     );
-    env.run_ok(&["add", "agy", "old", "--binary", &script, "--no-login"]);
+    env.run_ok(&[
+        "add",
+        "agy",
+        "old",
+        "--binary",
+        &script,
+        "--no-login",
+        "--shared-keyring",
+    ]);
     env.run_ok(&["probe"]);
 
     let table = env.run_ok(&["ls"]);
@@ -1403,7 +1430,15 @@ fn failed_probe_keeps_cached_windows() {
         "mock-agy-ok.sh",
         "#!/usr/bin/env bash\ncat <<'EOF'\nQuota:\nGemini Models          Weekly Limit Remaining  43%  2099-12-03 06:02 -03\nEOF\n",
     );
-    env.run_ok(&["add", "agy", "cached", "--binary", &ok, "--no-login"]);
+    env.run_ok(&[
+        "add",
+        "agy",
+        "cached",
+        "--binary",
+        &ok,
+        "--no-login",
+        "--shared-keyring",
+    ]);
     env.run_ok(&["probe"]);
 
     let broken = env.write_mock_script("mock-agy-broken.sh", "#!/usr/bin/env bash\nexit 1\n");
@@ -1474,4 +1509,356 @@ fn uninstall_removes_hooks_units_and_binary_while_keeping_data_unless_purged() {
     assert!(purge.status.success());
     assert!(!env.dir.path().join("config/tayassu").exists());
     assert!(!env.dir.path().join("data/tayassu").exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn private_agy_keyring_dry_run_and_fallback_preservation() {
+    let env = TestEnv::new();
+    let config = env.dir.path().join("config/tayassu");
+    fs::create_dir_all(&config).unwrap();
+    fs::write(
+        config.join("config.toml"),
+        r#"
+[[accounts]]
+id = "private"
+provider = "agy"
+label = "Private"
+agy_private_keyring = true
+"#,
+    )
+    .unwrap();
+    let runtime = env.dir.path().join("runtime");
+    fs::create_dir(&runtime).unwrap();
+    let dry_run = env
+        .command()
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .args(["run", "agy", "--account", "private", "--dry-run"])
+        .output()
+        .unwrap();
+    assert!(dry_run.status.success());
+    assert!(String::from_utf8_lossy(&dry_run.stdout).contains("private Antigravity keyring"));
+    assert!(fs::read_dir(&runtime).unwrap().next().is_none());
+
+    let fallback = env.dir.path().join(
+        "data/tayassu/profiles/agy/private/home/.gemini/antigravity-cli/antigravity-oauth-token",
+    );
+    fs::create_dir_all(fallback.parent().unwrap()).unwrap();
+    fs::write(&fallback, "synthetic").unwrap();
+    let run = env
+        .command()
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .args(["run", "agy", "--account", "private"])
+        .output()
+        .unwrap();
+    assert!(!run.status.success());
+    assert!(String::from_utf8_lossy(&run.stderr).contains("fallback credential exists"));
+    assert_eq!(fs::read_to_string(fallback).unwrap(), "synthetic");
+    assert!(fs::read_dir(runtime).unwrap().next().is_none());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn add_agy_enables_private_keyring_by_default_and_supports_opt_out() {
+    let env = TestEnv::new();
+    env.run_ok(&["add", "agy", "agy-fresh", "--no-login"]);
+    env.run_ok(&["add", "agy", "agy-shared", "--no-login", "--shared-keyring"]);
+
+    let private_dry = env.run_ok(&["run", "agy", "--account", "agy-fresh", "--dry-run"]);
+    assert!(private_dry.contains("authentication: private Antigravity keyring"));
+
+    let shared_dry = env.run_ok(&["run", "agy", "--account", "agy-shared", "--dry-run"]);
+    assert!(!shared_dry.contains("private Antigravity keyring"));
+}
+
+#[test]
+fn add_clears_stale_auth_artifacts_for_every_provider() {
+    let env = TestEnv::new();
+    let profiles = env.dir.path().join("data/tayassu/profiles");
+
+    let stale_cases = [
+        (
+            "agy",
+            "agy-reused",
+            "home/.local/share/keyrings/login.keyring",
+            "home/.gemini/antigravity-cli/settings.json",
+        ),
+        (
+            "claude",
+            "claude-reused",
+            ".credentials.json",
+            "settings.json",
+        ),
+        ("codex", "codex-reused", "auth.json", "config.toml"),
+        ("copilot", "copilot-reused", "hosts.json", "mcp-config.json"),
+        (
+            "opencode",
+            "opencode-reused",
+            "home/.local/share/opencode/auth.json",
+            "home/.config/opencode/opencode.json",
+        ),
+    ];
+
+    for (provider, id, auth_rel, keep_rel) in stale_cases {
+        let root = profiles.join(provider).join(id);
+        let auth_path = root.join(auth_rel);
+        let keep_path = root.join(keep_rel);
+        fs::create_dir_all(auth_path.parent().unwrap()).unwrap();
+        fs::create_dir_all(keep_path.parent().unwrap()).unwrap();
+        fs::write(&auth_path, "stale-secret").unwrap();
+        fs::write(&keep_path, "keep-me").unwrap();
+
+        env.run_ok(&["add", provider, id, "--no-login"]);
+
+        assert!(
+            !auth_path.exists(),
+            "{provider} auth file {auth_rel} should be cleared by `tayassu add`"
+        );
+        assert!(
+            keep_path.is_file(),
+            "{provider} non-auth file {keep_rel} should be preserved"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn run_strips_ambient_host_auth_env_vars() {
+    let env = TestEnv::new();
+    let script = env.write_mock_script(
+        "dump-env.sh",
+        "#!/usr/bin/env bash\nprintf 'GH=%s|GITHUB=%s|COPILOT=%s|OPENAI=%s|ANTHROPIC=%s|GKC=%s\\n' \"$GH_TOKEN\" \"$GITHUB_TOKEN\" \"$COPILOT_GITHUB_TOKEN\" \"$OPENAI_API_KEY\" \"$ANTHROPIC_API_KEY\" \"$GNOME_KEYRING_CONTROL\"\n",
+    );
+
+    env.run_ok(&["add", "copilot", "cop", "--no-login", "--binary", &script]);
+    env.run_ok(&["add", "codex", "cdx", "--no-login", "--binary", &script]);
+    env.run_ok(&["add", "claude", "cld", "--no-login", "--binary", &script]);
+
+    let run_with_host_tokens = |provider: &str, account: &str| {
+        let output = env
+            .command()
+            .env("GH_TOKEN", "host-gh")
+            .env("GITHUB_TOKEN", "host-github")
+            .env("COPILOT_GITHUB_TOKEN", "host-copilot")
+            .env("OPENAI_API_KEY", "host-openai")
+            .env("ANTHROPIC_API_KEY", "host-anthropic")
+            .env("GNOME_KEYRING_CONTROL", "/tmp/host-keyring")
+            .args(["run", provider, "--account", account])
+            .output()
+            .expect("run provider");
+        assert!(output.status.success(), "{output:?}");
+        String::from_utf8(output.stdout).expect("utf8")
+    };
+
+    let cop = run_with_host_tokens("copilot", "cop");
+    assert!(cop.contains("GH=|GITHUB=|COPILOT=|"), "{cop}");
+    assert!(cop.contains("|GKC=\n"), "{cop}");
+
+    let cdx = run_with_host_tokens("codex", "cdx");
+    assert!(cdx.contains("|OPENAI=|"), "{cdx}");
+
+    let cld = run_with_host_tokens("claude", "cld");
+    assert!(cld.contains("|ANTHROPIC=|"), "{cld}");
+}
+
+#[test]
+fn run_and_where_support_positional_account_and_validate_provider() {
+    let env = TestEnv::new();
+    let echo = env.write_mock_script("echo-args.sh", "#!/bin/sh\nprintf 'args:%s\\n' \"$*\"\n");
+
+    env.run_ok(&[
+        "add",
+        "agy",
+        "agy-marilia",
+        "--no-login",
+        "--shared-keyring",
+        "--binary",
+        &echo,
+    ]);
+    env.run_ok(&["add", "claude", "claude-work", "--no-login"]);
+
+    let by_provider_and_account = env.run_ok(&["run", "agy", "agy-marilia", "--dry-run"]);
+    assert!(by_provider_and_account.contains("account: agy-marilia"));
+    assert!(by_provider_and_account.contains("selection: explicit account"));
+
+    let by_account_only = env.run_ok(&["run", "agy-marilia", "--dry-run"]);
+    assert!(by_account_only.contains("account: agy-marilia"));
+
+    let where_out = env.run_ok(&["where", "agy", "agy-marilia"]);
+    assert!(where_out.contains("account: agy-marilia"));
+    assert!(
+        env.run_ok(&["where", "agy-marilia"])
+            .contains("account: agy-marilia")
+    );
+
+    let forwarded = env.run_ok(&["run", "agy", "agy-marilia", "--", "--flag", "val"]);
+    assert_eq!(forwarded, "args:--flag val\n");
+
+    let mismatch_pos = env.run_cli(&["run", "agy", "claude-work", "--dry-run"]);
+    assert!(!mismatch_pos.status.success());
+    assert!(
+        String::from_utf8_lossy(&mismatch_pos.stderr)
+            .contains("account 'claude-work' belongs to claude, not agy")
+    );
+
+    let mismatch_flag = env.run_cli(&["run", "agy", "--account", "claude-work", "--dry-run"]);
+    assert!(!mismatch_flag.status.success());
+    assert!(
+        String::from_utf8_lossy(&mismatch_flag.stderr)
+            .contains("account 'claude-work' belongs to claude, not agy")
+    );
+
+    let bad_flag_combo = env.run_cli(&["run", "agy-marilia", "--no-failover"]);
+    assert!(!bad_flag_combo.status.success());
+}
+
+#[cfg(unix)]
+#[test]
+fn shell_completion_filters_by_provider_state_and_models() {
+    let env = TestEnv::new();
+    let mock_agy = env.write_mock_script(
+        "mock-agy.sh",
+        "#!/usr/bin/env bash\ncat <<'EOF'\nQuota:\nGemini Models          Weekly Limit Remaining     80%  2099-12-03 06:02 -03\nClaude and GPT models  Five Hour Limit Remaining  60%  2099-11-26 21:38 -03\nEOF\n",
+    );
+
+    env.run_ok(&[
+        "add",
+        "agy",
+        "agy-lucas",
+        "--no-login",
+        "--shared-keyring",
+        "--binary",
+        &mock_agy,
+    ]);
+    env.run_ok(&[
+        "add",
+        "agy",
+        "agy-marilia",
+        "--no-login",
+        "--shared-keyring",
+        "--binary",
+        &mock_agy,
+    ]);
+    env.run_ok(&["add", "claude", "claude-host", "--no-login"]);
+    env.run_ok(&["disable", "claude-host"]);
+    env.run_ok(&["probe", "agy"]);
+
+    let complete = |index: &str, args: &[&str]| {
+        let output = env
+            .command()
+            .env("TAYASSU_COMPLETE", "bash")
+            .env("_CLAP_COMPLETE_INDEX", index)
+            .args(["--", "tayassu"])
+            .args(args)
+            .output()
+            .expect("run completion");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).expect("utf8")
+    };
+
+    // Positional account completion after `run agy` only lists agy accounts.
+    let agy_pos = complete("3", &["run", "agy", ""]);
+    assert!(agy_pos.contains("agy-lucas"), "{agy_pos}");
+    assert!(agy_pos.contains("agy-marilia"), "{agy_pos}");
+    assert!(!agy_pos.contains("claude-host"), "{agy_pos}");
+
+    // `--account` after `run agy` is also filtered to agy accounts.
+    let agy_flag = complete("4", &["run", "agy", "--account", ""]);
+    assert!(agy_flag.contains("agy-lucas"), "{agy_flag}");
+    assert!(agy_flag.contains("agy-marilia"), "{agy_flag}");
+    assert!(!agy_flag.contains("claude-host"), "{agy_flag}");
+
+    // First positional after `run` includes both enabled providers and direct accounts.
+    let run_first = complete("2", &["run", ""]);
+    assert!(
+        run_first.contains("agy\n") || run_first.contains("agy"),
+        "{run_first}"
+    );
+    assert!(run_first.contains("agy-marilia"), "{run_first}");
+
+    // `--model` after `run agy` suggests buckets discovered by probing agy.
+    let agy_models = complete("4", &["run", "agy", "--model", ""]);
+    assert!(agy_models.contains("gemini"), "{agy_models}");
+    assert!(agy_models.contains("claude"), "{agy_models}");
+
+    // `enable` only offers disabled accounts; `disable` only offers enabled accounts.
+    let enable_out = complete("2", &["enable", ""]);
+    assert!(enable_out.contains("claude-host"), "{enable_out}");
+    assert!(!enable_out.contains("agy-lucas"), "{enable_out}");
+
+    let disable_out = complete("2", &["disable", ""]);
+    assert!(disable_out.contains("agy-lucas"), "{disable_out}");
+    assert!(!disable_out.contains("claude-host"), "{disable_out}");
+
+    // `probe` completes both accounts and providers.
+    let probe_out = complete("2", &["probe", ""]);
+    assert!(probe_out.contains("agy-lucas"), "{probe_out}");
+    assert!(
+        probe_out.contains("agy\n") || probe_out.lines().any(|l| l == "agy"),
+        "{probe_out}"
+    );
+}
+
+#[test]
+fn rm_purge_deletes_profile_and_doctor_warns_on_orphans() {
+    let env = TestEnv::new();
+    let mock = env.write_mock_script("mock-claude.sh", "#!/bin/sh\nexit 0\n");
+
+    env.run_ok(&["add", "claude", "keep-me", "--no-login", "--binary", &mock]);
+    env.run_ok(&["add", "claude", "purge-me", "--no-login", "--binary", &mock]);
+    env.run_ok(&["add", "claude", "active", "--no-login", "--binary", &mock]);
+
+    let kept_profile = env.dir.path().join("data/tayassu/profiles/claude/keep-me");
+    let purged_profile = env.dir.path().join("data/tayassu/profiles/claude/purge-me");
+    assert!(kept_profile.is_dir());
+    assert!(purged_profile.is_dir());
+
+    let rm_keep = env.run_ok(&["rm", "keep-me"]);
+    assert!(rm_keep.contains("pass --purge to delete"), "{rm_keep}");
+    assert!(kept_profile.is_dir());
+
+    let rm_purge = env.run_ok(&["rm", "purge-me", "--purge"]);
+    assert!(rm_purge.contains("deleted"), "{rm_purge}");
+    assert!(!purged_profile.exists());
+
+    let doctor = env.run_ok(&["doctor"]);
+    assert!(doctor.contains("orphaned profile directory"), "{doctor}");
+    assert!(doctor.contains("keep-me"), "{doctor}");
+    assert!(!doctor.contains("purge-me"), "{doctor}");
+}
+
+#[test]
+fn ls_renders_locked_state_separately_from_auth_and_error() {
+    let env = TestEnv::new();
+    env.run_ok(&["add", "agy", "agy-locked", "--no-login"]);
+
+    let state_dir = env.dir.path().join("state/tayassu");
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::write(
+        state_dir.join("state.json"),
+        r#"{
+  "statuses": [
+    {
+      "account_id": "agy-locked",
+      "last_probed_at": null,
+      "windows": [],
+      "cooldowns": [],
+      "last_probe_error": {
+        "kind": "locked",
+        "message": "keyring is locked or uninitialized; run 'tayassu login agy-locked' in a terminal"
+      }
+    }
+  ]
+}"#,
+    )
+    .unwrap();
+
+    let table = env.run_ok(&["ls"]);
+    assert!(table.contains("LOCKED"), "{table}");
+    assert!(table.contains("locked"), "{table}");
+    assert!(table.contains("tayassu run agy-locked"), "{table}");
 }

@@ -239,6 +239,9 @@ pub struct AccountConfig {
     /// Whether this account participates in automatic routing.
     #[serde(default = "default_enabled")]
     pub enabled: bool,
+    /// Use a private Secret Service for this Antigravity profile.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub agy_private_keyring: bool,
     /// Relative paths under `$HOME` to symlink into a fake-HOME profile.
     #[serde(default)]
     pub shared_home_links: Vec<String>,
@@ -264,8 +267,15 @@ impl AccountConfig {
             opencode_copilot_account: None,
             binary_override: None,
             enabled: true,
+            agy_private_keyring: false,
             shared_home_links: Vec::new(),
         }
+    }
+
+    /// Whether this account uses an isolated Antigravity keyring.
+    #[must_use]
+    pub fn uses_private_agy_keyring(&self) -> bool {
+        self.provider == ProviderKind::Agy && self.agy_private_keyring
     }
 
     /// Returns the executable name or path to invoke for this account.

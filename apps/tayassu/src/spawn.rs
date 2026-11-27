@@ -28,7 +28,10 @@ pub struct RunOutcome {
 }
 
 /// Transfers `opencode` credentials through a pipe from `auth export` to `auth import`.
-pub fn transfer_opencode_auth(binary: &Path, profile_env: &[(String, String)]) -> Result<()> {
+pub fn transfer_opencode_auth(
+    binary: &Path,
+    profile: &tayassu_providers::ProfileEnvironment,
+) -> Result<()> {
     let exported = ProcessCommand::new(binary)
         .args(OPENCODE_AUTH_EXPORT_ARGS)
         .stdin(Stdio::null())
@@ -44,9 +47,7 @@ pub fn transfer_opencode_auth(binary: &Path, profile_env: &[(String, String)]) -
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    for (key, value) in profile_env {
-        cmd.env(key, value);
-    }
+    profile.apply_to_command(&mut cmd);
     let mut child = cmd
         .spawn()
         .context("failed to run `opencode auth import` in the profile")?;
@@ -65,6 +66,20 @@ pub fn transfer_opencode_auth(binary: &Path, profile_env: &[(String, String)]) -
     Ok(())
 }
 
+pub fn prepare_profile(
+    account: &AccountConfig,
+    paths: &tayassu_store::XdgPaths,
+    operation: crate::agy_keyring::Operation,
+) -> Result<tayassu_providers::ProfileEnvironment> {
+    let adapter = tayassu_providers::AdapterRegistry.adapter_for(account.provider);
+    let mut profile = adapter.build_environment(account, &paths.profiles_dir);
+    profile
+        .prepare(&paths.home_dir)
+        .with_context(|| format!("failed to prepare profile for {}", account.id))?;
+    crate::agy_keyring::prepare(account, &mut profile, operation)?;
+    Ok(profile)
+}
+
 pub fn account_executable(account: &AccountConfig, home_dir: &Path) -> PathBuf {
     let executable = account.executable();
     HostDiscovery
@@ -75,14 +90,12 @@ pub fn account_executable(account: &AccountConfig, home_dir: &Path) -> PathBuf {
 pub fn spawn_interactive(
     account: &AccountConfig,
     executable: &Path,
-    env_vars: &[(String, String)],
+    profile: &tayassu_providers::ProfileEnvironment,
     args: &[String],
 ) -> Result<()> {
     let mut cmd = ProcessCommand::new(executable);
     cmd.args(args);
-    for (key, value) in env_vars {
-        cmd.env(key, value);
-    }
+    profile.apply_to_command(&mut cmd);
 
     let exit_status = cmd.status().with_context(|| {
         format!(
@@ -107,7 +120,7 @@ pub fn spawn_interactive(
 pub fn spawn_capturing_stderr(
     account: &AccountConfig,
     executable: &Path,
-    env_vars: &[(String, String)],
+    profile: &tayassu_providers::ProfileEnvironment,
     args: &[String],
 ) -> Result<RunOutcome> {
     let mut cmd = ProcessCommand::new(executable);
@@ -115,9 +128,7 @@ pub fn spawn_capturing_stderr(
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::piped());
-    for (key, value) in env_vars {
-        cmd.env(key, value);
-    }
+    profile.apply_to_command(&mut cmd);
 
     let mut child = cmd.spawn().with_context(|| {
         format!(

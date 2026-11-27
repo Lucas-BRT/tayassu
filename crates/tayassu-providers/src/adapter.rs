@@ -2,7 +2,8 @@ use crate::error::ProviderError;
 use crate::isolation::{DEFAULT_SHARED_HOME_LINKS, IsolationStrategy, ProfileEnvironment};
 use chrono::{DateTime, NaiveDateTime, TimeDelta, Utc};
 use serde::Deserialize;
-use std::env;
+use std::fs;
+use std::io::ErrorKind;
 use std::path::Path;
 use tayassu_core::{
     AGY_PROBE_COOLDOWN_REASON_PREFIX, AccountConfig, CooldownEntry, DEFAULT_FALLBACK_COOLDOWN_SECS,
@@ -74,11 +75,69 @@ const COLON_TZ_OFFSET_LEN: usize = 6;
 /// Expected length of a compact timezone offset like `-0300`.
 const COMPACT_TZ_OFFSET_LEN: usize = 5;
 
-/// Environment variables checked by GitHub Copilot CLI for token authentication.
-const COPILOT_TOKEN_ENV_VARS: &[&str] = &["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"];
-
 /// Credential/config filenames written under `COPILOT_HOME` after `copilot login`.
 const COPILOT_CREDENTIAL_FILES: &[&str] = &["config.json", "hosts.json"];
+
+/// Ambient host environment variables cleared before launching an isolated `agy` profile.
+const AGY_STRIPPED_ENV_VARS: &[&str] =
+    &["GNOME_KEYRING_CONTROL", "GEMINI_API_KEY", "GOOGLE_API_KEY"];
+
+/// Ambient host environment variables cleared before launching an isolated `claude` profile.
+const CLAUDE_STRIPPED_ENV_VARS: &[&str] = &[
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+];
+
+/// Ambient host environment variables cleared before launching an isolated `codex` profile.
+const CODEX_STRIPPED_ENV_VARS: &[&str] = &["OPENAI_API_KEY", "CODEX_API_KEY"];
+
+/// Ambient host environment variables cleared before launching an isolated `copilot` profile.
+const COPILOT_STRIPPED_ENV_VARS: &[&str] = &[
+    "COPILOT_GITHUB_TOKEN",
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "GNOME_KEYRING_CONTROL",
+];
+
+/// Ambient host environment variables cleared before launching an isolated `opencode` profile.
+const OPENCODE_STRIPPED_ENV_VARS: &[&str] = &[
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+    "OPENROUTER_API_KEY",
+    "GEMINI_API_KEY",
+    "COPILOT_GITHUB_TOKEN",
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "GNOME_KEYRING_CONTROL",
+];
+
+/// Ambient host environment variables cleared before launching a custom provider profile.
+const CUSTOM_STRIPPED_ENV_VARS: &[&str] = &["GNOME_KEYRING_CONTROL"];
+
+/// Profile-relative auth files or directories cleared when initializing a brand-new `agy` account.
+const AGY_AUTH_PATHS: &[&str] = &[
+    ".local/share/keyrings",
+    ".gemini/antigravity-cli/antigravity-oauth-token",
+    ".config/antigravity/plugin-secrets.json",
+];
+
+/// Profile-relative auth files cleared when initializing a brand-new `claude` account.
+const CLAUDE_AUTH_PATHS: &[&str] = &[".credentials.json", ".claude.json"];
+
+/// Profile-relative auth files cleared when initializing a brand-new `codex` account.
+const CODEX_AUTH_PATHS: &[&str] = &["auth.json"];
+
+/// Profile-relative auth files cleared when initializing a brand-new `copilot` account.
+const COPILOT_AUTH_PATHS: &[&str] = &["config.json", "hosts.json"];
+
+/// Profile-relative auth files cleared when initializing a brand-new `opencode` account.
+const OPENCODE_AUTH_PATHS: &[&str] = &[
+    ".local/share/opencode/auth.json",
+    ".local/share/opencode/opencode.db",
+    ".local/share/opencode/opencode.db-wal",
+    ".local/share/opencode/opencode.db-shm",
+];
 
 /// Shared links added for `agy` fake `HOME` so `agy update`, skills, and MCP configs stay unified.
 const AGY_EXTRA_SHARED_LINKS: &[&str] = &[
@@ -161,6 +220,42 @@ pub trait ProviderAdapter: Send + Sync {
         None
     }
 
+    /// Ambient host environment variables removed before launching this provider's CLI.
+    fn stripped_env_vars(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// Relative auth files or directories under [`ProfileEnvironment::state_root`] cleared when
+    /// creating a fresh profile with `tayassu add`.
+    fn auth_paths(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// Removes any pre-existing auth artifacts for this provider from `profile` so a newly added
+    /// account always starts logged out.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProviderError::Io`] if an existing auth file or directory cannot be removed.
+    fn clear_auth(&self, profile: &ProfileEnvironment) -> Result<(), ProviderError> {
+        let state_root = profile.state_root();
+        for relative in self.auth_paths() {
+            let path = state_root.join(relative);
+            match path.symlink_metadata() {
+                Ok(meta) if meta.file_type().is_dir() => {
+                    fs::remove_dir_all(&path)
+                        .map_err(|source| ProviderError::Io { path, source })?;
+                }
+                Ok(_) => {
+                    fs::remove_file(&path).map_err(|source| ProviderError::Io { path, source })?;
+                }
+                Err(err) if err.kind() == ErrorKind::NotFound => {}
+                Err(source) => return Err(ProviderError::Io { path, source }),
+            }
+        }
+        Ok(())
+    }
+
     /// Builds the concrete [`ProfileEnvironment`] for `account` under `profiles_root`.
     fn build_environment(
         &self,
@@ -171,6 +266,7 @@ pub trait ProviderAdapter: Send + Sync {
             .join(self.kind().as_str())
             .join(account.id.as_str());
         ProfileEnvironment::new(profile_dir, self.isolation(account))
+            .with_removed_env(self.stripped_env_vars().iter().copied())
     }
 
     /// Parses raw usage or auth status output into quota windows and cooldowns.
@@ -293,6 +389,14 @@ impl ProviderAdapter for AgyAdapter {
         IsolationStrategy::FakeHome {
             shared_links: resolved_shared_links(account, AGY_EXTRA_SHARED_LINKS),
         }
+    }
+
+    fn stripped_env_vars(&self) -> &'static [&'static str] {
+        AGY_STRIPPED_ENV_VARS
+    }
+
+    fn auth_paths(&self) -> &'static [&'static str] {
+        AGY_AUTH_PATHS
     }
 
     fn login_args(&self) -> Vec<String> {
@@ -426,6 +530,14 @@ impl ProviderAdapter for ClaudeAdapter {
         }
     }
 
+    fn stripped_env_vars(&self) -> &'static [&'static str] {
+        CLAUDE_STRIPPED_ENV_VARS
+    }
+
+    fn auth_paths(&self) -> &'static [&'static str] {
+        CLAUDE_AUTH_PATHS
+    }
+
     fn login_args(&self) -> Vec<String> {
         vec!["auth".to_owned(), "login".to_owned()]
     }
@@ -502,6 +614,14 @@ impl ProviderAdapter for CodexAdapter {
         }
     }
 
+    fn stripped_env_vars(&self) -> &'static [&'static str] {
+        CODEX_STRIPPED_ENV_VARS
+    }
+
+    fn auth_paths(&self) -> &'static [&'static str] {
+        CODEX_AUTH_PATHS
+    }
+
     fn login_args(&self) -> Vec<String> {
         vec!["login".to_owned()]
     }
@@ -564,6 +684,14 @@ impl ProviderAdapter for CopilotAdapter {
         }
     }
 
+    fn stripped_env_vars(&self) -> &'static [&'static str] {
+        COPILOT_STRIPPED_ENV_VARS
+    }
+
+    fn auth_paths(&self) -> &'static [&'static str] {
+        COPILOT_AUTH_PATHS
+    }
+
     fn login_args(&self) -> Vec<String> {
         vec!["login".to_owned()]
     }
@@ -581,11 +709,8 @@ impl ProviderAdapter for CopilotAdapter {
         let has_profile_cred = COPILOT_CREDENTIAL_FILES
             .iter()
             .any(|name| env_profile.profile_dir.join(name).is_file());
-        let has_env_token = COPILOT_TOKEN_ENV_VARS
-            .iter()
-            .any(|var| env::var_os(var).is_some_and(|val| !val.is_empty()));
 
-        if has_profile_cred || has_env_token {
+        if has_profile_cred {
             Some(Err(ProviderError::AuthenticationUnverified {
                 account_id: account.id.clone(),
             }))
@@ -613,6 +738,14 @@ impl ProviderAdapter for OpencodeAdapter {
         }
     }
 
+    fn stripped_env_vars(&self) -> &'static [&'static str] {
+        OPENCODE_STRIPPED_ENV_VARS
+    }
+
+    fn auth_paths(&self) -> &'static [&'static str] {
+        OPENCODE_AUTH_PATHS
+    }
+
     fn build_environment(
         &self,
         account: &AccountConfig,
@@ -622,6 +755,7 @@ impl ProviderAdapter for OpencodeAdapter {
             .join(self.kind().as_str())
             .join(account.id.as_str());
         ProfileEnvironment::new(profile_dir, self.isolation(account))
+            .with_removed_env(self.stripped_env_vars().iter().copied())
             .with_service_port(opencode_service_port(account.id.as_str()))
     }
 
@@ -710,6 +844,10 @@ impl ProviderAdapter for CustomAdapter {
         IsolationStrategy::FakeHome {
             shared_links: resolved_shared_links(account, &[]),
         }
+    }
+
+    fn stripped_env_vars(&self) -> &'static [&'static str] {
+        CUSTOM_STRIPPED_ENV_VARS
     }
 }
 

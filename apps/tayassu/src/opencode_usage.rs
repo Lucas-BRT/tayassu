@@ -111,11 +111,7 @@ fn linked_copilot(
         .build_environment(linked, &paths.profiles_dir);
     profile.prepare(&paths.home_dir)?;
     let mut command = Command::new(executable);
-    command.envs(profile.env_vars.iter().map(|(key, value)| (key, value)));
-    // Keep the link tied to the isolated Copilot profile instead of an ambient token.
-    for variable in ["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"] {
-        command.env_remove(variable);
-    }
+    profile.apply_to_command(&mut command);
     let snapshot = quota_rpc::read_quota(command, ProviderKind::Copilot)?;
     let mut windows =
         tayassu_providers::parse_quota_snapshot(ProviderKind::Copilot, &snapshot)?.windows;
@@ -253,14 +249,13 @@ fn opencode_output(
     profile: &ProfileEnvironment,
     args: &[&str],
 ) -> Result<Vec<u8>> {
-    let mut child = Command::new(executable)
-        .args(args)
-        .envs(profile.env_vars.iter().map(|(key, value)| (key, value)))
+    let mut cmd = Command::new(executable);
+    cmd.args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("failed to start OpenCode")?;
+        .stderr(Stdio::null());
+    profile.apply_to_command(&mut cmd);
+    let mut child = cmd.spawn().context("failed to start OpenCode")?;
     let mut stdout = child
         .stdout
         .take()

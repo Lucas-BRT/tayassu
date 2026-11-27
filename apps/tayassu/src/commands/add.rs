@@ -28,6 +28,9 @@ pub struct Add {
     /// Register only; skip the interactive login.
     #[arg(long)]
     no_login: bool,
+    /// Share the desktop Secret Service instead of an isolated keyring (`agy` on Linux).
+    #[arg(long)]
+    shared_keyring: bool,
 }
 
 impl Execute for Add {
@@ -38,6 +41,7 @@ impl Execute for Add {
         let priority = self.priority;
         let binary = self.binary;
         let no_login = self.no_login;
+        let shared_keyring = self.shared_keyring;
         let mut added_account = None;
 
         app.with_current_config(|locked| {
@@ -53,9 +57,20 @@ impl Execute for Add {
             let mut account = AccountConfig::new(id.clone(), provider, label);
             account.priority = priority;
             account.binary_override = binary;
+            #[cfg(target_os = "linux")]
+            if provider == ProviderKind::Agy && !shared_keyring {
+                account.agy_private_keyring = true;
+            }
+            #[cfg(not(target_os = "linux"))]
+            let _ = shared_keyring;
 
             let adapter = AdapterRegistry.adapter_for(provider);
             let env_profile = adapter.build_environment(&account, &locked.paths.profiles_dir);
+            crate::agy_keyring::reset(&account, &env_profile)
+                .with_context(|| format!("failed to reset private keyring for {id}"))?;
+            adapter
+                .clear_auth(&env_profile)
+                .with_context(|| format!("failed to clear stale credentials for {id}"))?;
             env_profile
                 .prepare(&locked.paths.home_dir)
                 .with_context(|| format!("failed to prepare profile for {id}"))?;

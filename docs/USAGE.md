@@ -68,7 +68,7 @@ provider. An error during removal can still leave some originals already moved.
 | ------- | ----- | ------- |
 | `ls [provider]` | (bare `tayassu`) | Quota, cooldowns and sessions per account; `--json`. |
 | `add <provider> [id]` | | Register an account and log in (`--no-login` to skip). |
-| `rm <id>` | | Remove an account from `config.toml`. |
+| `rm <id>` | | Remove an account from `config.toml` (`--purge` also deletes profile files). |
 | `login <id>` | | Re-authenticate inside the isolated profile. |
 | `import` | | Discover installed CLIs and import credentials. |
 | `use [account]` | | Pin account, `--chain` or `--policy` for this project (`.tayassu.toml`); `--global` for the policy. |
@@ -104,16 +104,21 @@ tayassu add claude                  # id defaults to `claude`, then `claude-2`, 
 tayassu add claude work --binary /opt/claude/bin/claude --no-login
 ```
 
-Creates the isolated profile, writes the account to `config.toml`, then starts
-the provider's login flow.
+Creates an isolated profile with clean authentication (clearing any stale
+credentials left behind under that profile id, without copying host auth),
+writes the account to `config.toml`, then starts the provider's login flow. On
+Linux, new `agy` accounts enable a private keyring by default (pass
+`--shared-keyring` to share the desktop Secret Service instead).
 
 ### `tayassu run`
 
 ```bash
 tayassu run claude -- "explain this repository"
+tayassu run agy agy-marilia                      # provider + account shorthand
+tayassu run agy-marilia                          # direct account shorthand
 tayassu run --account codex-work -- --version
 tayassu run --chain claude --model claude -- "fix the tests"
-tayassu where claude
+tayassu where agy agy-marilia
 ```
 
 | Option          | Effect                                                              |
@@ -145,6 +150,7 @@ for the selected account, and `q` quits.
 
 ```bash
 tayassu probe
+tayassu probe agy             # probe every account for a provider
 tayassu probe agy-student
 tayassu probe --notify
 ```
@@ -289,3 +295,35 @@ an exclusive file lock, so concurrent runs and background probes are safe.
   `tayassu run <provider> --dry-run`.
 - **Rate limited during a run**: failover is on by default; use a chain that includes
   another provider.
+
+### Separate Antigravity accounts on Linux
+
+New `agy` accounts created with `tayassu add agy <id>` enable
+`agy_private_keyring = true` automatically on Linux (pass `--shared-keyring` to
+share the desktop Secret Service instead). For existing `[[accounts]]` entries
+in `config.toml` that should use an isolated Google sign-in, add
+`agy_private_keyring = true`. Leave the option unset for profiles that should
+keep using the desktop Secret Service.
+
+The mode requires an active `XDG_RUNTIME_DIR`, plus `dbus-daemon`, `gdbus`,
+`gnome-keyring-daemon` on `PATH`. Each enabled profile
+gets a private session bus under `XDG_RUNTIME_DIR` and an encrypted login keyring
+under its isolated `home/.local/share/keyrings`.
+
+1. Run `tayassu add agy <id>` (or `tayassu login <id>` for an existing profile)
+   in a terminal. Choose a password for the private keyring on first use, then
+   complete the Antigravity sign-in. Exit the Antigravity session so Tayassu can
+   verify authentication through a fresh `/usage` process.
+2. Repeat for the second account with its own Google sign-in.
+3. Run `tayassu run agy --account <id>` for each account and check the identity
+   in the Antigravity banner. After a reboot, interactive `tayassu run` can
+   unlock an already initialized keyring directly; background `tayassu probe`
+   reports the locked state without prompting.
+
+If the profile contains `home/.gemini/antigravity-cli/antigravity-oauth-token`,
+Tayassu reports the file and preserves it. Move it out of the profile before
+onboarding. Tayassu also checks for this file after the provider exits. The
+Antigravity CLI controls its file fallback during execution, so a failed
+Secret Service write may still leave a credential in the profile. Private
+services separate routine credential lookups between profiles under the
+same Linux user.

@@ -15,6 +15,10 @@ const SENSITIVE_CRED_FILES: &[&str] = &[
     "hosts.json",
 ];
 
+/// Binaries required on Linux for private Antigravity keyrings.
+#[cfg(target_os = "linux")]
+const PRIVATE_KEYRING_BINARIES: &[&str] = &["dbus-daemon", "gdbus", "gnome-keyring-daemon"];
+
 /// Mask matching group/other permission bits on Unix (`0o077`).
 #[cfg(unix)]
 const GROUP_OTHER_PERM_MASK: u32 = 0o077;
@@ -114,6 +118,9 @@ impl DoctorReport {
             check_credential_permissions(&env_profile.profile_dir, &subject, &mut report);
         }
 
+        check_private_keyring_deps(accounts, &paths.home_dir, path_env.as_deref(), &mut report);
+        check_orphaned_profiles(accounts, &paths.profiles_dir, &mut report);
+
         report
     }
 
@@ -181,3 +188,107 @@ fn check_credential_permissions(profile_dir: &Path, subject: &str, report: &mut 
 
 #[cfg(not(unix))]
 fn check_credential_permissions(_profile_dir: &Path, _subject: &str, _report: &mut DoctorReport) {}
+
+#[cfg(target_os = "linux")]
+fn check_private_keyring_deps(
+    accounts: &[AccountConfig],
+    home_dir: &Path,
+    path_env: Option<&std::ffi::OsStr>,
+    report: &mut DoctorReport,
+) {
+    if !accounts.iter().any(AccountConfig::uses_private_agy_keyring) {
+        return;
+    }
+    let has_runtime = env::var_os("XDG_RUNTIME_DIR")
+        .map(std::path::PathBuf::from)
+        .is_some_and(|dir| dir.is_absolute());
+    if has_runtime {
+        report.push(
+            CheckLevel::Ok,
+            "agy-keyring",
+            "XDG_RUNTIME_DIR is configured for private keyrings",
+        );
+    } else {
+        report.push(
+            CheckLevel::Error,
+            "agy-keyring",
+            "XDG_RUNTIME_DIR must point to an absolute runtime directory for private agy keyrings",
+        );
+    }
+    let missing: Vec<&str> = PRIVATE_KEYRING_BINARIES
+        .iter()
+        .copied()
+        .filter(|bin| {
+            HostDiscovery
+                .resolve_executable(bin, home_dir, path_env)
+                .is_none()
+        })
+        .collect();
+    if missing.is_empty() {
+        report.push(
+            CheckLevel::Ok,
+            "agy-keyring",
+            "all private keyring dependencies found on PATH",
+        );
+    } else {
+        report.push(
+            CheckLevel::Error,
+            "agy-keyring",
+            format!("missing private keyring tool(s): {}", missing.join(", ")),
+        );
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn check_private_keyring_deps(
+    _accounts: &[AccountConfig],
+    _home_dir: &Path,
+    _path_env: Option<&std::ffi::OsStr>,
+    _report: &mut DoctorReport,
+) {
+}
+
+fn check_orphaned_profiles(
+    accounts: &[AccountConfig],
+    profiles_dir: &Path,
+    report: &mut DoctorReport,
+) {
+    let Ok(provider_dirs) = fs::read_dir(profiles_dir) else {
+        return;
+    };
+    let mut orphans = Vec::new();
+    for provider_entry in provider_dirs.flatten() {
+        let provider_path = provider_entry.path();
+        if !provider_path.is_dir() {
+            continue;
+        }
+        let provider_name = provider_entry.file_name();
+        let Ok(account_dirs) = fs::read_dir(&provider_path) else {
+            continue;
+        };
+        for account_entry in account_dirs.flatten() {
+            let account_path = account_entry.path();
+            if !account_path.is_dir() {
+                continue;
+            }
+            let account_name = account_entry.file_name();
+            let configured = accounts.iter().any(|account| {
+                provider_name == account.provider.as_str() && account_name == account.id.as_str()
+            });
+            if !configured {
+                orphans.push(account_path);
+            }
+        }
+    }
+    orphans.sort();
+    for orphan in orphans {
+        report.push(
+            CheckLevel::Warn,
+            "profiles",
+            format!(
+                "orphaned profile directory {} (not in config.toml)",
+                orphan.display()
+            ),
+        );
+    }
+}
