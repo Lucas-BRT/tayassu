@@ -9,7 +9,6 @@ use anyhow::{Context, Result, bail};
 use chrono::{TimeDelta, Utc};
 use clap::Parser;
 use cli::{AccountAction, Cli, Command, CooldownAction};
-use ctrlc;
 use doctor::DoctorReport;
 use render::StatusTable;
 use shell::ShellInit;
