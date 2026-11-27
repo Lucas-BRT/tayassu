@@ -198,10 +198,11 @@ fn classify_failure(err: &anyhow::Error) -> ProbeFailure {
         Some(ProviderError::AuthenticationRequired { .. })
     ) {
         ProbeFailure::authentication(err.to_string())
-    } else if err
-        .downcast_ref::<crate::agy_keyring::KeyringLockedError>()
-        .is_some()
-    {
+    } else if err.chain().any(|cause| {
+        cause
+            .downcast_ref::<crate::agy_keyring::KeyringLockedError>()
+            .is_some()
+    }) {
         ProbeFailure::locked(format!("{err:#}"))
     } else {
         ProbeFailure::other(format!("{err:#}"))

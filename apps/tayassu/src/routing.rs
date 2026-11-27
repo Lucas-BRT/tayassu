@@ -1,16 +1,17 @@
 use crate::app::App;
+use crate::commands::login::Login;
 use crate::probing::probe_accounts;
 use crate::session::{SessionGuard, process_is_alive};
 use crate::spawn::{SIGNAL_FALLBACK_EXIT_CODE, account_executable, spawn_capturing_stderr};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use std::env;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::Path;
 use std::process;
 use tayassu_core::{
-    AccountConfig, AccountId, AccountRouter, CooldownEntry, FallbackTarget, ModelBucket,
-    ProviderKind, SelectionPolicy,
+    AccountConfig, AccountId, AccountRouter, AccountStatus, CooldownEntry, FallbackTarget,
+    ModelBucket, ProviderKind, SelectionPolicy,
 };
 use tayassu_providers::AdapterRegistry;
 use tayassu_store::{ProjectConfig, RuntimeState};
@@ -135,11 +136,10 @@ impl App {
             };
 
             let adapter = AdapterRegistry.adapter_for(account.provider);
-            let env_profile = crate::spawn::prepare_profile(
-                &account,
-                &self.paths,
-                crate::agy_keyring::Operation::Run,
-            )?;
+            let Some(env_profile) = self.prepare_profile_for_run(&account, !req.args.is_empty())?
+            else {
+                return Ok(());
+            };
 
             let (updated_state, ()) =
                 RuntimeState::update_locked(&self.paths.state_file, |state| {
@@ -193,6 +193,65 @@ impl App {
             return Ok(());
         }
 
+        Ok(())
+    }
+
+    fn prepare_profile_for_run(
+        &mut self,
+        account: &AccountConfig,
+        has_args: bool,
+    ) -> Result<Option<tayassu_providers::ProfileEnvironment>> {
+        let interactive = io::stdin().is_terminal();
+        let needs_auth = self
+            .state
+            .status_for(&account.id)
+            .is_some_and(AccountStatus::needs_login);
+        let redirect_reason = if needs_auth && interactive {
+            Some("account requires authentication")
+        } else {
+            match crate::spawn::prepare_profile(
+                account,
+                &self.paths,
+                crate::agy_keyring::Operation::Run,
+            ) {
+                Ok(profile) => return Ok(Some(profile)),
+                Err(error) if is_keyring_locked_error(&error) && interactive => {
+                    Some("private keyring is not initialized yet")
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        if let Some(reason) = redirect_reason {
+            self.redirect_to_login(account, reason)?;
+            if account.uses_private_agy_keyring() && !has_args {
+                return Ok(None);
+            }
+        }
+        crate::spawn::prepare_profile(account, &self.paths, crate::agy_keyring::Operation::Run)
+            .map(Some)
+    }
+
+    fn redirect_to_login(&mut self, account: &AccountConfig, reason: &str) -> Result<()> {
+        let mut stderr = io::stderr();
+        writeln!(
+            stderr,
+            "tayassu: '{}' ({reason}); redirecting to 'tayassu login {}'...",
+            account.id, account.id
+        )?;
+        stderr.flush()?;
+        Login::run(self, account, &mut stderr)?;
+        let (updated_state, ()) = RuntimeState::update_locked(&self.paths.state_file, |state| {
+            let status = state.status_for_mut(&account.id);
+            if status
+                .last_probe_error
+                .as_ref()
+                .is_some_and(|failure| failure.is_authentication() || failure.is_locked())
+            {
+                status.last_probe_error = None;
+            }
+        })
+        .with_context(|| format!("failed to save {}", self.paths.state_file.display()))?;
+        self.state = updated_state;
         Ok(())
     }
 
@@ -581,4 +640,26 @@ fn is_resume_invocation(args: &[String]) -> bool {
             .iter()
             .any(|flag| arg == flag || arg.starts_with(&format!("{flag}=")))
     })
+}
+
+fn is_keyring_locked_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<crate::agy_keyring::KeyringLockedError>()
+            .is_some()
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_keyring_locked_error;
+    use anyhow::Context;
+
+    #[test]
+    fn detects_wrapped_keyring_locked_error() {
+        let base: anyhow::Result<()> =
+            Err(crate::agy_keyring::KeyringLockedError("locked".to_owned()).into());
+        let wrapped = base.context("private Antigravity keyring for 'agy-lucas'");
+        assert!(is_keyring_locked_error(&wrapped.unwrap_err()));
+    }
 }

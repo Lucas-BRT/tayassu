@@ -7,7 +7,7 @@ mod cooldown;
 mod dash;
 mod doctor;
 mod import;
-mod login;
+pub(crate) mod login;
 mod ls;
 mod probe;
 mod providers;
