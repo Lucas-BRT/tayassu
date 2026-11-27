@@ -258,7 +258,7 @@ impl App {
                 .with_context(|| format!("failed to save {}", self.paths.state_file.display()))?;
             self.state = updated_state;
 
-            let _session_guard =
+            let session_guard =
                 SessionGuard::acquire(self.paths.state_file.clone(), account.id.clone())?;
 
             info!(account = %account.id, executable = account.executable(), "launching agent CLI");
@@ -290,7 +290,7 @@ impl App {
                     resets_at.to_rfc3339()
                 );
 
-                if req.failover && attempt < max_attempts {
+                if req.failover && attempt < max_attempts && !outcome.status.success() {
                     let _ = writeln!(
                         io::stderr(),
                         "tayassu: failing over to next available account..."
@@ -301,11 +301,10 @@ impl App {
 
             if !outcome.status.success() {
                 let code = outcome.status.code().unwrap_or(SIGNAL_FALLBACK_EXIT_CODE);
-                bail!(
-                    "'{}' (account '{}') exited with status {code}",
-                    account.executable(),
-                    account.id
-                );
+                // Release the session counter first: `exit` skips destructors.
+                drop(session_guard);
+                // Propagate the agent's own status so shell wrappers and scripts see it.
+                std::process::exit(code);
             }
             return Ok(());
         }
