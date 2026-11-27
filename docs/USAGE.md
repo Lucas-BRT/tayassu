@@ -125,8 +125,9 @@ Prints remaining quota, cooldown windows, and active sessions per account.
 
 ### `tayassu dash`
 
-Interactive terminal dashboard. `p` probes every account, `c` clears cooldowns
-for the selected account, and `q` quits.
+Interactive terminal dashboard. `r` probes every account, `c` clears cooldowns
+for the selected account, and `q` quits. Quota is shown per model bucket, one
+line per bucket, with active cooldown countdowns.
 
 ### `tayassu probe`
 
