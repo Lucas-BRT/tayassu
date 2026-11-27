@@ -25,6 +25,12 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9
 
+      - name: Cache Cargo artifacts
+        # v2.7.8
+        uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6
+        with:
+          shared-key: tayassu
+
       - name: Install cargo-audit
         # v2.49.49
         uses: taiki-e/install-action@69f61f612767f6e62b5aa73784621899a279a533
