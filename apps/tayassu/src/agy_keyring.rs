@@ -433,18 +433,9 @@ mod linux {
         account: &str,
     ) -> Result<()> {
         let control_root = fs::read_to_string(runtime.join("control-root"))?;
-        let mut prompt = Command::new("systemd-ask-password")
-            .arg("-n")
-            .arg(format!(
-                "Password for private Antigravity keyring '{account}' (choose one on first use):"
-            ))
-            .stderr(Stdio::inherit())
-            .output()
-            .context("failed to run systemd-ask-password")?;
-        ensure!(
-            prompt.status.success() && !prompt.stdout.is_empty(),
-            "keyring password prompt failed"
-        );
+        let mut password = read_password_from_tty(&format!(
+            "Password for private Antigravity keyring '{account}' (choose one on first use): "
+        ))?;
 
         let mut command = Command::new("gnome-keyring-daemon");
         daemon_environment(&mut command, profile, Path::new(&control_root));
@@ -467,11 +458,11 @@ mod linux {
                 .stdin
                 .take()
                 .expect("piped stdin")
-                .write_all(&prompt.stdout);
+                .write_all(&password);
             let status = child.wait();
             written.and(status)
         });
-        prompt.stdout.fill(0);
+        password.fill(0);
         ensure!(
             written
                 .context("failed to run gnome-keyring-daemon --unlock")?
@@ -479,6 +470,72 @@ mod linux {
             "keyring unlock failed"
         );
         Ok(())
+    }
+
+    struct RawModeGuard;
+
+    impl RawModeGuard {
+        fn enter() -> Result<Self> {
+            crossterm::terminal::enable_raw_mode()
+                .context("failed to enable raw terminal mode for password prompt")?;
+            Ok(Self)
+        }
+    }
+
+    impl Drop for RawModeGuard {
+        fn drop(&mut self) {
+            let _ = crossterm::terminal::disable_raw_mode();
+        }
+    }
+
+    fn read_password_from_tty(prompt: &str) -> Result<Vec<u8>> {
+        use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, read};
+
+        let mut stderr = std::io::stderr();
+        stderr.write_all(prompt.as_bytes())?;
+        stderr.flush()?;
+
+        let _raw = RawModeGuard::enter()?;
+        let mut chars = String::new();
+        loop {
+            let Event::Key(key) = read().context("failed to read keyring password")? else {
+                continue;
+            };
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            match key.code {
+                KeyCode::Enter => {
+                    let _ = stderr.write_all(b"\r\n");
+                    let _ = stderr.flush();
+                    break;
+                }
+                KeyCode::Char('c' | 'd') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    let _ = stderr.write_all(b"\r\n");
+                    let _ = stderr.flush();
+                    let mut bytes = chars.into_bytes();
+                    bytes.fill(0);
+                    bail!("keyring password prompt cancelled");
+                }
+                KeyCode::Backspace => {
+                    chars.pop();
+                }
+                KeyCode::Char(ch)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    chars.push(ch);
+                }
+                _ => {}
+            }
+        }
+        let mut bytes = chars.into_bytes();
+        if bytes.is_empty() {
+            bytes.fill(0);
+            bail!("keyring password cannot be empty");
+        }
+        Ok(bytes)
     }
 
     fn alias_path(response: &str) -> Result<&str> {

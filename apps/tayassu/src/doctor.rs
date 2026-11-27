@@ -17,12 +17,7 @@ const SENSITIVE_CRED_FILES: &[&str] = &[
 
 /// Binaries required on Linux for private Antigravity keyrings.
 #[cfg(target_os = "linux")]
-const PRIVATE_KEYRING_BINARIES: &[&str] = &[
-    "dbus-daemon",
-    "gdbus",
-    "gnome-keyring-daemon",
-    "systemd-ask-password",
-];
+const PRIVATE_KEYRING_BINARIES: &[&str] = &["dbus-daemon", "gdbus", "gnome-keyring-daemon"];
 
 /// Mask matching group/other permission bits on Unix (`0o077`).
 #[cfg(unix)]

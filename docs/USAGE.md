@@ -306,7 +306,7 @@ in `config.toml` that should use an isolated Google sign-in, add
 keep using the desktop Secret Service.
 
 The mode requires an active `XDG_RUNTIME_DIR`, plus `dbus-daemon`, `gdbus`,
-`gnome-keyring-daemon` and `systemd-ask-password` on `PATH`. Each enabled profile
+`gnome-keyring-daemon` on `PATH`. Each enabled profile
 gets a private session bus under `XDG_RUNTIME_DIR` and an encrypted login keyring
 under its isolated `home/.local/share/keyrings`.
 
