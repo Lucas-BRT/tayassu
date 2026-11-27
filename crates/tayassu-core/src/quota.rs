@@ -59,6 +59,36 @@ impl fmt::Display for RemainingPercent {
     }
 }
 
+/// Minutes a probe stays "fresh" before its readings are shown as estimates.
+pub const FRESH_WINDOW_MINUTES: i64 = 15;
+
+/// How trustworthy a cached quota reading is at a given instant (derived, never persisted).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WindowState {
+    /// Probed recently; the percentage is a live reading.
+    Fresh,
+    /// Probed a while ago; the percentage is the last known value.
+    Stale,
+    /// The recorded reset instant has passed; the quota has presumably been restored.
+    Reset,
+    /// Never probed.
+    Unknown,
+}
+
+impl WindowState {
+    /// Lowercase name used in JSON and text output.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Fresh => "fresh",
+            Self::Stale => "stale",
+            Self::Reset => "reset",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 /// Reason prefix marking cooldowns inferred from CLI output rather than reported by a provider.
 pub const PASSIVE_COOLDOWN_REASON_PREFIX: &str = "detected-rate-limit";
 
@@ -77,6 +107,29 @@ pub struct QuotaWindow {
 }
 
 impl QuotaWindow {
+    /// Returns `true` when the recorded reset instant has already passed at `now`.
+    #[must_use]
+    pub fn has_reset_at(&self, now: DateTime<Utc>) -> bool {
+        self.resets_at.is_some_and(|reset| reset <= now)
+    }
+
+    /// Classifies this reading given when its account was last probed.
+    #[must_use]
+    pub fn state(&self, probed_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> WindowState {
+        if self.has_reset_at(now) {
+            return WindowState::Reset;
+        }
+        match probed_at {
+            None => WindowState::Unknown,
+            Some(at)
+                if now.signed_duration_since(at) < TimeDelta::minutes(FRESH_WINDOW_MINUTES) =>
+            {
+                WindowState::Fresh
+            }
+            Some(_) => WindowState::Stale,
+        }
+    }
+
     /// Returns `true` when this window is exhausted and has not reset yet.
     #[must_use]
     pub fn is_exhausted_at(&self, now: DateTime<Utc>) -> bool {
@@ -274,14 +327,59 @@ impl AccountStatus {
     }
 
     /// Returns the minimum known remaining percentage across windows covering `bucket`.
+    ///
+    /// Windows whose reset instant has passed are skipped: their percentage is outdated.
     #[must_use]
-    pub fn lowest_remaining_percent(&self, bucket: &ModelBucket) -> Option<RemainingPercent> {
+    pub fn lowest_remaining_percent(
+        &self,
+        bucket: &ModelBucket,
+        now: DateTime<Utc>,
+    ) -> Option<RemainingPercent> {
+        self.covering(bucket)
+            .filter(|window| !window.has_reset_at(now))
+            .filter_map(|window| window.remaining)
+            .min()
+    }
+
+    /// Windows that apply to `bucket` (its own and the shared default bucket).
+    fn covering<'a>(&'a self, bucket: &'a ModelBucket) -> impl Iterator<Item = &'a QuotaWindow> {
         let default_bucket = ModelBucket::default_bucket();
         self.windows
             .iter()
-            .filter(|window| &window.bucket == bucket || window.bucket == default_bucket)
-            .filter_map(|window| window.remaining)
-            .min()
+            .filter(move |window| &window.bucket == bucket || window.bucket == default_bucket)
+    }
+
+    /// Worst reading state across windows covering `bucket` (`Reset` > `Stale` > `Unknown` > `Fresh`).
+    #[must_use]
+    pub fn bucket_state(&self, bucket: &ModelBucket, now: DateTime<Utc>) -> Option<WindowState> {
+        let probed_at = self.last_probed_at;
+        let states: Vec<_> = self
+            .covering(bucket)
+            .map(|window| window.state(probed_at, now))
+            .collect();
+        [
+            WindowState::Reset,
+            WindowState::Stale,
+            WindowState::Unknown,
+            WindowState::Fresh,
+        ]
+        .into_iter()
+        .find(|candidate| states.contains(candidate))
+    }
+
+    /// Compact quota text for `bucket`: `43%`, `~43%` (stale), `reset✓` or `ok` (no percentage).
+    #[must_use]
+    pub fn quota_label(&self, bucket: &ModelBucket, now: DateTime<Utc>) -> String {
+        match self.bucket_state(bucket, now) {
+            Some(WindowState::Reset) => "reset✓".to_owned(),
+            state => self.lowest_remaining_percent(bucket, now).map_or_else(
+                || "ok".to_owned(),
+                |pct| match state {
+                    Some(WindowState::Fresh) => pct.to_string(),
+                    _ => format!("~{pct}"),
+                },
+            ),
+        }
     }
 
     /// Returns the earliest known reset timestamp among windows covering `bucket`.
@@ -333,8 +431,93 @@ impl AccountStatus {
         });
     }
 
+    /// Stores freshly probed `windows` as the source of truth.
+    ///
+    /// Returns the buckets whose cached reset had passed (so they were assumed restored) but
+    /// which the provider now reports as exhausted again.
+    pub fn replace_windows(
+        &mut self,
+        windows: Vec<QuotaWindow>,
+        now: DateTime<Utc>,
+    ) -> Vec<ModelBucket> {
+        let assumed_restored: Vec<ModelBucket> = self
+            .windows
+            .iter()
+            .filter(|window| window.has_reset_at(now))
+            .map(|window| window.bucket.clone())
+            .collect();
+        self.last_probed_at = Some(now);
+        self.windows = windows;
+        assumed_restored
+            .into_iter()
+            .filter(|bucket| {
+                self.windows
+                    .iter()
+                    .any(|window| &window.bucket == bucket && window.is_exhausted_at(now))
+            })
+            .collect()
+    }
+
     /// Drops cooldown entries that have already expired at `now`.
     pub fn prune_expired(&mut self, now: DateTime<Utc>) {
         self.cooldowns.retain(|entry| entry.is_active(now));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Hours between the probe and "now" in the stale fixture.
+    const STALE_HOURS: i64 = 2;
+
+    fn window(remaining: u8, resets_in: TimeDelta, now: DateTime<Utc>) -> QuotaWindow {
+        QuotaWindow {
+            window_name: "5h".to_owned(),
+            bucket: ModelBucket::default_bucket(),
+            remaining: RemainingPercent::try_from(remaining).ok(),
+            resets_at: Some(now + resets_in),
+        }
+    }
+
+    fn status_with(window: QuotaWindow, probed_at: Option<DateTime<Utc>>) -> AccountStatus {
+        let mut status = AccountStatus::empty("a".parse().expect("id"));
+        status.last_probed_at = probed_at;
+        status.windows = vec![window];
+        status
+    }
+
+    #[test]
+    fn window_state_follows_probe_age_and_reset_instant() {
+        let now = Utc::now();
+        let future = TimeDelta::hours(1);
+        let bucket = ModelBucket::default_bucket();
+
+        let fresh = status_with(window(40, future, now), Some(now));
+        assert_eq!(fresh.bucket_state(&bucket, now), Some(WindowState::Fresh));
+        assert_eq!(fresh.quota_label(&bucket, now), "40%");
+
+        let probed = now - TimeDelta::hours(STALE_HOURS);
+        let stale = status_with(window(40, future, now), Some(probed));
+        assert_eq!(stale.bucket_state(&bucket, now), Some(WindowState::Stale));
+        assert_eq!(stale.quota_label(&bucket, now), "~40%");
+
+        let never = status_with(window(40, future, now), None);
+        assert_eq!(never.bucket_state(&bucket, now), Some(WindowState::Unknown));
+
+        let reset = status_with(window(0, -TimeDelta::minutes(1), now), Some(probed));
+        assert_eq!(reset.bucket_state(&bucket, now), Some(WindowState::Reset));
+        assert_eq!(reset.quota_label(&bucket, now), "reset✓");
+    }
+
+    #[test]
+    fn reset_window_is_available_and_has_no_known_percentage() {
+        let now = Utc::now();
+        let bucket = ModelBucket::default_bucket();
+        let probed = now - TimeDelta::hours(STALE_HOURS);
+        let status = status_with(window(0, -TimeDelta::minutes(1), now), Some(probed));
+
+        assert!(status.is_available(&bucket, now));
+        assert_eq!(status.lowest_remaining_percent(&bucket, now), None);
     }
 }

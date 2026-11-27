@@ -164,7 +164,7 @@ impl AccountRouter {
                 candidates.sort_by_key(|(account, status)| {
                     let active = status.map_or(0, |st| st.active_sessions);
                     let remaining = status
-                        .and_then(|st| st.lowest_remaining_percent(bucket))
+                        .and_then(|st| st.lowest_remaining_percent(bucket, now))
                         .map_or(MAX_REMAINING_PERCENT, RemainingPercent::value);
                     (
                         account.priority,
@@ -178,7 +178,7 @@ impl AccountRouter {
                 candidates.sort_by_key(|(account, status)| {
                     let active = status.map_or(0, |st| st.active_sessions);
                     let remaining = status
-                        .and_then(|st| st.lowest_remaining_percent(bucket))
+                        .and_then(|st| st.lowest_remaining_percent(bucket, now))
                         .map_or(MAX_REMAINING_PERCENT, RemainingPercent::value);
                     (
                         Reverse(remaining),
