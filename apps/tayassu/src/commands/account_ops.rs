@@ -1,5 +1,5 @@
 use crate::app::{App, Execute};
-use crate::shell::account_candidates;
+use crate::shell::{account_candidates, disabled_account_candidates, enabled_account_candidates};
 use anyhow::{Context, Result};
 use clap::Args;
 use clap_complete::ArgValueCandidates;
@@ -44,7 +44,7 @@ impl Execute for Edit {
 #[derive(Debug, Args)]
 pub struct Enable {
     /// Account identifier.
-    #[arg(add = ArgValueCandidates::new(account_candidates))]
+    #[arg(add = ArgValueCandidates::new(disabled_account_candidates))]
     id: AccountId,
 }
 
@@ -58,7 +58,7 @@ impl Execute for Enable {
 #[derive(Debug, Args)]
 pub struct Disable {
     /// Account identifier.
-    #[arg(add = ArgValueCandidates::new(account_candidates))]
+    #[arg(add = ArgValueCandidates::new(enabled_account_candidates))]
     id: AccountId,
 }
 

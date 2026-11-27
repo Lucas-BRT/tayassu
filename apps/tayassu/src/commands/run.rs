@@ -1,6 +1,8 @@
 use crate::app::{App, Execute};
 use crate::routing::RunRequest;
-use crate::shell::{account_candidates, chain_candidates, runnable_provider_candidates};
+use crate::shell::{
+    chain_candidates, model_candidates, run_account_candidates, run_target_candidates,
+};
 use anyhow::{Result, bail};
 use clap::Args;
 use clap_complete::ArgValueCandidates;
@@ -14,24 +16,24 @@ pub struct Target {
     /// Optional when `--account` or `--chain` (or `.tayassu.toml` `fallback_chain`) is used.
     #[arg(
         value_name = "PROVIDER|ACCOUNT",
-        add = ArgValueCandidates::new(runnable_provider_candidates)
+        add = ArgValueCandidates::new(run_target_candidates)
     )]
     provider_or_account: Option<String>,
     /// Account id for the selected provider (shorthand for `--account <id>`).
     #[arg(
         value_name = "ACCOUNT",
         conflicts_with = "account",
-        add = ArgValueCandidates::new(account_candidates)
+        add = ArgValueCandidates::new(run_account_candidates)
     )]
     account_arg: Option<AccountId>,
     /// Force a specific account id instead of routing automatically.
-    #[arg(long, add = ArgValueCandidates::new(account_candidates))]
+    #[arg(long, add = ArgValueCandidates::new(run_account_candidates))]
     account: Option<AccountId>,
     /// Use a named cross-provider fallback chain from `config.toml`.
     #[arg(long, add = ArgValueCandidates::new(chain_candidates))]
     chain: Option<String>,
     /// Model bucket to check cooldowns against (defaults to `default`).
-    #[arg(long)]
+    #[arg(long, add = ArgValueCandidates::new(model_candidates))]
     model: Option<ModelBucket>,
     /// Override the configured account selection policy.
     #[arg(long)]

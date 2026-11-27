@@ -1711,3 +1711,94 @@ fn run_and_where_support_positional_account_and_validate_provider() {
     let bad_flag_combo = env.run_cli(&["run", "agy-marilia", "--no-failover"]);
     assert!(!bad_flag_combo.status.success());
 }
+
+#[cfg(unix)]
+#[test]
+fn shell_completion_filters_by_provider_state_and_models() {
+    let env = TestEnv::new();
+    let mock_agy = env.write_mock_script(
+        "mock-agy.sh",
+        "#!/usr/bin/env bash\ncat <<'EOF'\nQuota:\nGemini Models          Weekly Limit Remaining     80%  2099-12-03 06:02 -03\nClaude and GPT models  Five Hour Limit Remaining  60%  2099-11-26 21:38 -03\nEOF\n",
+    );
+
+    env.run_ok(&[
+        "add",
+        "agy",
+        "agy-lucas",
+        "--no-login",
+        "--shared-keyring",
+        "--binary",
+        &mock_agy,
+    ]);
+    env.run_ok(&[
+        "add",
+        "agy",
+        "agy-marilia",
+        "--no-login",
+        "--shared-keyring",
+        "--binary",
+        &mock_agy,
+    ]);
+    env.run_ok(&["add", "claude", "claude-host", "--no-login"]);
+    env.run_ok(&["disable", "claude-host"]);
+    env.run_ok(&["probe", "agy"]);
+
+    let complete = |index: &str, args: &[&str]| {
+        let output = env
+            .command()
+            .env("TAYASSU_COMPLETE", "bash")
+            .env("_CLAP_COMPLETE_INDEX", index)
+            .args(["--", "tayassu"])
+            .args(args)
+            .output()
+            .expect("run completion");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).expect("utf8")
+    };
+
+    // Positional account completion after `run agy` only lists agy accounts.
+    let agy_pos = complete("3", &["run", "agy", ""]);
+    assert!(agy_pos.contains("agy-lucas"), "{agy_pos}");
+    assert!(agy_pos.contains("agy-marilia"), "{agy_pos}");
+    assert!(!agy_pos.contains("claude-host"), "{agy_pos}");
+
+    // `--account` after `run agy` is also filtered to agy accounts.
+    let agy_flag = complete("4", &["run", "agy", "--account", ""]);
+    assert!(agy_flag.contains("agy-lucas"), "{agy_flag}");
+    assert!(agy_flag.contains("agy-marilia"), "{agy_flag}");
+    assert!(!agy_flag.contains("claude-host"), "{agy_flag}");
+
+    // First positional after `run` includes both enabled providers and direct accounts.
+    let run_first = complete("2", &["run", ""]);
+    assert!(
+        run_first.contains("agy\n") || run_first.contains("agy"),
+        "{run_first}"
+    );
+    assert!(run_first.contains("agy-marilia"), "{run_first}");
+
+    // `--model` after `run agy` suggests buckets discovered by probing agy.
+    let agy_models = complete("4", &["run", "agy", "--model", ""]);
+    assert!(agy_models.contains("gemini"), "{agy_models}");
+    assert!(agy_models.contains("claude"), "{agy_models}");
+
+    // `enable` only offers disabled accounts; `disable` only offers enabled accounts.
+    let enable_out = complete("2", &["enable", ""]);
+    assert!(enable_out.contains("claude-host"), "{enable_out}");
+    assert!(!enable_out.contains("agy-lucas"), "{enable_out}");
+
+    let disable_out = complete("2", &["disable", ""]);
+    assert!(disable_out.contains("agy-lucas"), "{disable_out}");
+    assert!(!disable_out.contains("claude-host"), "{disable_out}");
+
+    // `probe` completes both accounts and providers.
+    let probe_out = complete("2", &["probe", ""]);
+    assert!(probe_out.contains("agy-lucas"), "{probe_out}");
+    assert!(
+        probe_out.contains("agy\n") || probe_out.lines().any(|l| l == "agy"),
+        "{probe_out}"
+    );
+}
