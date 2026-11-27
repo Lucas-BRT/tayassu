@@ -1,0 +1,592 @@
+use crate::render::format_countdown;
+use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::execute;
+use crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
+use ratatui::backend::CrosstermBackend;
+use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Wrap};
+use ratatui::{Frame, Terminal};
+use std::collections::BTreeSet;
+use std::io::{self, Stdout};
+use std::time::Duration;
+use tayassu_core::{AccountConfig, AccountId, AccountStatus, ModelBucket};
+use tayassu_store::RuntimeState;
+
+/// Poll interval in milliseconds for live cooldown countdown ticks in the TUI.
+const EVENT_POLL_MS: u64 = 500;
+
+/// Header pane height in terminal rows.
+const HEADER_HEIGHT: u16 = 3;
+
+/// Detail pane height in terminal rows.
+const DETAIL_HEIGHT: u16 = 8;
+
+/// Footer help bar height in terminal rows.
+const FOOTER_HEIGHT: u16 = 1;
+
+/// Column widths in the main accounts table.
+const COL_ACCOUNT_WIDTH: u16 = 18;
+const COL_PROVIDER_WIDTH: u16 = 10;
+const COL_PRIORITY_WIDTH: u16 = 5;
+const COL_STATE_WIDTH: u16 = 18;
+const COL_QUOTA_WIDTH: u16 = 30;
+
+/// Actions returned by keyboard input handling in [`DashboardState`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DashAction {
+    /// No external side effect required.
+    None,
+    /// Probe all configured accounts and refresh runtime state.
+    ProbeAll,
+    /// Clear active cooldowns on the currently selected account.
+    ClearSelectedCooldowns,
+    /// Exit the dashboard cleanly.
+    Quit,
+}
+
+/// Interactive state and pure renderer for `tayassu dash`.
+#[derive(Debug, Clone)]
+pub struct DashboardState {
+    selected: usize,
+    status_message: String,
+}
+
+impl Default for DashboardState {
+    fn default() -> Self {
+        Self {
+            selected: 0,
+            status_message: "Press 'r' to probe accounts, 'c' to clear cooldowns, 'q' to quit"
+                .to_owned(),
+        }
+    }
+}
+
+impl DashboardState {
+    /// Updates the transient status message shown in the footer.
+    pub fn set_status(&mut self, message: impl Into<String>) {
+        self.status_message = message.into();
+    }
+
+    /// Returns the currently selected account id, if any accounts exist.
+    #[must_use]
+    pub fn selected_account<'a>(&self, accounts: &'a [AccountConfig]) -> Option<&'a AccountConfig> {
+        accounts.get(self.selected)
+    }
+
+    /// Advances selection to the next account (wrapping around).
+    pub fn select_next(&mut self, count: usize) {
+        if count > 0 {
+            self.selected = (self.selected + 1) % count;
+        }
+    }
+
+    /// Moves selection to the previous account (wrapping around).
+    pub fn select_prev(&mut self, count: usize) {
+        if count > 0 {
+            self.selected = if self.selected == 0 {
+                count - 1
+            } else {
+                self.selected - 1
+            };
+        }
+    }
+
+    /// Clamps selection index when the account list shrinks.
+    pub fn clamp_selection(&mut self, count: usize) {
+        if count == 0 {
+            self.selected = 0;
+        } else if self.selected >= count {
+            self.selected = count - 1;
+        }
+    }
+
+    /// Translates a key event into a [`DashAction`].
+    pub fn handle_key(
+        &mut self,
+        code: KeyCode,
+        modifiers: KeyModifiers,
+        account_count: usize,
+    ) -> DashAction {
+        if modifiers.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('c') {
+            return DashAction::Quit;
+        }
+        match code {
+            KeyCode::Char('q') | KeyCode::Esc => DashAction::Quit,
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.select_next(account_count);
+                DashAction::None
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.select_prev(account_count);
+                DashAction::None
+            }
+            KeyCode::Char('r') => DashAction::ProbeAll,
+            KeyCode::Char('c') => DashAction::ClearSelectedCooldowns,
+            _ => DashAction::None,
+        }
+    }
+
+    /// Renders the full dashboard into `frame` at instant `now`.
+    pub fn render(
+        &self,
+        frame: &mut Frame<'_>,
+        accounts: &[AccountConfig],
+        statuses: &[AccountStatus],
+        now: DateTime<Utc>,
+    ) {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(HEADER_HEIGHT),
+                Constraint::Min(0),
+                Constraint::Length(DETAIL_HEIGHT),
+                Constraint::Length(FOOTER_HEIGHT),
+            ])
+            .split(frame.area());
+
+        render_header(frame, chunks[0], accounts, statuses, now);
+        self.render_table(frame, chunks[1], accounts, statuses, now);
+        self.render_details(frame, chunks[2], accounts, statuses, now);
+        self.render_footer(frame, chunks[3]);
+    }
+
+    fn render_table(
+        &self,
+        frame: &mut Frame<'_>,
+        area: ratatui::layout::Rect,
+        accounts: &[AccountConfig],
+        statuses: &[AccountStatus],
+        now: DateTime<Utc>,
+    ) {
+        let default_bucket = ModelBucket::default_bucket();
+        let header = Row::new(["ACCOUNT", "PROVIDER", "PRI", "STATE", "QUOTA", "LABEL"])
+            .style(
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .bottom_margin(1);
+
+        let rows: Vec<Row<'_>> = accounts
+            .iter()
+            .map(|account| {
+                let status = statuses.iter().find(|entry| entry.account_id == account.id);
+                let (state_text, state_color) =
+                    account_state_cell(account, status, &default_bucket, now);
+                let quota_text = summarize_buckets(status, now);
+
+                Row::new([
+                    Cell::from(account.id.as_str().to_owned()),
+                    Cell::from(account.provider.as_str().to_owned()),
+                    Cell::from(account.priority.to_string()),
+                    Cell::from(state_text).style(Style::default().fg(state_color)),
+                    Cell::from(quota_text),
+                    Cell::from(account.label.clone()),
+                ])
+            })
+            .collect();
+
+        let widths = [
+            Constraint::Length(COL_ACCOUNT_WIDTH),
+            Constraint::Length(COL_PROVIDER_WIDTH),
+            Constraint::Length(COL_PRIORITY_WIDTH),
+            Constraint::Length(COL_STATE_WIDTH),
+            Constraint::Length(COL_QUOTA_WIDTH),
+            Constraint::Min(10),
+        ];
+
+        let table = Table::new(rows, widths)
+            .header(header)
+            .block(Block::default().title(" Accounts ").borders(Borders::ALL))
+            .row_highlight_style(
+                Style::default()
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol("▸ ");
+
+        let mut table_state = TableState::default();
+        if !accounts.is_empty() {
+            table_state.select(Some(self.selected.min(accounts.len() - 1)));
+        }
+        frame.render_stateful_widget(table, area, &mut table_state);
+    }
+
+    fn render_details(
+        &self,
+        frame: &mut Frame<'_>,
+        area: ratatui::layout::Rect,
+        accounts: &[AccountConfig],
+        statuses: &[AccountStatus],
+        now: DateTime<Utc>,
+    ) {
+        let lines = if let Some(account) = self.selected_account(accounts) {
+            let status = statuses.iter().find(|entry| entry.account_id == account.id);
+            build_detail_lines(account, status, now)
+        } else {
+            vec![Line::from(
+                "No accounts configured. Run: tayassu account add <id> <provider>",
+            )]
+        };
+
+        let details = Paragraph::new(lines)
+            .block(Block::default().title(" Details ").borders(Borders::ALL))
+            .wrap(Wrap { trim: true });
+        frame.render_widget(details, area);
+    }
+
+    fn render_footer(&self, frame: &mut Frame<'_>, area: ratatui::layout::Rect) {
+        let footer = Paragraph::new(Line::from(vec![
+            Span::styled(
+                " j/k: move | r: probe | c: clear cooldown | q: quit ",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                self.status_message.as_str(),
+                Style::default().fg(Color::Gray),
+            ),
+        ]));
+        frame.render_widget(footer, area);
+    }
+}
+
+/// RAII guard restoring raw mode and the primary screen buffer on drop.
+struct TerminalGuard {
+    terminal: Terminal<CrosstermBackend<Stdout>>,
+}
+
+impl TerminalGuard {
+    fn enter() -> Result<Self> {
+        enable_raw_mode().context("failed to enable terminal raw mode")?;
+        let mut stdout = io::stdout();
+        execute!(stdout, EnterAlternateScreen).context("failed to enter alternate screen")?;
+        let backend = CrosstermBackend::new(stdout);
+        let terminal = Terminal::new(backend).context("failed to create ratatui terminal")?;
+        Ok(Self { terminal })
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
+        let _ = self.terminal.show_cursor();
+    }
+}
+
+/// Runs the interactive `tayassu dash` event loop.
+///
+/// # Errors
+///
+/// Returns an error if terminal initialization, drawing, or event polling fails.
+pub fn run_dashboard<FProbe, FClear>(
+    accounts: &[AccountConfig],
+    runtime_state: &mut RuntimeState,
+    mut on_probe_all: FProbe,
+    mut on_clear_cooldowns: FClear,
+) -> Result<()>
+where
+    FProbe: FnMut(&mut RuntimeState) -> Result<String>,
+    FClear: FnMut(&mut RuntimeState, &AccountId) -> Result<String>,
+{
+    let mut guard = TerminalGuard::enter()?;
+    let mut ui = DashboardState::default();
+
+    loop {
+        ui.clamp_selection(accounts.len());
+        let now = Utc::now();
+
+        guard
+            .terminal
+            .draw(|frame| ui.render(frame, accounts, &runtime_state.statuses, now))
+            .context("failed to draw TUI frame")?;
+
+        if event::poll(Duration::from_millis(EVENT_POLL_MS)).context("failed to poll key events")?
+            && let Event::Key(key) = event::read().context("failed to read key event")?
+            && key.kind == KeyEventKind::Press
+        {
+            match ui.handle_key(key.code, key.modifiers, accounts.len()) {
+                DashAction::None => {}
+                DashAction::Quit => break,
+                DashAction::ProbeAll => {
+                    ui.set_status("Probing all accounts...");
+                    let _ = guard.terminal.draw(|frame| {
+                        ui.render(frame, accounts, &runtime_state.statuses, Utc::now());
+                    });
+                    match on_probe_all(runtime_state) {
+                        Ok(summary) => ui.set_status(summary),
+                        Err(err) => ui.set_status(format!("Probe error: {err}")),
+                    }
+                }
+                DashAction::ClearSelectedCooldowns => {
+                    if let Some(account) = ui.selected_account(accounts) {
+                        match on_clear_cooldowns(runtime_state, &account.id) {
+                            Ok(summary) => ui.set_status(summary),
+                            Err(err) => ui.set_status(format!("Clear error: {err}")),
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn render_header(
+    frame: &mut Frame<'_>,
+    area: ratatui::layout::Rect,
+    accounts: &[AccountConfig],
+    statuses: &[AccountStatus],
+    now: DateTime<Utc>,
+) {
+    let default_bucket = ModelBucket::default_bucket();
+    let total = accounts.len();
+    let ready_count = accounts
+        .iter()
+        .filter(|account| {
+            account.enabled
+                && statuses
+                    .iter()
+                    .find(|st| st.account_id == account.id)
+                    .is_none_or(|st| st.is_available(&default_bucket, now))
+        })
+        .count();
+    let cooling_count = total.saturating_sub(ready_count);
+
+    let line = Line::from(vec![
+        Span::styled(
+            " tayassu ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(format!(
+            "| {total} accounts  •  {ready_count} ready  •  {cooling_count} unavailable  •  {}",
+            now.format("%H:%M:%S UTC")
+        )),
+    ]);
+
+    let header = Paragraph::new(line).block(
+        Block::default()
+            .title(" AI CLI Session & Cooldown Dashboard ")
+            .borders(Borders::ALL),
+    );
+    frame.render_widget(header, area);
+}
+
+fn account_state_cell(
+    account: &AccountConfig,
+    status: Option<&AccountStatus>,
+    bucket: &ModelBucket,
+    now: DateTime<Utc>,
+) -> (String, Color) {
+    if !account.enabled {
+        return ("DISABLED".to_owned(), Color::DarkGray);
+    }
+    if let Some(cd) = status.and_then(|st| st.active_cooldown(bucket, now)) {
+        let rem = cd
+            .remaining(now)
+            .map_or_else(|| "0m".to_owned(), format_countdown);
+        return (format!("COOLDOWN ({rem})"), Color::Red);
+    }
+    if status.is_some_and(|st| !st.is_available(bucket, now)) {
+        return ("EXHAUSTED".to_owned(), Color::Red);
+    }
+    let has_sub_cooldown = status.is_some_and(|st| st.cooldowns.iter().any(|cd| cd.is_active(now)));
+    if has_sub_cooldown {
+        return ("PARTIAL".to_owned(), Color::Yellow);
+    }
+    ("READY".to_owned(), Color::Green)
+}
+
+fn summarize_buckets(status: Option<&AccountStatus>, now: DateTime<Utc>) -> String {
+    let Some(st) = status else {
+        return "-".to_owned();
+    };
+    let mut buckets = BTreeSet::new();
+    for win in &st.windows {
+        buckets.insert(win.bucket.clone());
+    }
+    for cd in &st.cooldowns {
+        if cd.is_active(now) {
+            buckets.insert(cd.bucket.clone());
+        }
+    }
+    if buckets.is_empty() {
+        return "-".to_owned();
+    }
+    buckets
+        .iter()
+        .map(|bucket| {
+            let pct = st
+                .lowest_remaining_percent(bucket)
+                .map_or_else(|| "ok".to_owned(), |val| val.to_string());
+            if let Some(cd) = st.active_cooldown(bucket, now) {
+                let rem = cd
+                    .remaining(now)
+                    .map_or_else(|| "0m".to_owned(), format_countdown);
+                format!("{bucket}:{pct}({rem})")
+            } else {
+                format!("{bucket}:{pct}")
+            }
+        })
+        .collect::<Vec<String>>()
+        .join(" ")
+}
+
+fn build_detail_lines<'a>(
+    account: &'a AccountConfig,
+    status: Option<&'a AccountStatus>,
+    now: DateTime<Utc>,
+) -> Vec<Line<'a>> {
+    let mut lines = Vec::new();
+    let probed = status.and_then(|st| st.last_probed_at).map_or_else(
+        || "never".to_owned(),
+        |ts| ts.format("%Y-%m-%d %H:%M UTC").to_string(),
+    );
+
+    lines.push(Line::from(format!(
+        "Account: {} ({})  |  Executable: {}  |  Last probe: {}",
+        account.id,
+        account.provider,
+        account.executable(),
+        probed
+    )));
+
+    if let Some(st) = status {
+        if !st.windows.is_empty() {
+            let windows_summary: Vec<String> = st
+                .windows
+                .iter()
+                .map(|win| {
+                    let pct = win
+                        .remaining
+                        .map_or_else(|| "ok".to_owned(), |val| val.to_string());
+                    format!("{}/{}={}", win.bucket, win.window_name, pct)
+                })
+                .collect();
+            lines.push(Line::from(format!(
+                "Windows: {}",
+                windows_summary.join("  ")
+            )));
+        }
+
+        let active_cds: Vec<String> = st
+            .cooldowns
+            .iter()
+            .filter(|cd| cd.is_active(now))
+            .map(|cd| {
+                let rem = cd
+                    .remaining(now)
+                    .map_or_else(|| "0m".to_owned(), format_countdown);
+                format!("{} ({rem}, {})", cd.bucket, cd.reason)
+            })
+            .collect();
+        if !active_cds.is_empty() {
+            lines.push(Line::from(vec![
+                Span::styled("Cooldowns: ", Style::default().fg(Color::Red)),
+                Span::raw(active_cds.join("  ")),
+            ]));
+        }
+    }
+
+    lines
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeDelta;
+    use ratatui::backend::TestBackend;
+    use tayassu_core::{CooldownEntry, ProviderKind, QuotaWindow, RemainingPercent};
+
+    /// Virtual terminal width for `TestBackend` rendering checks.
+    const TEST_TERM_WIDTH: u16 = 100;
+
+    /// Virtual terminal height for `TestBackend` rendering checks.
+    const TEST_TERM_HEIGHT: u16 = 20;
+
+    /// Cooldown duration in minutes used in TUI rendering tests.
+    const TEST_COOLDOWN_MINUTES: i64 = 90;
+
+    /// Remaining quota fixture percentage.
+    const TEST_REMAINING_PCT: u8 = 47;
+
+    #[test]
+    fn dashboard_renders_accounts_and_cooldowns_into_test_backend() {
+        let now = Utc::now();
+        let account = AccountConfig::new(
+            "agy-student".parse().expect("id"),
+            ProviderKind::Agy,
+            "Student Plan",
+        );
+        let mut status = AccountStatus::empty(account.id.clone());
+        status.windows.push(QuotaWindow {
+            window_name: "5h".to_owned(),
+            bucket: "gemini".parse().expect("bucket"),
+            remaining: Some(RemainingPercent::try_from(TEST_REMAINING_PCT).expect("pct")),
+            resets_at: None,
+        });
+        status.set_cooldown(CooldownEntry {
+            bucket: "claude".parse().expect("bucket"),
+            resets_at: now + TimeDelta::minutes(TEST_COOLDOWN_MINUTES),
+            reason: "agy-probe:5h".to_owned(),
+        });
+
+        let state = DashboardState::default();
+        let backend = TestBackend::new(TEST_TERM_WIDTH, TEST_TERM_HEIGHT);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let accounts = [account];
+        let statuses = [status];
+
+        terminal
+            .draw(|frame| state.render(frame, &accounts, &statuses, now))
+            .expect("draw frame");
+
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+
+        assert!(rendered.contains("agy-student"));
+        assert!(rendered.contains("PARTIAL"));
+        assert!(rendered.contains("gemini:47%"));
+        assert!(rendered.contains("claude:ok(1h30m)"));
+    }
+
+    #[test]
+    fn dashboard_key_navigation_and_actions() {
+        let mut state = DashboardState::default();
+        assert_eq!(
+            state.handle_key(KeyCode::Char('j'), KeyModifiers::NONE, 2),
+            DashAction::None
+        );
+        assert_eq!(state.selected, 1);
+        assert_eq!(
+            state.handle_key(KeyCode::Char('r'), KeyModifiers::NONE, 2),
+            DashAction::ProbeAll
+        );
+        assert_eq!(
+            state.handle_key(KeyCode::Char('c'), KeyModifiers::NONE, 2),
+            DashAction::ClearSelectedCooldowns
+        );
+        assert_eq!(
+            state.handle_key(KeyCode::Char('q'), KeyModifiers::NONE, 2),
+            DashAction::Quit
+        );
+    }
+}

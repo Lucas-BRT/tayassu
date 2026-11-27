@@ -11,6 +11,18 @@ pub const DEFAULT_SHARED_HOME_LINKS: &[&str] = &[".gitconfig", ".ssh"];
 /// Environment variable name for the user home directory.
 pub const ENV_HOME: &str = "HOME";
 
+/// Environment variable name for the XDG config directory.
+pub const ENV_XDG_CONFIG_HOME: &str = "XDG_CONFIG_HOME";
+
+/// Environment variable name for the XDG data directory.
+pub const ENV_XDG_DATA_HOME: &str = "XDG_DATA_HOME";
+
+/// Environment variable name for the XDG state directory.
+pub const ENV_XDG_STATE_HOME: &str = "XDG_STATE_HOME";
+
+/// Environment variable name for the XDG cache directory.
+pub const ENV_XDG_CACHE_HOME: &str = "XDG_CACHE_HOME";
+
 /// How a provider isolates one account's credentials and session state on Linux.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IsolationStrategy {
@@ -47,7 +59,25 @@ impl ProfileEnvironment {
             }
             IsolationStrategy::FakeHome { .. } => {
                 let fake_home = profile_dir.join(FAKE_HOME_SUBDIR);
-                vec![(ENV_HOME.to_owned(), fake_home.display().to_string())]
+                vec![
+                    (ENV_HOME.to_owned(), fake_home.display().to_string()),
+                    (
+                        ENV_XDG_CONFIG_HOME.to_owned(),
+                        fake_home.join(".config").display().to_string(),
+                    ),
+                    (
+                        ENV_XDG_DATA_HOME.to_owned(),
+                        fake_home.join(".local/share").display().to_string(),
+                    ),
+                    (
+                        ENV_XDG_STATE_HOME.to_owned(),
+                        fake_home.join(".local/state").display().to_string(),
+                    ),
+                    (
+                        ENV_XDG_CACHE_HOME.to_owned(),
+                        fake_home.join(".cache").display().to_string(),
+                    ),
+                ]
             }
         };
 

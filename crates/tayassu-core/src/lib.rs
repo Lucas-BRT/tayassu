@@ -14,7 +14,7 @@ pub use quota::{
     AccountStatus, CooldownEntry, DEFAULT_FALLBACK_COOLDOWN_SECS, MAX_REMAINING_PERCENT,
     MIN_REMAINING_PERCENT, QuotaWindow, RemainingPercent,
 };
-pub use router::{AccountRouter, SelectionPolicy};
+pub use router::{AccountRouter, FallbackTarget, SelectionPolicy};
 
 #[cfg(test)]
 mod tests {
@@ -130,5 +130,121 @@ mod tests {
             .expect("higher quota account should be selected");
 
         assert_eq!(picked.id, second.id);
+    }
+
+    #[test]
+    fn router_soonest_reset_and_expired_cooldown_handling() {
+        let now = Utc::now();
+        let mut soon = AccountConfig::new(
+            "copilot-a".parse().expect("id"),
+            ProviderKind::Copilot,
+            "Copilot A",
+        );
+        soon.priority = PRO_PRIORITY;
+
+        let mut later = AccountConfig::new(
+            "copilot-b".parse().expect("id"),
+            ProviderKind::Copilot,
+            "Copilot B",
+        );
+        later.priority = STUDENT_PRIORITY;
+
+        let mut soon_status = AccountStatus::empty(soon.id.clone());
+        soon_status.windows.push(QuotaWindow {
+            window_name: "5h".to_owned(),
+            bucket: ModelBucket::default_bucket(),
+            remaining: Some(RemainingPercent::try_from(LOW_QUOTA_PCT).expect("pct")),
+            resets_at: Some(now + TimeDelta::hours(1)),
+        });
+        // Expired cooldown must not block selection.
+        soon_status.set_cooldown(CooldownEntry {
+            bucket: ModelBucket::default_bucket(),
+            resets_at: now - TimeDelta::minutes(1),
+            reason: "expired".to_owned(),
+        });
+
+        let mut later_status = AccountStatus::empty(later.id.clone());
+        later_status.windows.push(QuotaWindow {
+            window_name: "5h".to_owned(),
+            bucket: ModelBucket::default_bucket(),
+            remaining: Some(RemainingPercent::try_from(HIGH_QUOTA_PCT).expect("pct")),
+            resets_at: Some(now + TimeDelta::hours(TEST_COOLDOWN_HOURS)),
+        });
+
+        let accounts = [soon.clone(), later];
+        let router = AccountRouter::new(SelectionPolicy::SoonestReset);
+        let picked = router
+            .select(
+                &accounts,
+                &[soon_status, later_status],
+                ProviderKind::Copilot,
+                &ModelBucket::default_bucket(),
+                now,
+            )
+            .expect("soonest resetting account should be selected");
+
+        assert_eq!(picked.id, soon.id);
+    }
+
+    #[test]
+    fn provider_kind_parses_all_supported_agents_and_display_pads() {
+        assert_eq!(
+            "copilot".parse::<ProviderKind>().expect("copilot"),
+            ProviderKind::Copilot
+        );
+        assert_eq!(
+            "github-copilot".parse::<ProviderKind>().expect("alias"),
+            ProviderKind::Copilot
+        );
+        assert_eq!(
+            "opencode".parse::<ProviderKind>().expect("opencode"),
+            ProviderKind::Opencode
+        );
+
+        let id: AccountId = "agy-pro".parse().expect("id");
+        assert_eq!(format!("{id:<12}"), "agy-pro     ");
+        assert_eq!(format!("{:<10}", ProviderKind::Agy), "agy       ");
+    }
+
+    #[test]
+    fn router_selects_idle_account_on_priority_tie_and_supports_fallback_chain() {
+        let now = Utc::now();
+        let mut agy = AccountConfig::new("agy-a".parse().expect("id"), ProviderKind::Agy, "Agy");
+        agy.priority = STUDENT_PRIORITY;
+        let mut claude_busy = AccountConfig::new(
+            "claude-a".parse().expect("id"),
+            ProviderKind::Claude,
+            "Claude A",
+        );
+        claude_busy.priority = STUDENT_PRIORITY;
+        let mut claude_idle = AccountConfig::new(
+            "claude-b".parse().expect("id"),
+            ProviderKind::Claude,
+            "Claude B",
+        );
+        claude_idle.priority = STUDENT_PRIORITY;
+
+        let mut agy_st = AccountStatus::empty(agy.id.clone());
+        agy_st.set_cooldown(CooldownEntry {
+            bucket: "claude".parse().expect("bucket"),
+            resets_at: now + TimeDelta::hours(TEST_COOLDOWN_HOURS),
+            reason: "probe".to_owned(),
+        });
+        let mut busy_st = AccountStatus::empty(claude_busy.id.clone());
+        busy_st.active_sessions = 1;
+
+        let accounts = [agy, claude_busy, claude_idle.clone()];
+        let statuses = [agy_st, busy_st];
+        let chain: Vec<FallbackTarget> = vec![
+            "agy:claude".parse().expect("target"),
+            "claude".parse().expect("target"),
+        ];
+
+        let router = AccountRouter::new(SelectionPolicy::Priority);
+        let (picked, bucket) = router
+            .select_from_chain(&accounts, &statuses, &chain, now)
+            .expect("chain should fall back to idle claude-b");
+        assert_eq!(picked.id, claude_idle.id);
+        assert_eq!(bucket.as_str(), "default");
     }
 }

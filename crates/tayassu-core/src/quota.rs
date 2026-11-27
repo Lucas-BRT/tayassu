@@ -126,6 +126,9 @@ pub struct AccountStatus {
     /// Recorded cooldown entries per model bucket.
     #[serde(default)]
     pub cooldowns: Vec<CooldownEntry>,
+    /// Number of concurrent `tayassu run` sessions currently using this account.
+    #[serde(default)]
+    pub active_sessions: u32,
 }
 
 impl AccountStatus {
@@ -137,6 +140,7 @@ impl AccountStatus {
             last_probed_at: None,
             windows: Vec::new(),
             cooldowns: Vec::new(),
+            active_sessions: 0,
         }
     }
 

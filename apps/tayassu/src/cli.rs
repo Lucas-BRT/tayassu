@@ -1,3 +1,5 @@
+use crate::shell::ShellKind;
+use crate::systemd::DEFAULT_PROBE_INTERVAL_MINUTES;
 use clap::{Parser, Subcommand};
 use tayassu_core::{
     AccountId, DEFAULT_ACCOUNT_PRIORITY, ModelBucket, ProviderKind, SelectionPolicy,
@@ -28,10 +30,20 @@ pub enum Command {
         model: Option<ModelBucket>,
     },
 
-    /// Select an available account for a provider and invoke its CLI in an isolated profile.
+    /// Open an interactive live terminal dashboard for accounts, quotas, and cooldowns.
+    Dash,
+
+    /// Select an available account for a provider (or fallback chain) and invoke its CLI.
     Run {
-        /// Provider to invoke (`agy`, `claude`, `codex`, `custom`).
-        provider: ProviderKind,
+        /// Provider to invoke (`agy`, `claude`, `codex`, `copilot`, `opencode`, `custom`).
+        /// Optional when `--account` or `--chain` (or `.tayassu.toml` `fallback_chain`) is used.
+        provider: Option<ProviderKind>,
+        /// Force a specific account id instead of routing automatically.
+        #[arg(long)]
+        account: Option<AccountId>,
+        /// Use a named cross-provider fallback chain from `config.toml`.
+        #[arg(long)]
+        chain: Option<String>,
         /// Model bucket to check cooldowns against (defaults to `default`).
         #[arg(long)]
         model: Option<ModelBucket>,
@@ -41,6 +53,9 @@ pub enum Command {
         /// Print the chosen account and isolated environment without spawning the CLI.
         #[arg(long)]
         dry_run: bool,
+        /// Retry once on the next available account if the first run hits a rate limit.
+        #[arg(long)]
+        failover: bool,
         /// Extra arguments passed verbatim to the underlying agent CLI.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
@@ -65,6 +80,68 @@ pub enum Command {
         /// Limit probing to a single account id.
         #[arg(long)]
         id: Option<AccountId>,
+        /// Send a desktop notification (`notify-send`) when a previously active cooldown clears.
+        #[arg(long)]
+        notify: bool,
+    },
+
+    /// Auto-discover installed AI CLIs and safely import their host credentials into isolated profiles.
+    #[command(alias = "discover")]
+    Import {
+        /// Include only specific provider(s) (repeatable). Defaults to all discovered providers.
+        #[arg(long = "provider")]
+        include: Vec<ProviderKind>,
+        /// Exclude specific provider(s) from discovery/import (repeatable).
+        #[arg(long = "exclude")]
+        exclude: Vec<ProviderKind>,
+        /// Preview discovered agents, files, and update-safety notes without modifying disk.
+        #[arg(long)]
+        dry_run: bool,
+        /// Remove original host auth files after verified copy (never removes binaries or updater dirs).
+        #[arg(long)]
+        move_auth: bool,
+        /// Selection priority assigned to imported accounts.
+        #[arg(long, default_value_t = DEFAULT_ACCOUNT_PRIORITY)]
+        priority: u8,
+    },
+
+    /// Print shell wrapper functions so `agy`, `claude`, `codex`, etc. route through `tayassu`.
+    ShellInit {
+        /// Target shell (`bash`, `zsh`, `fish`).
+        shell: ShellKind,
+        /// Restrict wrappers to specific provider(s) (repeatable). Defaults to all built-in agents.
+        #[arg(long = "provider")]
+        providers: Vec<ProviderKind>,
+        /// Include `--failover` in generated wrapper functions.
+        #[arg(long)]
+        failover: bool,
+    },
+
+    /// Generate or install `systemd --user` service and timer units for background probing.
+    SystemdUnit {
+        /// Background probe interval in minutes.
+        #[arg(long, default_value_t = DEFAULT_PROBE_INTERVAL_MINUTES)]
+        interval_minutes: u64,
+        /// Write units into `$XDG_CONFIG_HOME/systemd/user/`.
+        #[arg(long)]
+        install: bool,
+    },
+
+    /// Validate installed binaries, fake-HOME symlinks, and credential file permissions.
+    Doctor {
+        /// Exit non-zero on warnings as well as errors.
+        #[arg(long)]
+        strict: bool,
+    },
+
+    /// Run each installed CLI's native self-updater using the real host `$HOME`.
+    Update {
+        /// Restrict updates to a single provider.
+        #[arg(long)]
+        provider: Option<ProviderKind>,
+        /// Print updater commands without executing them.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -75,7 +152,7 @@ pub enum AccountAction {
     Add {
         /// Unique account slug (e.g. `agy-student`, `agy-pro`).
         id: AccountId,
-        /// Provider kind (`agy`, `claude`, `codex`, `custom`).
+        /// Provider kind (`agy`, `claude`, `codex`, `copilot`, `opencode`, `custom`).
         provider: ProviderKind,
         /// Human-readable label shown in status output.
         #[arg(long, default_value = "")]
@@ -97,6 +174,12 @@ pub enum AccountAction {
     /// Print the isolated profile directory and environment overrides for an account.
     Env {
         /// Account identifier to inspect.
+        id: AccountId,
+    },
+
+    /// Launch the provider CLI interactively inside the account's isolated profile to log in.
+    Login {
+        /// Account identifier to authenticate.
         id: AccountId,
     },
 }
