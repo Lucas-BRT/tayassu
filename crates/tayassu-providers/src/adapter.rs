@@ -694,6 +694,14 @@ fn extract_json_object(raw: &str) -> Option<&str> {
 
 /// Splits a whitespace-aligned table row on runs of two or more ASCII spaces.
 fn split_table_columns(line: &str) -> Vec<&str> {
+    if line.contains('\t') {
+        return line
+            .split('\t')
+            .map(str::trim)
+            .filter(|segment| !segment.is_empty())
+            .collect();
+    }
+
     let mut columns = Vec::new();
     let bytes = line.as_bytes();
     let mut start = 0;

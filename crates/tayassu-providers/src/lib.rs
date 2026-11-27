@@ -36,11 +36,22 @@ Claude and GPT models  Weekly Limit Remaining     50%  2026-12-03 16:38 -03
 Claude and GPT models  Five Hour Limit Remaining  0%   2026-11-26 21:38 -03
 ";
 
+    /// Tab-separated `agy --print=/usage` output captured on 2026-11-27 (agy 1.5.18).
+    const AGY_TAB_USAGE_FIXTURE: &str = "\
+Gemini Models\tWeekly Limit Remaining\t31%\t2026-12-03T09:02:27Z
+Gemini Models\tFive Hour Limit Remaining\t0%\t2026-11-27T02:00:14Z
+Claude and GPT models\tWeekly Limit Remaining\t50%\t2026-12-03T19:38:57Z
+Claude and GPT models\tFive Hour Limit Remaining\t0%\t2026-11-27T00:38:57Z
+";
+
     /// Expected number of quota rows parsed from [`AGY_USAGE_FIXTURE`].
     const EXPECTED_AGY_WINDOWS: usize = 4;
 
     /// Expected Gemini weekly remaining percentage in [`AGY_USAGE_FIXTURE`].
     const EXPECTED_GEMINI_WEEKLY_PCT: u8 = 43;
+
+    /// Expected Gemini weekly remaining percentage in [`AGY_TAB_USAGE_FIXTURE`].
+    const EXPECTED_AGY_TAB_GEMINI_PCT: u8 = 31;
 
     #[test]
     fn claude_and_codex_use_native_env_vars() {
@@ -129,6 +140,28 @@ Claude and GPT models  Five Hour Limit Remaining  0%   2026-11-26 21:38 -03
         assert_eq!(parsed.cooldowns[0].bucket.as_str(), "claude");
         assert_eq!(parsed.cooldowns[0].reason, "agy-probe:5h");
         assert!(parsed.cooldowns[0].is_active(now));
+    }
+
+    #[test]
+    fn agy_parses_tab_separated_usage_output() {
+        let account =
+            AccountConfig::new("agy-host".parse().expect("id"), ProviderKind::Agy, "Host");
+        let now = Utc
+            .with_ymd_and_hms(2026, 11, 27, 0, 10, 0)
+            .single()
+            .expect("valid utc instant");
+
+        let parsed = AgyAdapter
+            .parse_usage_output(&account, AGY_TAB_USAGE_FIXTURE, now)
+            .expect("tab fixture should parse");
+
+        assert_eq!(parsed.windows.len(), EXPECTED_AGY_WINDOWS);
+        assert_eq!(parsed.windows[0].bucket.as_str(), "gemini");
+        assert_eq!(
+            parsed.windows[0].remaining.map(RemainingPercent::value),
+            Some(EXPECTED_AGY_TAB_GEMINI_PCT)
+        );
+        assert_eq!(parsed.windows[2].bucket.as_str(), "claude");
     }
 
     #[test]
