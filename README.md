@@ -22,9 +22,9 @@ cargo install --locked --path apps/tayassu
 
 ```bash
 tayassu import          # discover installed CLIs and copy credentials into isolated profiles
-tayassu status
+tayassu ls
 # If import requests a login, use the reported account ID, for example:
-# tayassu account login agy-host
+# tayassu login agy-host
 tayassu probe
 tayassu run claude --dry-run -- --help
 tayassu run claude -- --help

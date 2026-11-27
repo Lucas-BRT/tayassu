@@ -52,7 +52,7 @@ pub struct MigrationSummary {
     pub copied_files: usize,
     /// Number of original host auth files removed (only non-zero under [`MigrationMode::MoveAuth`]).
     pub removed_source_files: usize,
-    /// Whether the user still needs to run `tayassu account login <id>` for this profile.
+    /// Whether the user still needs to run `tayassu login <id>` for this profile.
     pub requires_relogin: bool,
 }
 
@@ -69,7 +69,7 @@ pub struct DiscoveredAgent {
     pub files: Vec<MigrationFile>,
     /// Human-readable explanation of how auto-updates remain safe for this provider.
     pub update_safety_note: &'static str,
-    /// Whether an interactive `tayassu account login` is still required after import.
+    /// Whether an interactive `tayassu login` is still required after import.
     pub requires_relogin: bool,
 }
 
@@ -296,7 +296,7 @@ const fn update_safety_note_for(provider: ProviderKind) -> &'static str {
             "Uses COPILOT_HOME; ~/.local/bin/copilot and auto-updater stay untouched"
         }
         ProviderKind::Agy => {
-            "Uses fake HOME with ~/.local/bin symlinked so agy update updates the shared host binary; run tayassu account login to authenticate"
+            "Uses fake HOME with ~/.local/bin symlinked so agy update updates the shared host binary"
         }
         ProviderKind::Opencode => {
             "Uses fake HOME with ~/.opencode/bin symlinked so opencode upgrade updates the shared host binary"

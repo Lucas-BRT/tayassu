@@ -250,7 +250,7 @@ an exclusive file lock, so concurrent runs and background probes are safe.
 - **Login required**: run `tayassu login <id>`; some providers require a
   fresh OAuth flow after credentials are copied.
 - **Broken profile links**: run `tayassu doctor --strict`.
-- **A provider stopped working after an upgrade**: run `tayassu upgrade-clis`, then
+- **A provider stopped working after an upgrade**: run `tayassu providers update`, then
   `tayassu doctor`.
 - **Wrapper loops or wrong account**: call the CLI directly with
   `command <cli> ...`, or check the account selected by

@@ -24,7 +24,7 @@ pub enum ProviderError {
 
     /// Isolated profile has not been authenticated yet.
     #[error(
-        "account '{account_id}' ({provider}) is not logged in; run `tayassu account login {account_id}`"
+        "account '{account_id}' ({provider}) is not logged in; run `tayassu login {account_id}`"
     )]
     AuthenticationRequired {
         /// Provider requiring authentication.

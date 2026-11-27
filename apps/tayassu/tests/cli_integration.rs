@@ -99,6 +99,15 @@ fn account_lifecycle_and_aligned_status_table() {
 }
 
 #[test]
+fn filtered_empty_status_names_the_requested_provider() {
+    let env = TestEnv::new();
+    env.run_ok(&["add", "agy", "work", "--no-login"]);
+    let output = env.run_ok(&["ls", "codex"]);
+    assert!(output.contains("No accounts configured for codex"));
+    assert!(output.contains("tayassu add codex"));
+}
+
+#[test]
 fn manual_cooldown_routes_run_to_fallback_account() {
     let env = TestEnv::new();
 
@@ -605,7 +614,7 @@ exit 7
     let status = env.run_ok(&["ls"]);
     assert!(status.contains("ERROR"));
     assert!(status.contains("unverified"));
-    assert!(status.contains("tayassu doctor, then tayassu probe --id work"));
+    assert!(status.contains("tayassu doctor, then tayassu probe work"));
 
     env.write_mock_script(
         "codex.sh",
@@ -617,7 +626,7 @@ exit 1
     env.run_ok(&["probe", "work"]);
     let status = env.run_ok(&["ls"]);
     assert!(status.contains("AUTH"));
-    assert!(status.contains("tayassu account login work"));
+    assert!(status.contains("tayassu login work"));
     let automatic = env.run_cli(&["run", "codex", "--dry-run"]);
     assert!(!automatic.status.success());
     assert!(String::from_utf8_lossy(&automatic.stderr).contains("login required"));
