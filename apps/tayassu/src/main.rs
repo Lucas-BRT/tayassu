@@ -48,6 +48,12 @@ const MAX_FAILOVER_ATTEMPTS: usize = 2;
 /// CLI flags indicating the user is resuming an existing conversation in the current directory.
 const RESUME_FLAGS: &[&str] = &["-c", "--continue", "-r", "--resume", "--conversation"];
 
+/// Arguments for dumping the host `opencode` credentials as JSON on stdout.
+const OPENCODE_AUTH_EXPORT_ARGS: &[&str] = &["auth", "export"];
+
+/// Arguments for reading exported `opencode` credentials from stdin.
+const OPENCODE_AUTH_IMPORT_ARGS: &[&str] = &["auth", "import"];
+
 /// Relative path under `$XDG_CONFIG_HOME` where `systemd --user` units live.
 const SYSTEMD_USER_REL_DIR: &str = "systemd/user";
 
@@ -620,7 +626,18 @@ impl App {
                 summary.removed_source_files
             )?;
             writeln!(out, "  update-safety: {}", agent.update_safety_note)?;
-            if summary.requires_relogin {
+            let credentials_transferred = agent.provider == ProviderKind::Opencode
+                && match transfer_opencode_auth(&agent.binary_path, &profile_env.env_vars) {
+                    Ok(()) => {
+                        writeln!(out, "  credentials: exported from host and imported")?;
+                        true
+                    }
+                    Err(err) => {
+                        warn!(error = %err, "opencode credential transfer failed");
+                        false
+                    }
+                };
+            if summary.requires_relogin && !credentials_transferred {
                 writeln!(
                     out,
                     "  next: run `tayassu account login {}`",
@@ -877,6 +894,46 @@ fn send_desktop_notification(title: &str, body: &str) {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
+}
+
+/// Copies host `opencode` credentials (stored in its database, not a file) into an isolated profile.
+///
+/// The secrets flow through a pipe from `auth export` to `auth import` and never touch disk.
+fn transfer_opencode_auth(binary: &Path, profile_env: &[(String, String)]) -> Result<()> {
+    let exported = ProcessCommand::new(binary)
+        .args(OPENCODE_AUTH_EXPORT_ARGS)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .context("failed to run `opencode auth export` on the host")?;
+    if !exported.status.success() {
+        bail!("`opencode auth export` exited with {}", exported.status);
+    }
+
+    let mut cmd = ProcessCommand::new(binary);
+    cmd.args(OPENCODE_AUTH_IMPORT_ARGS)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    for (key, value) in profile_env {
+        cmd.env(key, value);
+    }
+    let mut child = cmd
+        .spawn()
+        .context("failed to run `opencode auth import` in the profile")?;
+    child
+        .stdin
+        .take()
+        .context("opencode import stdin unavailable")?
+        .write_all(&exported.stdout)
+        .context("failed to pipe credentials into `opencode auth import`")?;
+    let status = child
+        .wait()
+        .context("failed waiting on `opencode auth import`")?;
+    if !status.success() {
+        bail!("`opencode auth import` exited with {status}");
+    }
+    Ok(())
 }
 
 fn spawn_interactive(
