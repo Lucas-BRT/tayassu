@@ -1199,7 +1199,7 @@ dependencies = [
 
 [[package]]
 name = "tayassu"
-version = "0.1.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1225,7 +1225,7 @@ dependencies = [
 
 [[package]]
 name = "tayassu-core"
-version = "0.1.1"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "serde",
@@ -1234,7 +1234,7 @@ dependencies = [
 
 [[package]]
 name = "tayassu-providers"
-version = "0.1.1"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "serde",
@@ -1247,7 +1247,7 @@ dependencies = [
 
 [[package]]
 name = "tayassu-store"
-version = "0.1.1"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "serde",
