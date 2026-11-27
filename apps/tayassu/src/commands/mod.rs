@@ -8,11 +8,12 @@ mod import;
 mod login;
 mod ls;
 mod probe;
+mod providers;
 mod rm;
 mod run;
 mod self_update;
 mod setup;
-mod upgrade_clis;
+mod uninstall;
 mod use_;
 
 use crate::app::{App, Execute};
@@ -54,8 +55,10 @@ pub enum Command {
     Config(config::Config),
     /// Update tayassu itself.
     SelfUpdate(self_update::SelfUpdate),
-    /// Run each installed provider CLI's own updater.
-    UpgradeClis(upgrade_clis::UpgradeClis),
+    /// Manage installed provider CLIs.
+    Providers(providers::Providers),
+    /// Remove tayassu hooks, timer, and binary.
+    Uninstall(uninstall::Uninstall),
     /// Manage cooldowns by hand.
     #[command(hide = true)]
     Cooldown(cooldown::Cooldown),
@@ -85,7 +88,8 @@ impl Execute for Command {
             Self::Setup(c) => c.execute(app, out),
             Self::Config(c) => c.execute(app, out),
             Self::SelfUpdate(c) => c.execute(app, out),
-            Self::UpgradeClis(c) => c.execute(app, out),
+            Self::Providers(c) => c.execute(app, out),
+            Self::Uninstall(c) => c.execute(app, out),
             Self::Cooldown(c) => c.execute(app, out),
         }
     }

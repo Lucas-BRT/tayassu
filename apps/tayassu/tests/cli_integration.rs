@@ -607,3 +607,75 @@ fn failed_probe_keeps_cached_windows() {
     assert!(out.contains("all probes failed"), "{out}");
     assert!(env.run_ok(&["ls"]).contains("gemini:43%"));
 }
+
+#[cfg(unix)]
+#[test]
+fn uninstall_removes_hooks_units_and_binary_while_keeping_data_unless_purged() {
+    let env = TestEnv::new();
+    let home = env.dir.path().join("home");
+    fs::write(home.join(".bashrc"), "export KEEP=1\n").expect("write bashrc");
+    env.run_ok(&["add", "claude", "work", "--no-login"]);
+    env.run_ok(&["setup", "--interval-minutes", "15"]);
+
+    let fake_bin = env.dir.path().join("tayassu-copy");
+    fs::write(&fake_bin, "bin").expect("write fake bin");
+
+    let dry = Command::new(env!("CARGO_BIN_EXE_tayassu"))
+        .args(["uninstall", "--dry-run"])
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", env.dir.path().join("config"))
+        .env("XDG_STATE_HOME", env.dir.path().join("state"))
+        .env("XDG_DATA_HOME", env.dir.path().join("data"))
+        .env("TAYASSU_UNINSTALL_BIN", &fake_bin)
+        .output()
+        .expect("dry uninstall");
+    assert!(dry.status.success());
+    let dry_out = String::from_utf8_lossy(&dry.stdout);
+    assert!(dry_out.contains("[dry-run] shell:"));
+    assert!(dry_out.contains("[dry-run] binary:"));
+    assert!(fake_bin.exists());
+
+    let run = Command::new(env!("CARGO_BIN_EXE_tayassu"))
+        .args(["uninstall", "--yes"])
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", env.dir.path().join("config"))
+        .env("XDG_STATE_HOME", env.dir.path().join("state"))
+        .env("XDG_DATA_HOME", env.dir.path().join("data"))
+        .env("TAYASSU_UNINSTALL_BIN", &fake_bin)
+        .output()
+        .expect("uninstall");
+    assert!(
+        run.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(!fake_bin.exists());
+    assert_eq!(
+        fs::read_to_string(home.join(".bashrc")).expect("read bashrc"),
+        "export KEEP=1\n"
+    );
+    assert!(
+        !env.dir
+            .path()
+            .join("config/systemd/user/tayassu-probe.timer")
+            .exists()
+    );
+    // User data stays untouched without --purge.
+    assert!(env.dir.path().join("config/tayassu/config.toml").exists());
+
+    let purge = Command::new(env!("CARGO_BIN_EXE_tayassu"))
+        .args(["uninstall", "--yes", "--purge"])
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", env.dir.path().join("config"))
+        .env("XDG_STATE_HOME", env.dir.path().join("state"))
+        .env("XDG_DATA_HOME", env.dir.path().join("data"))
+        .env("TAYASSU_UNINSTALL_BIN", &fake_bin)
+        .output()
+        .expect("purge");
+    assert!(purge.status.success());
+    assert!(!env.dir.path().join("config/tayassu").exists());
+    assert!(!env.dir.path().join("data/tayassu").exists());
+}

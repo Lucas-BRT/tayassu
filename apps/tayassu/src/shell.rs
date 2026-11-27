@@ -43,6 +43,18 @@ pub trait Shell {
     /// Returns an I/O error when a startup file cannot be written.
     fn install(&self, home: &Path) -> io::Result<Option<String>>;
 
+    /// Removes the `tayassu activate` hook from this shell's startup under `home`.
+    ///
+    /// Returns a description of the change, or `None` when nothing was installed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error when a startup file cannot be read or updated.
+    fn uninstall(&self, home: &Path) -> io::Result<Option<String>>;
+
+    /// Startup file path that would be modified or removed if currently configured.
+    fn installed_path(&self, home: &Path) -> io::Result<Option<std::path::PathBuf>>;
+
     /// Full activation script: wrappers for `providers` followed by completion.
     fn activation(&self, providers: &[ProviderKind], failover: bool) -> String {
         let mut out = String::from(
@@ -97,6 +109,65 @@ pub trait RcShell: Shell {
             path.display()
         )))
     }
+
+    /// Returns the rc file path if it contains the `tayassu activate` marker.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error when the rc file cannot be read.
+    fn installed_rc(&self, home: &Path) -> io::Result<Option<std::path::PathBuf>> {
+        let path = home.join(self.rc_file());
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let existing = fs::read_to_string(&path)?;
+        Ok(existing.contains(RC_MARKER).then_some(path))
+    }
+
+    /// Removes the marked activation block from the rc file, if present.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error when the rc file cannot be read or written.
+    fn uninstall_rc(&self, home: &Path) -> io::Result<Option<String>> {
+        let path = home.join(self.rc_file());
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let existing = fs::read_to_string(&path)?;
+        if !existing.contains(RC_MARKER) {
+            return Ok(None);
+        }
+        let activate_prefix = "command -v tayassu";
+        let mut kept: Vec<&str> = Vec::new();
+        let mut skip_next = false;
+        for line in existing.lines() {
+            if skip_next {
+                skip_next = false;
+                if line.contains(activate_prefix) && line.contains("tayassu activate") {
+                    continue;
+                }
+            }
+            if line.trim() == RC_MARKER {
+                if kept.last().is_some_and(|prev| prev.is_empty()) {
+                    kept.pop();
+                }
+                skip_next = true;
+                continue;
+            }
+            kept.push(line);
+        }
+        let mut updated = kept.join("\n");
+        if existing.ends_with('\n') && !updated.is_empty() {
+            updated.push('\n');
+        }
+        fs::write(&path, updated)?;
+        Ok(Some(format!(
+            "{}: removed activation from {}",
+            self.name(),
+            path.display()
+        )))
+    }
 }
 
 /// Renders a POSIX-style wrapper function (bash and zsh share syntax).
@@ -129,6 +200,12 @@ impl Shell for Bash {
     fn install(&self, home: &Path) -> io::Result<Option<String>> {
         self.install_rc(home)
     }
+    fn uninstall(&self, home: &Path) -> io::Result<Option<String>> {
+        self.uninstall_rc(home)
+    }
+    fn installed_path(&self, home: &Path) -> io::Result<Option<std::path::PathBuf>> {
+        self.installed_rc(home)
+    }
 }
 
 impl RcShell for Bash {
@@ -149,6 +226,12 @@ impl Shell for Zsh {
     }
     fn install(&self, home: &Path) -> io::Result<Option<String>> {
         self.install_rc(home)
+    }
+    fn uninstall(&self, home: &Path) -> io::Result<Option<String>> {
+        self.uninstall_rc(home)
+    }
+    fn installed_path(&self, home: &Path) -> io::Result<Option<std::path::PathBuf>> {
+        self.installed_rc(home)
     }
 }
 
@@ -187,6 +270,18 @@ impl Shell for Fish {
         }
         fs::write(&path, script)?;
         Ok(Some(format!("fish: wrote {}", path.display())))
+    }
+    fn uninstall(&self, home: &Path) -> io::Result<Option<String>> {
+        let path = home.join(FISH_CONF_DIR).join(FISH_CONF_FILE);
+        if !path.exists() {
+            return Ok(None);
+        }
+        fs::remove_file(&path)?;
+        Ok(Some(format!("fish: removed {}", path.display())))
+    }
+    fn installed_path(&self, home: &Path) -> io::Result<Option<std::path::PathBuf>> {
+        let path = home.join(FISH_CONF_DIR).join(FISH_CONF_FILE);
+        Ok(path.exists().then_some(path))
     }
 }
 
@@ -255,6 +350,28 @@ mod tests {
 
         for kind in ShellKind::ALL {
             assert!(kind.shell().install(home.path()).expect("again").is_none());
+        }
+
+        for kind in ShellKind::ALL {
+            kind.shell().uninstall(home.path()).expect("uninstall");
+        }
+        assert_eq!(
+            fs::read_to_string(home.path().join(".bashrc")).expect("read"),
+            "export A=1\n"
+        );
+        assert!(
+            !home
+                .path()
+                .join(".config/fish/conf.d/tayassu.fish")
+                .exists()
+        );
+        for kind in ShellKind::ALL {
+            assert!(
+                kind.shell()
+                    .uninstall(home.path())
+                    .expect("uninstall again")
+                    .is_none()
+            );
         }
     }
 }
