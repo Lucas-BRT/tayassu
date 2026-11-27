@@ -1,3 +1,4 @@
+mod agy_keyring;
 mod app;
 mod artifacts;
 mod claude_usage;

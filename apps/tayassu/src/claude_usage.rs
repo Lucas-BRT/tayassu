@@ -25,7 +25,7 @@ enum Phase {
 
 pub(crate) fn probe(
     executable: &Path,
-    environment: &[(String, String)],
+    profile: &tayassu_providers::ProfileEnvironment,
     now: DateTime<Utc>,
 ) -> Result<Vec<QuotaWindow>> {
     let pair = native_pty_system().openpty(PtySize {
@@ -48,7 +48,10 @@ pub(crate) fn probe(
         "--tools",
         "",
     ]);
-    for (key, value) in environment {
+    for key in &profile.env_remove {
+        command.env_remove(key);
+    }
+    for (key, value) in &profile.env_vars {
         command.env(key, value);
     }
     command.env("TERM", "xterm-256color");

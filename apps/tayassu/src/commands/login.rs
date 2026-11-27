@@ -20,10 +20,11 @@ impl Login {
     /// Prepares the profile of `account` and runs its interactive login flow.
     pub fn run(app: &App, account: &AccountConfig, out: &mut dyn Write) -> Result<()> {
         let adapter = AdapterRegistry.adapter_for(account.provider);
-        let env_profile = adapter.build_environment(account, &app.paths.profiles_dir);
-        env_profile
-            .prepare(&app.paths.home_dir)
-            .with_context(|| format!("failed to prepare profile for {}", account.id))?;
+        let env_profile = crate::spawn::prepare_profile(
+            account,
+            &app.paths,
+            crate::agy_keyring::Operation::Login,
+        )?;
         writeln!(
             out,
             "Logging in '{}' ({}) using isolated profile {}",
@@ -33,12 +34,29 @@ impl Login {
         )?;
         out.flush()?;
         let executable = account_executable(account, &app.paths.home_dir);
-        spawn_interactive(
-            account,
-            &executable,
-            &env_profile.env_vars,
-            &adapter.login_args(),
-        )
+        let args = if account.uses_private_agy_keyring() {
+            Vec::new()
+        } else {
+            adapter.login_args()
+        };
+        let outcome = spawn_interactive(account, &executable, &env_profile, &args);
+        crate::agy_keyring::check_after_launch(account, &env_profile)?;
+        outcome?;
+        if account.uses_private_agy_keyring() {
+            crate::probing::run_single_probe(
+                account,
+                &app.config.accounts,
+                &app.paths,
+                chrono::Utc::now(),
+            )
+            .context("could not confirm Antigravity authentication in a fresh process")?;
+            writeln!(
+                out,
+                "Confirmed Antigravity authentication for '{}'",
+                account.id
+            )?;
+        }
+        Ok(())
     }
 }
 

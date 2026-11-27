@@ -1,11 +1,13 @@
 use clap::ValueEnum;
 use clap_complete::CompletionCandidate;
+use std::collections::BTreeSet;
+use std::env;
 use std::fmt::Write as _;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use tayassu_core::ProviderKind;
-use tayassu_store::{AppConfig, XdgPaths};
+use tayassu_core::{AccountConfig, AccountId, ProviderKind};
+use tayassu_store::{AppConfig, RuntimeState, XdgPaths};
 
 /// Default providers wrapped by `tayassu activate` when `--provider` is omitted.
 pub const DEFAULT_SHELL_PROVIDERS: &[ProviderKind] = &[
@@ -28,21 +30,260 @@ const FISH_CONF_DIR: &str = ".config/fish";
 /// Fish snippet filename under `conf.d/` (autoloaded by fish).
 const FISH_CONF_FILE: &str = "conf.d/tayassu.fish";
 
+/// Environment variable set by `clap_complete` with the active completion word index.
+const COMPLETE_INDEX_ENV: &str = "_CLAP_COMPLETE_INDEX";
+
+/// Flags that consume a following value token in `run`, `where`, and `ls`.
+const VALUE_FLAGS: &[&str] = &["--account", "--chain", "--model", "--policy"];
+
 fn load_completion_config() -> Option<AppConfig> {
     let paths = XdgPaths::from_env().ok()?;
     AppConfig::load(&paths.config_file).ok()
 }
 
+fn load_completion_state() -> Option<RuntimeState> {
+    let paths = XdgPaths::from_env().ok()?;
+    RuntimeState::load(&paths.state_file).ok()
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct CompletionContext {
+    provider: Option<ProviderKind>,
+    account: Option<AccountId>,
+    first_positional_is_account: bool,
+}
+
+impl CompletionContext {
+    fn from_env(config: &AppConfig) -> Self {
+        let args: Vec<String> = env::args_os()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        let index = env::var(COMPLETE_INDEX_ENV)
+            .ok()
+            .and_then(|raw| raw.parse::<usize>().ok());
+        Self::from_args(&args, index, config)
+    }
+
+    fn from_args(args: &[String], index: Option<usize>, config: &AppConfig) -> Self {
+        let Some(sep) = args.iter().position(|arg| arg == "--") else {
+            return Self::default();
+        };
+        let words = &args[sep + 1..];
+        if words.len() < 2 {
+            return Self::default();
+        }
+        let cursor = index
+            .unwrap_or_else(|| words.len().saturating_sub(1))
+            .min(words.len());
+        // Skip binary name (`words[0]`) and subcommand (`words[1]`).
+        if cursor <= 2 {
+            return Self::default();
+        }
+        let committed = &words[2..cursor];
+        let mut ctx = Self::default();
+        let mut idx = 0usize;
+        let mut positional_seen = 0usize;
+
+        while idx < committed.len() {
+            let token = committed[idx].as_str();
+            if token == "--" {
+                break;
+            }
+            if let Some(value) = token.strip_prefix("--account=") {
+                if let Ok(id) = value.parse::<AccountId>() {
+                    ctx.account = Some(id);
+                }
+                idx += 1;
+                continue;
+            }
+            if VALUE_FLAGS.contains(&token) {
+                if token == "--account"
+                    && let Some(value) = committed.get(idx + 1)
+                    && let Ok(id) = value.parse::<AccountId>()
+                {
+                    ctx.account = Some(id);
+                }
+                idx += 2;
+                continue;
+            }
+            if token.starts_with('-') {
+                idx += 1;
+                continue;
+            }
+            if positional_seen == 0 {
+                if let Ok(provider) = token.parse::<ProviderKind>() {
+                    ctx.provider = Some(provider);
+                } else if let Ok(id) = token.parse::<AccountId>()
+                    && config.find_account(&id).is_some()
+                {
+                    ctx.account = Some(id);
+                    ctx.first_positional_is_account = true;
+                }
+            }
+            positional_seen += 1;
+            idx += 1;
+        }
+
+        ctx
+    }
+
+    fn effective_provider(&self, config: &AppConfig) -> Option<ProviderKind> {
+        self.provider.or_else(|| {
+            self.account
+                .as_ref()
+                .and_then(|id| config.find_account(id))
+                .map(|account| account.provider)
+        })
+    }
+}
+
+fn account_candidate(account: &AccountConfig) -> CompletionCandidate {
+    let help = if account.label.is_empty() {
+        account.provider.to_string()
+    } else {
+        account.label.clone()
+    };
+    CompletionCandidate::new(account.id.to_string()).help(Some(help.into()))
+}
+
 pub fn account_candidates() -> Vec<CompletionCandidate> {
+    load_completion_config().map_or_else(Vec::new, |config| {
+        config.accounts.iter().map(account_candidate).collect()
+    })
+}
+
+pub fn enabled_account_candidates() -> Vec<CompletionCandidate> {
     load_completion_config().map_or_else(Vec::new, |config| {
         config
             .accounts
-            .into_iter()
-            .map(|account| {
-                CompletionCandidate::new(account.id.to_string()).help(Some(account.label.into()))
-            })
+            .iter()
+            .filter(|account| account.enabled)
+            .map(account_candidate)
             .collect()
     })
+}
+
+pub fn disabled_account_candidates() -> Vec<CompletionCandidate> {
+    load_completion_config().map_or_else(Vec::new, |config| {
+        config
+            .accounts
+            .iter()
+            .filter(|account| !account.enabled)
+            .map(account_candidate)
+            .collect()
+    })
+}
+
+/// First positional target for `run` and `where`: enabled providers plus configured accounts.
+pub fn run_target_candidates() -> Vec<CompletionCandidate> {
+    load_completion_config().map_or_else(Vec::new, |config| {
+        let mut seen = BTreeSet::new();
+        let mut candidates = Vec::new();
+        for &provider in DEFAULT_SHELL_PROVIDERS
+            .iter()
+            .chain(&[ProviderKind::Custom])
+        {
+            if config
+                .accounts
+                .iter()
+                .any(|account| account.enabled && account.provider == provider)
+            {
+                let name = provider.as_str().to_owned();
+                if seen.insert(name.clone()) {
+                    candidates.push(
+                        CompletionCandidate::new(name).help(Some("provider (auto-route)".into())),
+                    );
+                }
+            }
+        }
+        for account in &config.accounts {
+            if seen.insert(account.id.as_str().to_owned()) {
+                candidates.push(account_candidate(account));
+            }
+        }
+        candidates
+    })
+}
+
+/// Account candidates for `run` / `where`, filtered by the provider already typed on the command line.
+pub fn run_account_candidates() -> Vec<CompletionCandidate> {
+    load_completion_config().map_or_else(Vec::new, |config| {
+        let ctx = CompletionContext::from_env(&config);
+        if ctx.first_positional_is_account {
+            return Vec::new();
+        }
+        config
+            .accounts
+            .iter()
+            .filter(|account| ctx.provider.is_none_or(|p| account.provider == p))
+            .map(account_candidate)
+            .collect()
+    })
+}
+
+/// Targets for `tayassu probe`: configured accounts and providers with at least one account.
+pub fn probe_target_candidates() -> Vec<CompletionCandidate> {
+    load_completion_config().map_or_else(Vec::new, |config| {
+        let mut seen = BTreeSet::new();
+        let mut candidates = Vec::new();
+        for account in &config.accounts {
+            if seen.insert(account.id.as_str().to_owned()) {
+                candidates.push(account_candidate(account));
+            }
+        }
+        for &provider in DEFAULT_SHELL_PROVIDERS
+            .iter()
+            .chain(&[ProviderKind::Custom])
+        {
+            if config
+                .accounts
+                .iter()
+                .any(|account| account.provider == provider)
+                && seen.insert(provider.as_str().to_owned())
+            {
+                candidates.push(
+                    CompletionCandidate::new(provider.as_str())
+                        .help(Some("all accounts for provider".into())),
+                );
+            }
+        }
+        candidates
+    })
+}
+
+/// Model buckets discovered in `state.json`, filtered by the provider or account on the command line.
+pub fn model_candidates() -> Vec<CompletionCandidate> {
+    let Some(config) = load_completion_config() else {
+        return Vec::new();
+    };
+    let Some(state) = load_completion_state() else {
+        return Vec::new();
+    };
+    let ctx = CompletionContext::from_env(&config);
+    let provider_filter = ctx.effective_provider(&config);
+    let mut buckets = BTreeSet::new();
+    for status in &state.statuses {
+        let Some(account) = config.find_account(&status.account_id) else {
+            continue;
+        };
+        if let Some(account_filter) = &ctx.account
+            && &account.id != account_filter
+        {
+            continue;
+        }
+        if let Some(provider) = provider_filter
+            && account.provider != provider
+        {
+            continue;
+        }
+        for window in &status.windows {
+            buckets.insert(window.bucket.as_str().to_owned());
+        }
+        for model in status.model_buckets.keys() {
+            buckets.insert(model.as_str().to_owned());
+        }
+    }
+    buckets.into_iter().map(CompletionCandidate::new).collect()
 }
 
 pub fn chain_candidates() -> Vec<CompletionCandidate> {
@@ -51,24 +292,6 @@ pub fn chain_candidates() -> Vec<CompletionCandidate> {
             .fallback_chains
             .into_keys()
             .map(CompletionCandidate::new)
-            .collect()
-    })
-}
-
-/// Providers with at least one enabled account, listed once per provider.
-pub fn runnable_provider_candidates() -> Vec<CompletionCandidate> {
-    load_completion_config().map_or_else(Vec::new, |config| {
-        DEFAULT_SHELL_PROVIDERS
-            .iter()
-            .copied()
-            .chain([ProviderKind::Custom])
-            .filter(|provider| {
-                config
-                    .accounts
-                    .iter()
-                    .any(|a| a.enabled && a.provider == *provider)
-            })
-            .map(|provider| CompletionCandidate::new(provider.as_str()))
             .collect()
     })
 }

@@ -1,8 +1,8 @@
 # Acceptance criteria for isolated agy authentication
 
-Status: proposed. The private-keyring prototype ran on Pop!_OS 24.04 with
-Antigravity CLI 1.5.18 and GNOME Keyring 46.1. The released Tayassu launcher
-still uses the desktop Secret Service.
+The private-keyring prototype ran on Pop!_OS 24.04 with Antigravity CLI
+1.5.18 and GNOME Keyring 46.1. The launcher supports opt-in private keyrings
+for Antigravity profiles. See [Separate Antigravity accounts on Linux](USAGE.md#separate-antigravity-accounts-on-linux).
 
 ## Requested provider behavior
 
@@ -31,8 +31,12 @@ payloads, OAuth callback URLs and keyring files out of test artifacts.
 ## Evidence and outstanding work
 
 Two real accounts retained separate identities after restarting their private
-services. Concurrent isolation was tested with synthetic secrets. Real
-concurrent sessions, refresh-time failure and reboot remain unverified.
+services in the standalone prototype. The launcher was tested against two
+real GNOME Keyring daemons with synthetic secrets, including overlapping
+runs and probes, reading stored credentials after daemon restart, and
+clearing one profile without affecting the other. Real OAuth onboarding
+and concurrent sessions through the launcher, refresh-time failure, and
+machine reboot remain unverified.
 During a real sign-in with an unavailable keyring and a blocked fallback
 path, the CLI displayed an authenticated session despite logging a failed
 save. A fresh process subsequently requested authentication.
