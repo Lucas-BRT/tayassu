@@ -53,6 +53,8 @@ pub struct ProfileEnvironment {
     pub strategy: IsolationStrategy,
     /// Environment key/value overrides injected into the spawned CLI process.
     pub env_vars: Vec<(String, String)>,
+    /// Ambient host environment variables removed before launching the spawned CLI process.
+    pub env_remove: Vec<String>,
     /// Dedicated managed-service port written into the fake `HOME` when the CLI binds a fixed port.
     pub service_port: Option<u16>,
 }
@@ -93,8 +95,20 @@ impl ProfileEnvironment {
             profile_dir,
             strategy,
             env_vars,
+            env_remove: Vec::new(),
             service_port: None,
         }
+    }
+
+    /// Marks ambient host environment variables to unset when spawning this profile.
+    #[must_use]
+    pub fn with_removed_env<I, S>(mut self, vars: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.env_remove.extend(vars.into_iter().map(Into::into));
+        self
     }
 
     /// Sets the managed-service port persisted into the fake `HOME` by [`Self::prepare`].
@@ -102,6 +116,25 @@ impl ProfileEnvironment {
     pub fn with_service_port(mut self, port: u16) -> Self {
         self.service_port = Some(port);
         self
+    }
+
+    /// Returns the filesystem root where provider credentials and state live for this profile.
+    #[must_use]
+    pub fn state_root(&self) -> PathBuf {
+        match self.strategy {
+            IsolationStrategy::NativeEnvVar { .. } => self.profile_dir.clone(),
+            IsolationStrategy::FakeHome { .. } => self.profile_dir.join(FAKE_HOME_SUBDIR),
+        }
+    }
+
+    /// Applies this profile's environment removals and overrides to `command`.
+    pub fn apply_to_command(&self, command: &mut std::process::Command) {
+        for key in &self.env_remove {
+            command.env_remove(key);
+        }
+        for (key, value) in &self.env_vars {
+            command.env(key, value);
+        }
     }
 
     /// Ensures the profile directory exists and creates any configured symlinks for fake `HOME`.

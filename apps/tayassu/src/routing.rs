@@ -135,10 +135,11 @@ impl App {
             };
 
             let adapter = AdapterRegistry.adapter_for(account.provider);
-            let env_profile = adapter.build_environment(&account, &self.paths.profiles_dir);
-            env_profile
-                .prepare(&self.paths.home_dir)
-                .with_context(|| format!("failed to prepare profile for {}", account.id))?;
+            let env_profile = crate::spawn::prepare_profile(
+                &account,
+                &self.paths,
+                crate::agy_keyring::Operation::Run,
+            )?;
 
             let (updated_state, ()) =
                 RuntimeState::update_locked(&self.paths.state_file, |state| {
@@ -159,9 +160,9 @@ impl App {
             {
                 crate::codex_daemon::restore_missing_link(&env_profile.profile_dir);
             }
-            let outcome =
-                spawn_capturing_stderr(&account, &executable, &env_profile.env_vars, &arguments)?;
+            let outcome = spawn_capturing_stderr(&account, &executable, &env_profile, &arguments)?;
 
+            crate::agy_keyring::check_after_launch(&account, &env_profile)?;
             let exit_code = outcome.status.code().unwrap_or(SIGNAL_FALLBACK_EXIT_CODE);
             // A clean exit never signals a limit; stderr noise must not cool the account down.
             let rate_limit_hit = if outcome.status.success() {
@@ -285,6 +286,9 @@ impl App {
         writeln!(out, "executable: {}", executable.display())?;
         let adapter = AdapterRegistry.adapter_for(account.provider);
         let profile = adapter.build_environment(&account, &self.paths.profiles_dir);
+        if account.uses_private_agy_keyring() {
+            writeln!(out, "authentication: private Antigravity keyring")?;
+        }
         for (key, value) in &profile.env_vars {
             writeln!(out, "env: {key}={value}")?;
         }

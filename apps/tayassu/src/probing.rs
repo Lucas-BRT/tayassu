@@ -222,17 +222,15 @@ fn send_desktop_notification(title: &str, body: &str) {
         .status();
 }
 
-fn run_single_probe(
+pub(crate) fn run_single_probe(
     account: &AccountConfig,
     configured_accounts: &[AccountConfig],
     paths: &XdgPaths,
     now: DateTime<Utc>,
 ) -> Result<ProbeOutput> {
     let adapter = AdapterRegistry.adapter_for(account.provider);
-    let env_profile = adapter.build_environment(account, &paths.profiles_dir);
-    env_profile
-        .prepare(&paths.home_dir)
-        .with_context(|| format!("failed to prepare profile for {}", account.id))?;
+    let env_profile =
+        crate::spawn::prepare_profile(account, paths, crate::agy_keyring::Operation::Probe)?;
 
     let executable = account_executable(account, &paths.home_dir);
     if account.provider == ProviderKind::Opencode {
@@ -257,7 +255,7 @@ fn run_single_probe(
         ProviderKind::Codex | ProviderKind::Copilot
     ) {
         let mut command = ProcessCommand::new(&executable);
-        command.envs(env_profile.env_vars.iter().map(|(key, value)| (key, value)));
+        env_profile.apply_to_command(&mut command);
         match quota_rpc::read_quota(command, account.provider) {
             Ok(snapshot) => {
                 let mut probe =
@@ -288,23 +286,7 @@ fn run_single_probe(
             .map_err(Into::into);
     };
 
-    let mut cmd = ProcessCommand::new(&executable);
-    cmd.args(&spec.args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    for (key, value) in &env_profile.env_vars {
-        cmd.env(key, value);
-    }
-
-    let output = cmd.output().with_context(|| {
-        format!(
-            "failed to run probe '{}' for account '{}'",
-            executable.display(),
-            account.id
-        )
-    })?;
-
+    let output = probe_process(account, &executable, &env_profile, &spec.args)?;
     let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
     if !output.stderr.is_empty() {
         combined.push('\n');
@@ -323,7 +305,7 @@ fn run_single_probe(
     }
     let mut parsed = parsed?;
     if account.provider == ProviderKind::Claude {
-        match claude_usage::probe(&executable, &env_profile.env_vars, now) {
+        match claude_usage::probe(&executable, &env_profile, now) {
             Ok(windows) => parsed.windows.extend(windows),
             Err(error) => {
                 tracing::debug!(account = %account.id, %error, "Claude plan usage unavailable");
@@ -331,4 +313,32 @@ fn run_single_probe(
         }
     }
     Ok(parsed)
+}
+
+fn probe_process(
+    account: &AccountConfig,
+    executable: &std::path::Path,
+    env_profile: &tayassu_providers::ProfileEnvironment,
+    args: &[String],
+) -> Result<std::process::Output> {
+    let mut cmd = ProcessCommand::new(executable);
+    cmd.args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    env_profile.apply_to_command(&mut cmd);
+
+    let output = if account.uses_private_agy_keyring() {
+        crate::agy_keyring::probe_output(&mut cmd)
+    } else {
+        cmd.output().map_err(Into::into)
+    };
+    crate::agy_keyring::check_after_launch(account, env_profile)?;
+    output.with_context(|| {
+        format!(
+            "failed to run probe '{}' for account '{}'",
+            executable.display(),
+            account.id
+        )
+    })
 }

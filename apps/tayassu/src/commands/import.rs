@@ -127,7 +127,7 @@ impl Import {
             )?;
             writeln!(out, "  update-safety: {}", agent.update_safety_note)?;
             let credentials_transferred = agent.provider == ProviderKind::Opencode
-                && match transfer_opencode_auth(&agent.binary_path, &profile_env.env_vars) {
+                && match transfer_opencode_auth(&agent.binary_path, &profile_env) {
                     Ok(()) => {
                         writeln!(out, "  credentials: exported from host and imported")?;
                         true

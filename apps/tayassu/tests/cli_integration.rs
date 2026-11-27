@@ -303,6 +303,7 @@ fn live_probe_updates_buckets_and_routes_per_model_cooldown() {
         "agy",
         "agy-student",
         "--no-login",
+        "--shared-keyring",
         "--priority",
         "10",
         "--binary",
@@ -313,6 +314,7 @@ fn live_probe_updates_buckets_and_routes_per_model_cooldown() {
         "agy",
         "agy-pro",
         "--no-login",
+        "--shared-keyring",
         "--priority",
         "20",
         "--binary",
@@ -731,7 +733,15 @@ fn bash_wrapper_routes_configured_accounts_and_does_not_bypass_disabled_accounts
     fs::set_permissions(&host, fs::Permissions::from_mode(SCRIPT_EXECUTABLE_MODE))
         .expect("chmod host");
     let routed = env.write_mock_script("routed", "#!/bin/sh\nprintf 'routed:%s\\n' \"$*\"\n");
-    env.run_ok(&["add", "agy", "work", "--no-login", "--binary", &routed]);
+    env.run_ok(&[
+        "add",
+        "agy",
+        "work",
+        "--no-login",
+        "--shared-keyring",
+        "--binary",
+        &routed,
+    ]);
     let run_shell = || {
         env.command()
             .get_envs()
@@ -1023,7 +1033,15 @@ fn agy_disabled_window_clears_previous_probe_cooldown_and_keeps_other_quota() {
         "agy.sh",
         "#!/bin/sh\nprintf 'Claude and GPT models\tFHour Limit Remaining\t0%%\t2099-01-01T00:00:00Z\n'\n",
     );
-    env.run_ok(&["add", "agy", "agy-host", "--no-login", "--binary", &mock]);
+    env.run_ok(&[
+        "add",
+        "agy",
+        "agy-host",
+        "--no-login",
+        "--shared-keyring",
+        "--binary",
+        &mock,
+    ]);
     env.run_ok(&["probe", "agy-host"]);
     assert!(
         !env.run_cli(&["run", "agy", "--model", "claude", "--dry-run"])
@@ -1331,9 +1349,10 @@ fn shared_token_does_not_confirm_two_copilot_profiles() {
     assert!(output.status.success());
     let report = String::from_utf8(output.stdout).expect("text report");
     for id in ids {
-        assert!(report.contains(&format!(
-            "unable to verify Copilot authentication for account '{id}'"
-        )));
+        assert!(
+            report.contains(&format!("account '{id}' (copilot) is not logged in")),
+            "{report}"
+        );
     }
 }
 
@@ -1379,7 +1398,15 @@ fn cached_window_past_its_reset_is_shown_as_reset_and_routable() {
         "mock-agy-old.sh",
         "#!/usr/bin/env bash\ncat <<'EOF'\nQuota:\nGemini Models          Five Hour Limit Remaining  0%  2000-01-01 00:00 -03\nEOF\n",
     );
-    env.run_ok(&["add", "agy", "old", "--binary", &script, "--no-login"]);
+    env.run_ok(&[
+        "add",
+        "agy",
+        "old",
+        "--binary",
+        &script,
+        "--no-login",
+        "--shared-keyring",
+    ]);
     env.run_ok(&["probe"]);
 
     let table = env.run_ok(&["ls"]);
@@ -1403,7 +1430,15 @@ fn failed_probe_keeps_cached_windows() {
         "mock-agy-ok.sh",
         "#!/usr/bin/env bash\ncat <<'EOF'\nQuota:\nGemini Models          Weekly Limit Remaining  43%  2099-12-03 06:02 -03\nEOF\n",
     );
-    env.run_ok(&["add", "agy", "cached", "--binary", &ok, "--no-login"]);
+    env.run_ok(&[
+        "add",
+        "agy",
+        "cached",
+        "--binary",
+        &ok,
+        "--no-login",
+        "--shared-keyring",
+    ]);
     env.run_ok(&["probe"]);
 
     let broken = env.write_mock_script("mock-agy-broken.sh", "#!/usr/bin/env bash\nexit 1\n");
@@ -1474,4 +1509,154 @@ fn uninstall_removes_hooks_units_and_binary_while_keeping_data_unless_purged() {
     assert!(purge.status.success());
     assert!(!env.dir.path().join("config/tayassu").exists());
     assert!(!env.dir.path().join("data/tayassu").exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn private_agy_keyring_dry_run_and_fallback_preservation() {
+    let env = TestEnv::new();
+    let config = env.dir.path().join("config/tayassu");
+    fs::create_dir_all(&config).unwrap();
+    fs::write(
+        config.join("config.toml"),
+        r#"
+[[accounts]]
+id = "private"
+provider = "agy"
+label = "Private"
+agy_private_keyring = true
+"#,
+    )
+    .unwrap();
+    let runtime = env.dir.path().join("runtime");
+    fs::create_dir(&runtime).unwrap();
+    let dry_run = env
+        .command()
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .args(["run", "agy", "--account", "private", "--dry-run"])
+        .output()
+        .unwrap();
+    assert!(dry_run.status.success());
+    assert!(String::from_utf8_lossy(&dry_run.stdout).contains("private Antigravity keyring"));
+    assert!(fs::read_dir(&runtime).unwrap().next().is_none());
+
+    let fallback = env.dir.path().join(
+        "data/tayassu/profiles/agy/private/home/.gemini/antigravity-cli/antigravity-oauth-token",
+    );
+    fs::create_dir_all(fallback.parent().unwrap()).unwrap();
+    fs::write(&fallback, "synthetic").unwrap();
+    let run = env
+        .command()
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .args(["run", "agy", "--account", "private"])
+        .output()
+        .unwrap();
+    assert!(!run.status.success());
+    assert!(String::from_utf8_lossy(&run.stderr).contains("fallback credential exists"));
+    assert_eq!(fs::read_to_string(fallback).unwrap(), "synthetic");
+    assert!(fs::read_dir(runtime).unwrap().next().is_none());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn add_agy_enables_private_keyring_by_default_and_supports_opt_out() {
+    let env = TestEnv::new();
+    env.run_ok(&["add", "agy", "agy-fresh", "--no-login"]);
+    env.run_ok(&["add", "agy", "agy-shared", "--no-login", "--shared-keyring"]);
+
+    let private_dry = env.run_ok(&["run", "agy", "--account", "agy-fresh", "--dry-run"]);
+    assert!(private_dry.contains("authentication: private Antigravity keyring"));
+
+    let shared_dry = env.run_ok(&["run", "agy", "--account", "agy-shared", "--dry-run"]);
+    assert!(!shared_dry.contains("private Antigravity keyring"));
+}
+
+#[test]
+fn add_clears_stale_auth_artifacts_for_every_provider() {
+    let env = TestEnv::new();
+    let profiles = env.dir.path().join("data/tayassu/profiles");
+
+    let stale_cases = [
+        (
+            "agy",
+            "agy-reused",
+            "home/.local/share/keyrings/login.keyring",
+            "home/.gemini/antigravity-cli/settings.json",
+        ),
+        (
+            "claude",
+            "claude-reused",
+            ".credentials.json",
+            "settings.json",
+        ),
+        ("codex", "codex-reused", "auth.json", "config.toml"),
+        ("copilot", "copilot-reused", "hosts.json", "mcp-config.json"),
+        (
+            "opencode",
+            "opencode-reused",
+            "home/.local/share/opencode/auth.json",
+            "home/.config/opencode/opencode.json",
+        ),
+    ];
+
+    for (provider, id, auth_rel, keep_rel) in stale_cases {
+        let root = profiles.join(provider).join(id);
+        let auth_path = root.join(auth_rel);
+        let keep_path = root.join(keep_rel);
+        fs::create_dir_all(auth_path.parent().unwrap()).unwrap();
+        fs::create_dir_all(keep_path.parent().unwrap()).unwrap();
+        fs::write(&auth_path, "stale-secret").unwrap();
+        fs::write(&keep_path, "keep-me").unwrap();
+
+        env.run_ok(&["add", provider, id, "--no-login"]);
+
+        assert!(
+            !auth_path.exists(),
+            "{provider} auth file {auth_rel} should be cleared by `tayassu add`"
+        );
+        assert!(
+            keep_path.is_file(),
+            "{provider} non-auth file {keep_rel} should be preserved"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn run_strips_ambient_host_auth_env_vars() {
+    let env = TestEnv::new();
+    let script = env.write_mock_script(
+        "dump-env.sh",
+        "#!/usr/bin/env bash\nprintf 'GH=%s|GITHUB=%s|COPILOT=%s|OPENAI=%s|ANTHROPIC=%s|GKC=%s\\n' \"$GH_TOKEN\" \"$GITHUB_TOKEN\" \"$COPILOT_GITHUB_TOKEN\" \"$OPENAI_API_KEY\" \"$ANTHROPIC_API_KEY\" \"$GNOME_KEYRING_CONTROL\"\n",
+    );
+
+    env.run_ok(&["add", "copilot", "cop", "--no-login", "--binary", &script]);
+    env.run_ok(&["add", "codex", "cdx", "--no-login", "--binary", &script]);
+    env.run_ok(&["add", "claude", "cld", "--no-login", "--binary", &script]);
+
+    let run_with_host_tokens = |provider: &str, account: &str| {
+        let output = env
+            .command()
+            .env("GH_TOKEN", "host-gh")
+            .env("GITHUB_TOKEN", "host-github")
+            .env("COPILOT_GITHUB_TOKEN", "host-copilot")
+            .env("OPENAI_API_KEY", "host-openai")
+            .env("ANTHROPIC_API_KEY", "host-anthropic")
+            .env("GNOME_KEYRING_CONTROL", "/tmp/host-keyring")
+            .args(["run", provider, "--account", account])
+            .output()
+            .expect("run provider");
+        assert!(output.status.success(), "{output:?}");
+        String::from_utf8(output.stdout).expect("utf8")
+    };
+
+    let cop = run_with_host_tokens("copilot", "cop");
+    assert!(cop.contains("GH=|GITHUB=|COPILOT=|"), "{cop}");
+    assert!(cop.contains("|GKC=\n"), "{cop}");
+
+    let cdx = run_with_host_tokens("codex", "cdx");
+    assert!(cdx.contains("|OPENAI=|"), "{cdx}");
+
+    let cld = run_with_host_tokens("claude", "cld");
+    assert!(cld.contains("|ANTHROPIC=|"), "{cld}");
 }
