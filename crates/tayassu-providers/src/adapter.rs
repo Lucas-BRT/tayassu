@@ -586,14 +586,8 @@ impl ProviderAdapter for CopilotAdapter {
             .any(|var| env::var_os(var).is_some_and(|val| !val.is_empty()));
 
         if has_profile_cred || has_env_token {
-            Some(Ok(ProbeOutput {
-                windows: vec![QuotaWindow {
-                    window_name: "auth".to_owned(),
-                    bucket: ModelBucket::default_bucket(),
-                    remaining: None,
-                    resets_at: None,
-                }],
-                ..ProbeOutput::default()
+            Some(Err(ProviderError::AuthenticationUnverified {
+                account_id: account.id.clone(),
             }))
         } else {
             Some(Err(ProviderError::AuthenticationRequired {

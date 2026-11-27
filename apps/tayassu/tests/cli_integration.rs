@@ -289,7 +289,9 @@ fn probe_supports_claude_codex_copilot_and_opencode_in_parallel() {
     assert!(probe_out.contains("claude-main: ok (1 windows, 0 active cooldowns)"));
     assert!(probe_out.contains("codex-main: ok (1 windows, 0 active cooldowns)"));
     assert!(probe_out.contains("opencode-main: ok (2 windows, 0 active cooldowns)"));
-    assert!(probe_out.contains("copilot-main: ok (1 windows, 0 active cooldowns)"));
+    assert!(
+        probe_out.contains("unable to verify Copilot authentication for account 'copilot-main'")
+    );
 
     let status_out = env.run_ok(&["status"]);
     assert!(status_out.contains("claude-main"));
@@ -920,4 +922,26 @@ fn auto_probe_installs_and_enables_timer_without_overwriting_existing_units() {
         fs::read_to_string(timer).expect("read timer"),
         "custom timer"
     );
+}
+
+#[test]
+fn shared_token_does_not_confirm_two_copilot_profiles() {
+    let env = TestEnv::new();
+    let ids = ["copilot-work", "copilot-personal"];
+    for id in ids {
+        env.run_ok(&["account", "add", id, "copilot", "--binary", "/bin/false"]);
+    }
+    let output = env
+        .command()
+        .env("GH_TOKEN", "synthetic")
+        .arg("probe")
+        .output()
+        .expect("probe");
+    assert!(output.status.success());
+    let report = String::from_utf8(output.stdout).expect("text report");
+    for id in ids {
+        assert!(report.contains(&format!(
+            "unable to verify Copilot authentication for account '{id}'"
+        )));
+    }
 }
