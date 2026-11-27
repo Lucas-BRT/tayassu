@@ -1,10 +1,13 @@
-use crate::atomic::write_atomic;
+use crate::atomic::{FileLock, write_atomic};
 use crate::error::StoreError;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 use tayassu_core::{AccountConfig, AccountId, FallbackTarget, SelectionPolicy};
+
+/// Sibling lock filename for configuration read-modify-write operations.
+const CONFIG_LOCK_FILE_NAME: &str = "config.lock";
 
 /// Top-level user configuration persisted in `config.toml`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,10 +53,31 @@ impl AppConfig {
         write_atomic(path, serialized.as_bytes())
     }
 
+    /// Loads the latest config and runs an operation while holding its exclusive lock.
+    ///
+    /// # Errors
+    ///
+    /// Returns lock, load or operation errors.
+    pub fn with_current_locked<T, E>(
+        path: &Path,
+        operation: impl FnOnce(Self) -> Result<T, E>,
+    ) -> Result<T, E>
+    where
+        E: From<StoreError>,
+    {
+        let _lock = FileLock::acquire(path.with_file_name(CONFIG_LOCK_FILE_NAME))?;
+        operation(Self::load(path)?)
+    }
+
     /// Looks up a configured account by `id`.
     #[must_use]
     pub fn find_account(&self, id: &AccountId) -> Option<&AccountConfig> {
         self.accounts.iter().find(|account| &account.id == id)
+    }
+
+    /// Looks up a configured account for editing.
+    pub fn find_account_mut(&mut self, id: &AccountId) -> Option<&mut AccountConfig> {
+        self.accounts.iter_mut().find(|account| &account.id == id)
     }
 
     /// Inserts or replaces an account configuration by its [`AccountId`].

@@ -22,9 +22,12 @@ cargo install --locked --path apps/tayassu
 
 ```bash
 tayassu import          # discover installed CLIs and copy credentials into isolated profiles
-tayassu account login agy
 tayassu status
-tayassu run claude -- "explain this repository"
+# If import requests a login, use the reported account ID, for example:
+# tayassu account login agy-host
+tayassu probe
+tayassu run claude --dry-run -- --help
+tayassu run claude -- --help
 ```
 
 ## Documentation
@@ -45,3 +48,12 @@ git config core.hooksPath .githooks
 cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo nextest run --locked --workspace
 ```
+
+
+## Releases
+
+After promoting `develop` to `main` through a pull request, tag the release commit.
+The tag must match the workspace version in `Cargo.toml` and the lockfile must be
+up to date. The tag workflow reruns CI, builds and smoke-tests Linux binaries on
+x86_64 and ARM64, then publishes both archives and their SHA-256 checksums to
+GitHub Releases.

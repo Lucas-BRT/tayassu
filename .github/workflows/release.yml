@@ -1,0 +1,111 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate release tag
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.tag.outputs.version }}
+    steps:
+      # v4.2.2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify main ancestry and workspace version
+        id: tag
+        run: |
+          git merge-base --is-ancestor HEAD refs/remotes/origin/main
+          version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
+          if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ || "$GITHUB_REF_NAME" != "v$version" ]]; then
+            echo "::error::Tag $GITHUB_REF_NAME must match workspace version v$version"
+            exit 1
+          fi
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+
+  ci:
+    needs: validate
+    uses: ./.github/workflows/ci.yml
+
+  packages:
+    name: Package Linux (${{ matrix.target }})
+    needs: [validate, ci]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: "0"
+      CARGO_NET_RETRY: "10"
+      RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+      TARGET: ${{ matrix.target }}
+    steps:
+      # v4.2.2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Activate pinned Rust toolchain
+        run: cargo --version
+      # v2.7.8
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6
+        with:
+          shared-key: tayassu
+      - name: Build, package, and smoke-test
+        run: |
+          cargo build --locked --release --package tayassu --target "$TARGET"
+          target_dir="$(cargo metadata --locked --no-deps --format-version 1 | jq -r .target_directory)"
+          bash tools/package-release.sh "$target_dir/$TARGET/release/tayassu" "$TARGET" dist
+          (
+            cd dist
+            sha256sum --check "tayassu-$TARGET.tar.gz.sha256"
+            tar -xzf "tayassu-$TARGET.tar.gz"
+            [[ "$(./tayassu --version)" == "tayassu $RELEASE_VERSION" ]]
+            ./tayassu --help > /dev/null
+          )
+      # v4.6.2
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: tayassu-${{ matrix.target }}
+          path: dist/*.tar.gz*
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub release
+    needs: [validate, packages]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      # v4.3.0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Verify and publish assets
+        working-directory: dist
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+            sha256sum --check "tayassu-$target.tar.gz.sha256"
+          done
+          gh release create "$GITHUB_REF_NAME" ./*.tar.gz ./*.tar.gz.sha256 \
+            --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes \
+            --title "Tayassu $RELEASE_VERSION"

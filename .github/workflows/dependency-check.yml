@@ -1,9 +1,19 @@
-name: Weekly version and advisory check
+name: Dependency audit
 
 on:
   schedule:
     - cron: "0 9 * * 1"
+  pull_request:
+    branches: [develop, main]
+    paths:
+      - Cargo.lock
+      - "**/Cargo.toml"
+      - ".github/workflows/dependency-check.yml"
   workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -17,19 +27,28 @@ jobs:
   audit:
     name: Cargo audit
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - name: Checkout
         # v4.2.2
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9
+      - name: Activate pinned Rust toolchain
+        run: cargo --version
+
+      - name: Cache Cargo artifacts
+        # v2.7.8
+        uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6
+        with:
+          shared-key: tayassu
 
       - name: Install cargo-audit
-        # v2.49.49
-        uses: taiki-e/install-action@69f61f612767f6e62b5aa73784621899a279a533
+        # v2.90.11
+        uses: taiki-e/install-action@073e1fd0bc889c9aee68dbaaa927cde1b5653a83
         with:
-          tool: cargo-audit@0.21.2
+          tool: cargo-audit@0.23.0
 
       - name: Run cargo audit
-        run: cargo audit
+        run: cargo audit --file Cargo.lock

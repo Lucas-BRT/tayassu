@@ -1,6 +1,8 @@
 use crate::shell::ShellKind;
+use crate::shell::{account_candidates, chain_candidates, provider_candidates};
 use crate::systemd::DEFAULT_PROBE_INTERVAL_MINUTES;
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
+use clap_complete::ArgValueCandidates;
 use tayassu_core::{
     AccountId, DEFAULT_ACCOUNT_PRIORITY, ModelBucket, ProviderKind, SelectionPolicy,
 };
@@ -24,6 +26,7 @@ pub enum Command {
     Status {
         /// Filter output to a single provider.
         #[arg(long)]
+        #[arg(add = ArgValueCandidates::new(provider_candidates))]
         provider: Option<ProviderKind>,
         /// Model bucket to evaluate availability against.
         #[arg(long)]
@@ -37,12 +40,15 @@ pub enum Command {
     Run {
         /// Provider to invoke (`agy`, `claude`, `codex`, `copilot`, `opencode`, `custom`).
         /// Optional when `--account` or `--chain` (or `.tayassu.toml` `fallback_chain`) is used.
+        #[arg(add = ArgValueCandidates::new(provider_candidates))]
         provider: Option<ProviderKind>,
         /// Force a specific account id instead of routing automatically.
         #[arg(long)]
+        #[arg(add = ArgValueCandidates::new(account_candidates))]
         account: Option<AccountId>,
         /// Use a named cross-provider fallback chain from `config.toml`.
         #[arg(long)]
+        #[arg(add = ArgValueCandidates::new(chain_candidates))]
         chain: Option<String>,
         /// Model bucket to check cooldowns against (defaults to `default`).
         #[arg(long)]
@@ -54,7 +60,7 @@ pub enum Command {
         #[arg(long)]
         dry_run: bool,
         /// Retry once on the next available account if the first run hits a rate limit.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "account")]
         failover: bool,
         /// Extra arguments passed verbatim to the underlying agent CLI.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -79,6 +85,7 @@ pub enum Command {
     Probe {
         /// Limit probing to a single account id.
         #[arg(long)]
+        #[arg(add = ArgValueCandidates::new(account_candidates))]
         id: Option<AccountId>,
         /// Send a desktop notification (`notify-send`) when a previously active cooldown clears.
         #[arg(long)]
@@ -87,23 +94,7 @@ pub enum Command {
 
     /// Auto-discover installed AI CLIs and safely import their host credentials into isolated profiles.
     #[command(alias = "discover")]
-    Import {
-        /// Include only specific provider(s) (repeatable). Defaults to all discovered providers.
-        #[arg(long = "provider")]
-        include: Vec<ProviderKind>,
-        /// Exclude specific provider(s) from discovery/import (repeatable).
-        #[arg(long = "exclude")]
-        exclude: Vec<ProviderKind>,
-        /// Preview discovered agents, files, and update-safety notes without modifying disk.
-        #[arg(long)]
-        dry_run: bool,
-        /// Remove original host auth files after verified copy (never removes binaries or updater dirs).
-        #[arg(long)]
-        move_auth: bool,
-        /// Selection priority assigned to imported accounts.
-        #[arg(long, default_value_t = DEFAULT_ACCOUNT_PRIORITY)]
-        priority: u8,
-    },
+    Import(ImportArgs),
 
     /// Print shell wrapper functions so `agy`, `claude`, `codex`, etc. route through `tayassu`.
     ShellInit {
@@ -111,6 +102,7 @@ pub enum Command {
         shell: ShellKind,
         /// Restrict wrappers to specific provider(s) (repeatable). Defaults to all built-in agents.
         #[arg(long = "provider")]
+        #[arg(add = ArgValueCandidates::new(provider_candidates))]
         providers: Vec<ProviderKind>,
         /// Include `--failover` in generated wrapper functions.
         #[arg(long)]
@@ -138,11 +130,37 @@ pub enum Command {
     Update {
         /// Restrict updates to a single provider.
         #[arg(long)]
+        #[arg(add = ArgValueCandidates::new(provider_candidates))]
         provider: Option<ProviderKind>,
         /// Print updater commands without executing them.
         #[arg(long)]
         dry_run: bool,
     },
+}
+
+/// Options for discovering and importing host accounts.
+#[derive(Debug, Args)]
+pub struct ImportArgs {
+    /// Include only specific provider(s) (repeatable). Defaults to all discovered providers.
+    #[arg(long = "provider")]
+    #[arg(add = ArgValueCandidates::new(provider_candidates))]
+    pub include: Vec<ProviderKind>,
+    /// Exclude specific provider(s) from discovery/import (repeatable).
+    #[arg(long = "exclude")]
+    #[arg(add = ArgValueCandidates::new(provider_candidates))]
+    pub exclude: Vec<ProviderKind>,
+    /// Preview discovered agents, files, and update-safety notes without modifying disk.
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Refresh credentials in profiles that are already registered.
+    #[arg(long)]
+    pub refresh: bool,
+    /// Remove original host auth files after verified copy (never removes binaries or updater dirs).
+    #[arg(long)]
+    pub move_auth: bool,
+    /// Selection priority assigned to imported accounts.
+    #[arg(long, default_value_t = DEFAULT_ACCOUNT_PRIORITY)]
+    pub priority: u8,
 }
 
 /// Account management subcommands.
@@ -153,6 +171,7 @@ pub enum AccountAction {
         /// Unique account slug (e.g. `agy-student`, `agy-pro`).
         id: AccountId,
         /// Provider kind (`agy`, `claude`, `codex`, `copilot`, `opencode`, `custom`).
+        #[arg(add = ArgValueCandidates::new(provider_candidates))]
         provider: ProviderKind,
         /// Human-readable label shown in status output.
         #[arg(long, default_value = "")]
@@ -165,21 +184,51 @@ pub enum AccountAction {
         binary: Option<String>,
     },
 
+    /// Edit an account's label or selection priority.
+    Edit {
+        /// Account identifier.
+        #[arg(add = ArgValueCandidates::new(account_candidates))]
+        id: AccountId,
+        /// New display label.
+        #[arg(long, required_unless_present = "priority")]
+        label: Option<String>,
+        /// New selection priority (lower values are preferred).
+        #[arg(long)]
+        priority: Option<u8>,
+    },
+
+    /// Include an account in automatic routing.
+    Enable {
+        /// Account identifier.
+        #[arg(add = ArgValueCandidates::new(account_candidates))]
+        id: AccountId,
+    },
+
+    /// Pause automatic routing to an account while keeping its profile.
+    Disable {
+        /// Account identifier.
+        #[arg(add = ArgValueCandidates::new(account_candidates))]
+        id: AccountId,
+    },
+
     /// Remove an account from `config.toml` (leaves profile data on disk untouched).
     Remove {
         /// Account identifier to remove.
+        #[arg(add = ArgValueCandidates::new(account_candidates))]
         id: AccountId,
     },
 
     /// Print the isolated profile directory and environment overrides for an account.
     Env {
         /// Account identifier to inspect.
+        #[arg(add = ArgValueCandidates::new(account_candidates))]
         id: AccountId,
     },
 
     /// Launch the provider CLI interactively inside the account's isolated profile to log in.
     Login {
         /// Account identifier to authenticate.
+        #[arg(add = ArgValueCandidates::new(account_candidates))]
         id: AccountId,
     },
 }
@@ -190,6 +239,7 @@ pub enum CooldownAction {
     /// Mark an account (and optional model bucket) as cooling down.
     Set {
         /// Account identifier.
+        #[arg(add = ArgValueCandidates::new(account_candidates))]
         id: AccountId,
         /// Cooldown duration in minutes.
         #[arg(long, default_value_t = DEFAULT_MANUAL_COOLDOWN_MINUTES)]
@@ -205,6 +255,7 @@ pub enum CooldownAction {
     /// Clear a recorded cooldown for an account.
     Clear {
         /// Account identifier.
+        #[arg(add = ArgValueCandidates::new(account_candidates))]
         id: AccountId,
         /// Model bucket to clear (defaults to `default`).
         #[arg(long)]
